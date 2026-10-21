@@ -19,6 +19,7 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 import charts
 import dialogs
 import formula_engine as fe
+import richclip
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
 from function_info import CATEGORIES, FUNCTION_INFO
 from ribbon import (RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, Ribbon, RibbonButton, RibbonStyle, StyleTile,
@@ -163,6 +164,10 @@ PHÍM TẮT
 TỆP
   .xlsx mở được bằng Microsoft Excel (giữ công thức, định dạng, ô hợp nhất, định dạng có điều kiện,
   bộ lọc); .pyxl là định dạng riêng (JSON); .csv chỉ lưu giá trị của trang tính đang mở.
+
+SAO CHÉP SANG PHẦN MỀM KHÁC (Windows)
+  Ctrl+C đưa vùng chọn lên bộ nhớ tạm như Excel: chữ, bảng (HTML, RTF) và hình vẽ (EMF, bitmap).
+  Dán được vào Word, AutoCAD...; trong AutoCAD dùng Ctrl+V, hoặc lệnh PASTESPEC để chọn dạng dán.
 """
 
 KEEP = object()
@@ -2627,8 +2632,14 @@ class SpreadsheetApp:
                   for r in range(r1, r2 + 1)]
         text = "\n".join("\t".join(self._tsv_field(self.wb.display_text(self.sheet, r, c)) for c in range(c1, c2 + 1))
                          for r in range(r1, r2 + 1))
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
+        try:  # on Windows, also as HTML/RTF tables and a picture, like Excel (AutoCAD needs those)
+            rich = (r2 - r1 + 1) * (c2 - c1 + 1) <= BIG_AREA and richclip.copy_to_clipboard(
+                self.root.winfo_id(), text, self._clip_table(r1, c1, r2, c2))
+        except Exception:  # noqa: BLE001 - the rich formats are a bonus; plain text must always work
+            rich = False
+        if not rich:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
         self.clip = {"sheet": self.sheet, "rect": (r1, c1, r2, c2), "cells": block, "values": values,
                      "cut": cut, "text": text}
         self.set_mode("Chọn ô đích rồi nhấn Ctrl+V (Esc để hủy)")
@@ -2636,6 +2647,36 @@ class SpreadsheetApp:
 
     def cut(self):
         self.copy(cut=True)
+
+    def _clip_table(self, r1, c1, r2, c2):
+        """The copied block as richclip describes a table: visible rows and columns only, with each
+        cell's text as displayed, its alignment and its format (conditional formatting included)."""
+        sh = self.sh
+        rows = [r for r in range(r1, r2 + 1) if not sh.row_hidden(r)]
+        cols = [c for c in range(c1, c2 + 1) if c not in sh.hidden_cols]
+        cells = []
+        for r in rows:
+            row = []
+            for c in cols:
+                value = self.wb.get_value(self.sheet, r, c)
+                fmt = dict(sh.formats.get((r, c)) or {})
+                style = self.wb.cond_format(self.sheet, r, c) or {}
+                fmt.update({k: style[k] for k in ("bg", "fg", "bold", "italic") if k in style})
+                default = ("right" if fe.is_number(value) else
+                           "center" if isinstance(value, (bool, fe.CellError)) else "left")
+                row.append({"text": self.wb.display_text(self.sheet, r, c), "align": fmt.get("align") or default,
+                            "fmt": fmt})
+            cells.append(row)
+        row_at, col_at = {r: i for i, r in enumerate(rows)}, {c: j for j, c in enumerate(cols)}
+        merges = []
+        for m in sh.merges:
+            if r1 <= m[0] and m[2] <= r2 and c1 <= m[1] and m[3] <= c2:
+                mr = [row_at[r] for r in range(m[0], m[2] + 1) if r in row_at]
+                mc = [col_at[c] for c in range(m[1], m[3] + 1) if c in col_at]
+                if mr and mc and (len(mr) > 1 or len(mc) > 1):
+                    merges.append((mr[0], mc[0], mr[-1], mc[-1]))
+        return {"cols": [sh.col_widths.get(c, fe.DEFAULT_COL_WIDTH) for c in cols],
+                "rows": [sh.row_heights.get(r, fe.DEFAULT_ROW_HEIGHT) for r in rows], "cells": cells, "merges": merges}
 
     def _paste_targets(self, h, w):
         """(row, col, i, j) for pasting an h x w block; a selection that is a multiple of

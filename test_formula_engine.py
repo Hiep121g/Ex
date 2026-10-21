@@ -1,6 +1,7 @@
 """Unit tests for the PyExcel formula engine.  Run:  python -m unittest -v"""
 
 import os
+import sys
 import tempfile
 import unittest
 
@@ -717,6 +718,91 @@ class ChartTests(unittest.TestCase):
     def test_xlsx_roundtrip(self):
         charts = self.roundtrip(".xlsx")
         self.assertEqual(charts, self.wb.sheets["Sheet1"].charts)
+
+
+class RichClipboardTests(unittest.TestCase):
+    TABLE = {"cols": [80, 120], "rows": [20, 30, 20],
+             "cells": [[{"text": "Bảng giá", "align": "center",
+                         "fmt": {"bold": True, "bg": "#ddebf7", "bb": ["thin", "#000000"]}},
+                        {"text": "", "align": "left", "fmt": {}}],
+                       [{"text": "Thép <D10>", "align": "left", "fmt": {"font": "Arial", "size": 10}},
+                        {"text": "1,250", "align": "right", "fmt": {"fg": "#ff0000", "br": ["double", "#000000"]}}],
+                       [{"text": "Dòng 1\nDòng 2", "align": "left", "fmt": {"wrap": True}},
+                        {"text": "", "align": "left", "fmt": {}}]],
+             "merges": [(0, 0, 0, 1)]}
+
+    def test_html(self):
+        import richclip
+        out = richclip.html_table(self.TABLE)
+        self.assertIn('<td colspan=2 style="', out)
+        self.assertEqual(out.count("<td"), 5)  # the merged-away cell is left out
+        self.assertIn("Thép &lt;D10&gt;", out)
+        self.assertIn("Dòng 1<br>Dòng 2", out)
+        self.assertIn("border-bottom:0.5pt solid #000000", out)
+        self.assertIn("font-weight:700", out)
+        data = richclip.html_clipboard(self.TABLE)
+        header = data[:data.index(b"<html>")].decode("ascii")
+        offsets = dict(line.split(":") for line in header.split())
+        fragment = data[int(offsets["StartFragment"]):int(offsets["EndFragment"])].decode("utf-8")
+        self.assertTrue(fragment.startswith("<table") and fragment.endswith("</table>"))
+        self.assertEqual(int(offsets["EndHTML"]), len(data))
+
+    def test_rtf(self):
+        import richclip
+        out = richclip.rtf_table(self.TABLE)
+        out.encode("ascii")  # RTF is 7-bit; Vietnamese goes through \u escapes
+        self.assertIn("\\clmgf", out)
+        self.assertIn("\\clmrg", out)
+        self.assertIn("\\cellx1200\\", out.replace("\n", "\\"))  # 80 px = 1200 twips
+        self.assertIn("B\\u7843?ng gi\\u225?", out)  # "Bảng giá"
+        self.assertIn("\\line ", out)
+        self.assertEqual(out.count("\\row"), 3)
+        self.assertIn("{\\f1\\fnil\\fcharset0 Arial;}", out)
+
+    def test_windows_clipboard_calls(self):
+        """Run the Win32 code path against a stand-in for user32/gdi32/kernel32 that records calls."""
+        import ctypes
+        import ctypes.wintypes
+        import types
+        from unittest import mock
+
+        import richclip
+        calls, handles = [], iter(range(1000, 100000))
+        caps = {88: 96, 90: 96, 4: 344, 8: 1920, 6: 194, 10: 1080}
+
+        def func(name):
+            def call(*args):
+                calls.append((name, args))
+                if name == "GetDeviceCaps":
+                    return caps[args[1]]
+                if name == "RegisterClipboardFormatW":
+                    return {"HTML Format": 49330, "Rich Text Format": 49331}[args[0]]
+                return 1 if name in ("OpenClipboard", "EmptyClipboard", "CloseClipboard") else next(handles)
+            return call
+
+        class FakeDll:
+            def __init__(self, *a, **k):
+                self.funcs = {}
+
+            def __getattr__(self, name):
+                return self.funcs.setdefault(name, mock.Mock(side_effect=func(name)))
+
+        fake = types.SimpleNamespace(WinDLL=FakeDll, wintypes=ctypes.wintypes, c_void_p=ctypes.c_void_p, c_int=ctypes.c_int,
+                                     c_size_t=ctypes.c_size_t, POINTER=ctypes.POINTER, byref=lambda x: x,
+                                     memmove=lambda *a: calls.append(("memmove", a)))
+        with mock.patch.object(richclip.sys, "platform", "win32"), mock.patch.dict("sys.modules", {"ctypes": fake}):
+            self.assertTrue(richclip.copy_to_clipboard(123, "a\tb\nc", self.TABLE))
+        names = [n for n, _ in calls]
+        formats = [a[0] for n, a in calls if n == "SetClipboardData"]
+        self.assertEqual(formats, [13, 49330, 49331, 14, 2])
+        self.assertLess(names.index("CloseEnhMetaFile"), names.index("OpenClipboard"))
+        self.assertEqual(names[-1], "CloseClipboard")
+        texts = [a[1] for n, a in calls if n == "DrawTextW"]
+        self.assertEqual(texts, ["Bảng giá", "Thép <D10>", "1,250", "Dòng 1\r\nDòng 2"])
+        payloads = [a[1] for n, a in calls if n == "memmove"]
+        self.assertEqual(payloads[0], "a\tb\r\nc\0".encode("utf-16-le"))
+        self.assertEqual(sum(1 for n in names if n == "CreatePen"), 2)
+        self.assertFalse(richclip.copy_to_clipboard(123, "x", self.TABLE) if sys.platform != "win32" else False)
 
 
 class LayoutFileTests(unittest.TestCase):
