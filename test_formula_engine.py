@@ -1026,6 +1026,34 @@ class PivotTests(unittest.TestCase):
             self.assertEqual(wb.get_value("Pivot", 4, 1), 2400)
 
 
+class NaturalOrderTests(unittest.TestCase):
+    def test_numbers_and_codes_sort_by_value(self):
+        order = lambda items: sorted(items, key=fe.natural_key)  # noqa: E731
+        self.assertEqual(order(["Mục 10", "Mục 2", "Mục 1"]), ["Mục 1", "Mục 2", "Mục 10"])
+        self.assertEqual(order(["10", "9", "1", "100"]), ["1", "9", "10", "100"])  # numbers typed as text
+        self.assertEqual(order([10.0, "9", 1.0, "2"]), [1.0, "2", "9", 10.0])     # mixed with real numbers
+        self.assertEqual(order(["BCR-1000x50", "BCR-300x30", "BCR-400x40"]), ["BCR-300x30", "BCR-400x40", "BCR-1000x50"])
+        self.assertEqual(order(["SP10", "sp2", "SP1"]), ["SP1", "sp2", "SP10"])
+        self.assertEqual(order(["15/09/2026", "02/10/2026", "01/01/2025"]), ["01/01/2025", "15/09/2026", "02/10/2026"])
+
+    def test_vietnamese_alphabet(self):
+        names = ["Đức", "Dũng", "Ánh", "Anh", "Bình", "Zung", "Ân", "Ăn", "Ệ", "Ê", "Em"]
+        self.assertEqual(sorted(names, key=fe.natural_key),
+                         ["Anh", "Ánh", "Ăn", "Ân", "Bình", "Dũng", "Đức", "Em", "Ê", "Ệ", "Zung"])
+
+    def test_filter_lists_and_pivot_items_use_it(self):
+        import pivot as pv
+        wb = make({"A1": "Mã", "B1": "Số", "A2": "SP10", "B2": "1", "A3": "SP2", "B3": "2", "A4": "SP1", "B4": "3",
+                   "A5": "'10", "B5": "4", "A6": "'9", "B6": "5"})
+        wb.sheets["Sheet1"].filter = {"range": (0, 0, 5, 1), "criteria": {}, "hidden": set()}
+        self.assertEqual(wb.filter_values("Sheet1", 0), ["9", "10", "SP1", "SP2", "SP10"])
+        p = pv.new_pivot("P", "Sheet1", (0, 0, 5, 1), (0, 3))
+        p.update(rows=["Mã"], values=[{"field": "Số", "func": "sum"}])
+        report = pv.compute(wb, p)
+        self.assertEqual([report.cells.get((r, 0)) for r in range(1, 6)], ["9", "10", "SP1", "SP2", "SP10"])
+        self.assertIs(fe.compare("<", "10", "9"), True)  # formulas still compare text the Excel way
+
+
 class LayoutFileTests(unittest.TestCase):
     def build(self):
         wb = make({"A1": "Báo cáo", "A2": "10", "A3": "20", "B2": "=A2*2", "A4": "x", "A5": "y"})

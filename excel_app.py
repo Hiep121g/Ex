@@ -3528,15 +3528,25 @@ class SpreadsheetApp:
         return r1, c1, r2, c2
 
     def _has_header(self, r1, c1, r2, c2):
+        """Guess, like Excel, whether the first row of a block holds column titles: all text, and
+        formatted unlike the next row, or above numbers (numbers typed as text count), or the
+        first row of a filter."""
         if r2 <= r1:
             return False
         first = [self.wb.get_value(self.sheet, r1, c) for c in range(c1, c2 + 1)]
         if not all(isinstance(v, str) and v for v in first):
             return False
-        if (self.sh.formats.get((r1, c1)) or {}).get("bold"):
+        f = self.sh.filter
+        if f and f["range"][0] == r1 and f["range"][1] <= c1 and c2 <= f["range"][3]:
+            return True
+
+        def look(r, c):
+            fmt = self.sh.formats.get((r, c)) or {}
+            return bool(fmt.get("bold")), fmt.get("bg"), bool(fmt.get("bb"))
+        if any(look(r1, c) != look(r1 + 1, c) for c in range(c1, c2 + 1)):
             return True
         second = [self.wb.get_value(self.sheet, r1 + 1, c) for c in range(c1, c2 + 1)]
-        return any(v is not None and not isinstance(v, str) for v in second)
+        return any(v not in (None, "") and fe.natural_key(v)[0] != 1 for v in second)
 
     def _sort_target(self):
         r1, c1, r2, c2 = self.sel_rect()
@@ -3581,7 +3591,7 @@ class SpreadsheetApp:
         for i in reversed(range(len(keys))):  # stable passes, most significant key last
             filled = [it for it in items if it[1][i] is not None and it[1][i] != ""]
             blanks = [it for it in items if it[1][i] is None or it[1][i] == ""]
-            filled.sort(key=lambda it: fe.sort_key(it[1][i]), reverse=keys[i][1])
+            filled.sort(key=lambda it: fe.natural_key(it[1][i]), reverse=keys[i][1])  # 2 before 10
             items = filled + blanks
         if first is not None:
             col, what, color = first

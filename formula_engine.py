@@ -24,6 +24,7 @@ import random
 import re
 import statistics
 import sys
+import unicodedata
 from collections import Counter, namedtuple
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal, InvalidOperation
 from fractions import Fraction
@@ -274,6 +275,55 @@ def sort_key(v):
     if isinstance(v, CellError):
         return (3, v.code)
     return (1, str(v).lower())
+
+
+# Vietnamese alphabetical order (with the Latin letters Vietnamese lacks), and the tones in dictionary order:
+# none, huyền, hỏi, ngã, sắc, nặng
+_VN_LETTERS = {ch: i for i, ch in enumerate("aăâbcdđeêfghijklmnoôơpqrstuưvwxyz")}
+_VN_TONES = {"\u0300": 1, "\u0309": 2, "\u0303": 3, "\u0301": 4, "\u0323": 5}
+_DIGITS_RE = re.compile(r"(\d+)")
+
+
+def _text_order(text):
+    """(letters, tones) ordering a piece of text alphabetically the Vietnamese way: "d" < "đ" < "e",
+    "a" < "ă" < "â" < "b", and tones only break ties ("anh" < "ánh" < "bình")."""
+    letters, tones = [], []
+    for ch in unicodedata.normalize("NFD", text.lower()):
+        if ch in _VN_TONES and tones:
+            tones[-1] = _VN_TONES[ch]
+        elif unicodedata.combining(ch) and letters:  # breve, circumflex, horn: part of the letter (ă, â, ơ...)
+            letters[-1] += ch
+        else:
+            letters.append(ch)
+            tones.append(0)
+    ranks = []
+    for letter in letters:
+        letter = unicodedata.normalize("NFC", letter)
+        if letter in _VN_LETTERS:
+            ranks.append(200 + _VN_LETTERS[letter])
+        else:  # spaces and ASCII punctuation sort before letters, other scripts after them
+            ranks.append(ord(letter[0]) if ord(letter[0]) < 200 else 1000 + ord(letter[0]))
+    return tuple(ranks), tuple(tones)
+
+
+def natural_key(v):
+    """Order for sorting in the UI - sorted rows, filter lists, PivotTable items - unlike Excel's:
+    numbers by value, also when typed as text ("2" before "10"), dates typed as text by date, and text
+    "naturally", runs of digits by value ("SP2" before "SP10", "BCR-300x30" before "BCR-1000x50") in
+    Vietnamese alphabetical order. Formulas keep Excel's rules (see compare / sort_key)."""
+    if isinstance(v, bool):
+        return (2, v)
+    if isinstance(v, CellError):
+        return (3, v.code)
+    if is_number(v):
+        return (0, float(v))
+    text = str(v).strip()
+    literal = parse_literal(text)[0] if text else ""
+    if is_number(literal):
+        return (0, float(literal))
+    parts = tuple((0, int(chunk)) if chunk.isdigit() else (1, _text_order(chunk))
+                  for chunk in _DIGITS_RE.split(text) if chunk)
+    return (1, parts, text.lower())
 
 
 def _blank_like(v):
@@ -2946,7 +2996,7 @@ class Workbook:
         texts = {}
         for r in range(r1 + 1, r2 + 1):
             texts.setdefault(self.display_text(sheet, r, col), self.get_value(sheet, r, col))
-        return sorted(texts, key=lambda t: (t == "", sort_key(texts[t]) if texts[t] is not None else (9,)))
+        return sorted(texts, key=lambda t: (t == "", natural_key(texts[t]) if texts[t] is not None else (9,)))
 
     def cell_color(self, sheet, r, c, what="bg"):
         """Fill ("bg") or font ("fg") colour a cell shows, conditional formatting included; None when

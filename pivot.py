@@ -101,12 +101,12 @@ def _item(value, text, group):
         try:
             d = fe.serial_to_datetime(value)
         except (OverflowError, ValueError):
-            return fe.sort_key(value), text
+            return fe.natural_key(value), text
         q = (d.month - 1) // 3 + 1
         return {"year": ((0, d.year), str(d.year)), "quarter": ((0, d.year, q), f"Quý {q}/{d.year}"),
                 "month": ((0, d.year, d.month), f"Tháng {d.month:02d}/{d.year}"),
                 "day": ((0, d.year, d.month, d.day), f"{d.day:02d}/{d.month:02d}/{d.year}")}[group]
-    return fe.sort_key(value), text
+    return fe.natural_key(value), text
 
 
 def field_items(source, pivot, field):
