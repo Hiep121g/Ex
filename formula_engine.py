@@ -10,6 +10,7 @@ rows/columns/cells are inserted or deleted, and reads/writes .pyxl (JSON),
 
 from __future__ import annotations
 
+import calendar
 import copy
 import csv
 import datetime as dt
@@ -886,21 +887,35 @@ class RangeRef:
     def flat(self):
         return [v for row in self.rows() for v in row]
 
-    def values(self):
-        """Non-empty values row by row; on large sparse ranges only stored cells are visited."""
+    def stored(self):
+        """(row, col) of the cells holding something, row by row; on large sparse ranges only
+        stored cells are visited."""
         cells = self.wb.sheets[self.sheet].cells
         if self.nrows * self.ncols <= len(cells):
-            for i in range(self.nrows):
-                for j in range(self.ncols):
-                    v = self.value(i, j)
-                    if v is not None:
-                        yield v
-        else:
-            keys = sorted(k for k in cells if self.r1 <= k[0] <= self.r2 and self.c1 <= k[1] <= self.c2)
-            for r, c in keys:
-                v = self.wb.get_value(self.sheet, r, c)
-                if v is not None:
-                    yield v
+            return [(r, c) for r in range(self.r1, min(self.r2 + 1, MAX_ROWS))
+                    for c in range(self.c1, min(self.c2 + 1, MAX_COLS)) if (r, c) in cells]
+        return sorted(k for k in cells if self.r1 <= k[0] <= self.r2 and self.c1 <= k[1] <= self.c2)
+
+    def values(self):
+        """Non-empty values row by row."""
+        for r, c in self.stored():
+            v = self.wb.get_value(self.sheet, r, c)
+            if v is not None:
+                yield v
+
+    def line(self):
+        """Cells of a one-row or one-column range, in order; None for a 2-D block."""
+        if self.ncols == 1:
+            return [self.value(i, 0) for i in range(self.nrows)]
+        if self.nrows == 1:
+            return [self.value(0, j) for j in range(self.ncols)]
+        return None
+
+    def part(self, i, by_row):
+        """Row i (by_row) or column i of the range, as a range."""
+        if by_row:
+            return RangeRef(self.wb, self.sheet, self.r1 + i, self.c1, self.r1 + i, self.c2)
+        return RangeRef(self.wb, self.sheet, self.r1, self.c1 + i, self.r2, self.c1 + i)
 
 
 def scalar(x):
@@ -920,7 +935,8 @@ def scalar(x):
 _FUNCS = {}
 _LAZY_FUNCS = {}  # take (workbook, argument nodes, sheet) and evaluate only what they need
 
-_FUNC_FORMATS = {"TODAY": "dd/mm/yyyy", "DATE": "dd/mm/yyyy", "NOW": "dd/mm/yyyy hh:mm"}
+_FUNC_FORMATS = {"TODAY": "dd/mm/yyyy", "DATE": "dd/mm/yyyy", "NOW": "dd/mm/yyyy hh:mm", "EDATE": "dd/mm/yyyy",
+                 "EOMONTH": "dd/mm/yyyy", "WORKDAY": "dd/mm/yyyy", "DATEVALUE": "dd/mm/yyyy", "TIME": "hh:mm"}
 
 
 def _register(*names, lazy=False):
@@ -1037,7 +1053,7 @@ def _f_median(*args):
     return float(statistics.median(nums))
 
 
-@_register("STDEV")
+@_register("STDEV", "STDEV.S")
 def _f_stdev(*args):
     nums = list(_numbers(args))
     if len(nums) < 2:
@@ -1045,12 +1061,99 @@ def _f_stdev(*args):
     return statistics.stdev(nums)
 
 
-@_register("VAR")
+@_register("VAR", "VAR.S")
 def _f_var(*args):
     nums = list(_numbers(args))
     if len(nums) < 2:
         raise CellError(DIV0)
     return statistics.variance(nums)
+
+
+@_register("STDEVP", "STDEV.P")
+def _f_stdevp(*args):
+    nums = list(_numbers(args))
+    if not nums:
+        raise CellError(DIV0)
+    return statistics.pstdev(nums)
+
+
+@_register("VARP", "VAR.P")
+def _f_varp(*args):
+    nums = list(_numbers(args))
+    if not nums:
+        raise CellError(DIV0)
+    return statistics.pvariance(nums)
+
+
+def _kth(args, k, largest):
+    nums = sorted(_numbers([args]), reverse=largest)
+    k = math.ceil(_num(k))
+    if not 1 <= k <= len(nums):
+        raise CellError(NUM)
+    return nums[k - 1]
+
+
+@_register("LARGE")
+def _f_large(array, k):
+    return _kth(array, k, True)
+
+
+@_register("SMALL")
+def _f_small(array, k):
+    return _kth(array, k, False)
+
+
+def _rank(x, ref, order, average):
+    v = _num(x)
+    nums = list(_numbers([_range_arg(ref)]))
+    if v not in nums:
+        raise CellError(NA)
+    ascending = order is not None and _num(order) != 0
+    better = sum(1 for n in nums if (n < v if ascending else n > v))
+    if not average:
+        return float(better + 1)
+    ties = nums.count(v)
+    return better + (ties + 1) / 2
+
+
+@_register("RANK", "RANK.EQ")
+def _f_rank(x, ref, order=None):
+    return _rank(x, ref, order, False)
+
+
+@_register("RANK.AVG")
+def _f_rank_avg(x, ref, order=None):
+    return _rank(x, ref, order, True)
+
+
+@_register("MODE", "MODE.SNGL")
+def _f_mode(*args):
+    nums = list(_numbers(args))
+    counts = Counter(nums)
+    best = max(counts.values(), default=0)
+    if best < 2:
+        raise CellError(NA)
+    return next(n for n in nums if counts[n] == best)  # the first one met wins ties, as in Excel
+
+
+@_register("PERCENTILE", "PERCENTILE.INC")
+def _f_percentile(array, k):
+    nums = sorted(_numbers([array]))
+    k = _num(k)
+    if not nums or not 0 <= k <= 1:
+        raise CellError(NUM)
+    pos = k * (len(nums) - 1)
+    lo = math.floor(pos)
+    hi = min(lo + 1, len(nums) - 1)
+    return nums[lo] + (nums[hi] - nums[lo]) * (pos - lo)
+
+
+@_register("QUARTILE", "QUARTILE.INC")
+def _f_quartile(array, quart):
+    q = math.trunc(_num(quart))
+    if not 0 <= q <= 4:
+        raise CellError(NUM)
+    return _f_percentile(array, q / 4)
 
 
 @_register("COUNT")
@@ -1205,6 +1308,128 @@ def _f_sumproduct(*ranges):
     return total
 
 
+@_register("SUMSQ")
+def _f_sumsq(*args):
+    return math.fsum(x * x for x in _numbers(args))
+
+
+@_register("MROUND")
+def _f_mround(x, multiple):
+    v, m = _num(x), _num(multiple)
+    if m == 0:
+        return 0.0
+    if v * m < 0:
+        raise CellError(NUM)
+    return _quantize(v / m, 0, ROUND_HALF_UP) * m
+
+
+@_register("QUOTIENT")
+def _f_quotient(a, b):
+    a, b = _num(a), _num(b)
+    if b == 0:
+        raise CellError(DIV0)
+    return float(math.trunc(a / b))
+
+
+def _whole_numbers(args):
+    nums = [math.trunc(x) for x in _numbers(args)]
+    if any(x < 0 for x in nums):
+        raise CellError(NUM)
+    return nums
+
+
+@_register("GCD")
+def _f_gcd(*args):
+    return float(math.gcd(*_whole_numbers(args)))
+
+
+@_register("LCM")
+def _f_lcm(*args):
+    return float(math.lcm(*_whole_numbers(args)))
+
+
+@_register("FACT")
+def _f_fact(x):
+    n = math.trunc(_num(x))
+    if n < 0 or n > 170:
+        raise CellError(NUM)
+    return float(math.factorial(n))
+
+
+@_register("COMBIN")
+def _f_combin(n, k):
+    n, k = math.trunc(_num(n)), math.trunc(_num(k))
+    if n < 0 or k < 0 or k > n:
+        raise CellError(NUM)
+    return float(math.comb(n, k))
+
+
+def _away_from_zero(v, parity):
+    """Round away from zero to the nearest even (parity 0) or odd (parity 1) integer."""
+    n = math.ceil(abs(v))
+    if n % 2 != parity:
+        n += 1
+    return float(math.copysign(n, v)) if v else float(parity)
+
+
+@_register("EVEN")
+def _f_even(x):
+    return _away_from_zero(_num(x), 0)
+
+
+@_register("ODD")
+def _f_odd(x):
+    return _away_from_zero(_num(x), 1)
+
+
+def _unary_math(name, func):
+    _register(name)(lambda x: func(_num(x)))
+
+
+for _name, _func in (("SIN", math.sin), ("COS", math.cos), ("TAN", math.tan), ("ASIN", math.asin),
+                     ("ACOS", math.acos), ("ATAN", math.atan), ("DEGREES", math.degrees),
+                     ("RADIANS", math.radians)):
+    _unary_math(_name, _func)
+
+
+@_register("ATAN2")
+def _f_atan2(x, y):
+    x, y = _num(x), _num(y)
+    if x == 0 and y == 0:
+        raise CellError(DIV0)
+    return math.atan2(y, x)  # Excel takes x first
+
+
+_SUBTOTALS = {1: "AVERAGE", 2: "COUNT", 3: "COUNTA", 4: "MAX", 5: "MIN", 6: "PRODUCT", 7: "STDEV",
+              8: "STDEVP", 9: "SUM", 10: "VAR", 11: "VARP"}
+_SUBTOTAL_RE = re.compile(r"=\s*SUBTOTAL\s*\(", re.I)
+
+
+@_register("SUBTOTAL")
+def _f_subtotal(kind, *refs):
+    """Aggregate that skips rows hidden by a filter (and, for codes 101-111, by hand) and
+    cells that are themselves SUBTOTALs."""
+    k = _int(kind)
+    name = _SUBTOTALS.get(k - 100 if k > 100 else k)
+    if name is None or not refs:
+        raise CellError(VALUE)
+    values = []
+    for ref in refs:
+        rng = _range_arg(ref)
+        sh = rng.wb.sheets[rng.sheet]
+        filtered = sh.filter["hidden"] if sh.filter else ()
+        for r, c in rng.stored():
+            if r in filtered or (k > 100 and r in sh.hidden_rows) or _SUBTOTAL_RE.match(sh.cells[(r, c)]):
+                continue
+            values.append(_raise_if_error(rng.wb.get_value(rng.sheet, r, c)))
+    if name == "COUNTA":
+        return len(values)
+    nums = [float(v) for v in values if is_number(v)]
+    if name == "COUNT":
+        return len(nums)
+    return _FUNCS[name](*nums)
+
+
 # logic
 def _logicals(args):
     for a in args:
@@ -1277,6 +1502,20 @@ def _f_ifs(wb, nodes, sheet):
     raise CellError(NA)
 
 
+@_register("SWITCH", lazy=True)
+def _f_switch(wb, nodes, sheet):
+    if len(nodes) < 3:
+        raise CellError(VALUE)
+    value = scalar(wb._eval(nodes[0], sheet))
+    pairs = nodes[1:]
+    for i in range(0, len(pairs) - 1, 2):
+        if compare("=", value, scalar(wb._eval(pairs[i], sheet))):
+            return wb._eval(pairs[i + 1], sheet)
+    if len(pairs) % 2:
+        return wb._eval(pairs[-1], sheet)
+    raise CellError(NA)
+
+
 @_register("IFERROR", lazy=True)
 def _f_iferror(wb, nodes, sheet):
     if len(nodes) != 2:
@@ -1342,6 +1581,32 @@ def _f_istext(x):
 @_register("ISLOGICAL")
 def _f_islogical(x):
     return isinstance(_peek(x), bool)
+
+
+@_register("ISNONTEXT")
+def _f_isnontext(x):
+    return not isinstance(_peek(x), str)
+
+
+@_register("ISEVEN")
+def _f_iseven(x):
+    return math.trunc(_num(x)) % 2 == 0
+
+
+@_register("ISODD")
+def _f_isodd(x):
+    return math.trunc(_num(x)) % 2 == 1
+
+
+@_register("ISFORMULA")
+def _f_isformula(ref):
+    rng = _range_arg(ref)
+    return is_formula(rng.wb.get_raw(rng.sheet, rng.r1, rng.c1))
+
+
+@_register("NA")
+def _f_na():
+    raise CellError(NA)
 
 
 @_register("ROW", lazy=True)
@@ -1527,6 +1792,33 @@ def _f_code(x):
     return ord(s[0])
 
 
+def _split_at(x, delimiter, instance):
+    """Text before and after the n-th delimiter (counting from the end when n < 0)."""
+    s, d, n = _text(x), _text(delimiter), _int(instance)
+    if n == 0 or not d:
+        raise CellError(VALUE)
+    pos, end = -1, len(s)
+    for _ in range(abs(n)):
+        if n > 0:
+            pos = s.find(d, pos + 1)
+        else:
+            pos = s.rfind(d, 0, end)
+            end = pos + len(d) - 1
+        if pos < 0:
+            raise CellError(NA)
+    return s[:pos], s[pos + len(d):]
+
+
+@_register("TEXTBEFORE")
+def _f_textbefore(x, delimiter, instance=1):
+    return _split_at(x, delimiter, instance)[0]
+
+
+@_register("TEXTAFTER")
+def _f_textafter(x, delimiter, instance=1):
+    return _split_at(x, delimiter, instance)[1]
+
+
 # dates
 @_register("TODAY")
 def _f_today():
@@ -1582,6 +1874,125 @@ def _f_weekday(x, kind=1):
 @_register("DAYS")
 def _f_days(end, start):
     return math.floor(_num(end)) - math.floor(_num(start))
+
+
+@_register("SECOND")
+def _f_second(x):
+    return serial_to_datetime(_num(x) + 1 / 172800).second
+
+
+@_register("TIME")
+def _f_time(h, m, s):
+    total = _int(h) * 3600 + _int(m) * 60 + _int(s)
+    if total < 0:
+        raise CellError(NUM)
+    return (total % 86400) / 86400
+
+
+@_register("DATEVALUE")
+def _f_datevalue(x):
+    value, fmt = parse_literal(_text(x))
+    if not (fmt and is_date_format(fmt)):
+        raise CellError(VALUE)
+    return float(math.floor(value))
+
+
+def _date_of(x):
+    return serial_to_datetime(math.floor(_num(x))).date()
+
+
+def _plus_months(d, months):
+    """(year, month) `months` after the month of date d."""
+    y, m = divmod(d.month - 1 + months, 12)
+    if not 1 <= d.year + y <= 9999:
+        raise CellError(NUM)
+    return d.year + y, m + 1
+
+
+@_register("EDATE")
+def _f_edate(start, months):
+    d = _date_of(start)
+    y, m = _plus_months(d, math.trunc(_num(months)))
+    return date_to_serial(dt.date(y, m, min(d.day, calendar.monthrange(y, m)[1])))
+
+
+@_register("EOMONTH")
+def _f_eomonth(start, months):
+    y, m = _plus_months(_date_of(start), math.trunc(_num(months)))
+    return date_to_serial(dt.date(y, m, calendar.monthrange(y, m)[1]))
+
+
+def _is_weekend(serial):
+    return (serial + 5) % 7 >= 5  # serial 0 (30/12/1899) was a Saturday
+
+
+def _holidays(arg):
+    return set() if arg is None else {math.floor(v) for v in _numbers([arg])}
+
+
+@_register("NETWORKDAYS")
+def _f_networkdays(start, end, holidays=None):
+    a, b = math.floor(_num(start)), math.floor(_num(end))
+    sign = 1 if a <= b else -1
+    a, b = min(a, b), max(a, b)
+    weeks, rest = divmod(b - a + 1, 7)
+    count = weeks * 5 + sum(1 for d in range(b - rest + 1, b + 1) if not _is_weekend(d))
+    count -= sum(1 for d in _holidays(holidays) if a <= d <= b and not _is_weekend(d))
+    return float(sign * count)
+
+
+@_register("WORKDAY")
+def _f_workday(start, days, holidays=None):
+    d, n = math.floor(_num(start)), math.trunc(_num(days))
+    if abs(n) > 1_000_000:
+        raise CellError(NUM)
+    skip, step = _holidays(holidays), 1 if n >= 0 else -1
+    while n:
+        d += step
+        if not _is_weekend(d) and d not in skip:
+            n -= step
+    return float(d)
+
+
+@_register("DATEDIF")
+def _f_datedif(start, end, unit):
+    a, b, unit = _date_of(start), _date_of(end), _text(unit).upper()
+    if a > b:
+        raise CellError(NUM)
+    months = (b.year - a.year) * 12 + b.month - a.month - (b.day < a.day)
+
+    def shifted(d, n):  # d moved n months on, the day clamped to the month's length
+        y, m = _plus_months(d, n)
+        return dt.date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+    if unit == "D":
+        return float((b - a).days)
+    if unit == "M":
+        return float(months)
+    if unit == "Y":
+        return float(months // 12)
+    if unit == "YM":
+        return float(months % 12)
+    if unit == "MD":
+        return float((b - shifted(a, months)).days)
+    if unit == "YD":
+        return float((b - shifted(a, months // 12 * 12)).days)
+    raise CellError(NUM)
+
+
+@_register("WEEKNUM")
+def _f_weeknum(x, kind=1):
+    d, kind = _date_of(x), _int(kind)
+    if kind not in (1, 2):
+        raise CellError(NUM)
+    jan1 = dt.date(d.year, 1, 1)
+    offset = (jan1.weekday() + 1) % 7 if kind == 1 else jan1.weekday()  # days of week 1 before Jan 1
+    return float((d.timetuple().tm_yday - 1 + offset) // 7 + 1)
+
+
+@_register("ISOWEEKNUM")
+def _f_isoweeknum(x):
+    return float(_date_of(x).isocalendar()[1])
 
 
 # lookup
@@ -1650,6 +2061,124 @@ def _f_match(key, rng, mode=1):
     return _match_index(rng.flat(), scalar(key), (m > 0) - (m < 0)) + 1
 
 
+def _wildcard_re(text):
+    """Regex for an Excel pattern where * is any run of characters and ? any one character."""
+    return re.compile("".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in text), re.S)
+
+
+def _xmatch_index(items, key, match_mode, search_mode):
+    """Position of `key` for XLOOKUP/XMATCH: match_mode 0 exact, -1 exact or next smaller,
+    1 exact or next larger, 2 wildcard; a negative search_mode searches from the end."""
+    if match_mode not in (-1, 0, 1, 2) or search_mode not in (-2, -1, 1, 2):
+        raise CellError(VALUE)
+    if key is None:
+        raise CellError(NA)
+    order = range(len(items)) if search_mode > 0 else range(len(items) - 1, -1, -1)
+    if match_mode == 2:
+        pattern = _wildcard_re(to_text(key).lower())
+        for i in order:
+            if isinstance(items[i], str) and pattern.fullmatch(items[i].lower()):
+                return i
+        raise CellError(NA)
+    rank, best = sort_key(key)[0], None
+    for i in order:
+        v = items[i]
+        if v is None or isinstance(v, CellError):
+            continue
+        if compare("=", v, key):
+            return i
+        if (match_mode and sort_key(v)[0] == rank and compare("<" if match_mode < 0 else ">", v, key)
+                and (best is None or compare(">" if match_mode < 0 else "<", v, items[best]))):
+            best = i
+    if best is None:
+        raise CellError(NA)
+    return best
+
+
+def _optional_int(wb, nodes, i, sheet, default):
+    if len(nodes) <= i or nodes[i][0] == "empty":
+        return default
+    return int(to_number(scalar(wb._eval(nodes[i], sheet))))
+
+
+@_register("XLOOKUP", lazy=True)
+def _f_xlookup(wb, nodes, sheet):
+    if not 3 <= len(nodes) <= 6:
+        raise CellError(VALUE)
+    key = scalar(wb._eval(nodes[0], sheet))
+    look = _range_arg(wb._eval(nodes[1], sheet))
+    result = _range_arg(wb._eval(nodes[2], sheet))
+    items = look.line()
+    by_row = look.ncols == 1
+    if items is None or (result.nrows if by_row else result.ncols) != len(items):
+        raise CellError(VALUE)
+    match_mode = _optional_int(wb, nodes, 4, sheet, 0)
+    search_mode = _optional_int(wb, nodes, 5, sheet, 1)
+    try:
+        i = _xmatch_index(items, key, match_mode, search_mode)
+    except CellError as err:
+        if err.code != NA or len(nodes) < 4 or nodes[3][0] == "empty":
+            raise
+        return wb._eval(nodes[3], sheet)
+    return result.part(i, by_row)
+
+
+@_register("XMATCH")
+def _f_xmatch(key, rng, match_mode=None, search_mode=None):
+    items = _range_arg(rng).line()
+    if items is None:
+        raise CellError(VALUE)
+    match_mode = 0 if match_mode is None else _int(match_mode)
+    search_mode = 1 if search_mode is None else _int(search_mode)
+    return _xmatch_index(items, scalar(key), match_mode, search_mode) + 1
+
+
+@_register("OFFSET")
+def _f_offset(ref, rows, cols, height=None, width=None):
+    ref = _range_arg(ref)
+    r1, c1 = ref.r1 + _int(rows), ref.c1 + _int(cols)
+    h = ref.nrows if height is None else _int(height)
+    w = ref.ncols if width is None else _int(width)
+    if h == 0 or w == 0:
+        raise CellError(REF)
+    if h < 0:  # a negative height or width reaches up / left
+        r1, h = r1 + h + 1, -h
+    if w < 0:
+        c1, w = c1 + w + 1, -w
+    if r1 < 0 or c1 < 0 or r1 + h > MAX_ROWS or c1 + w > MAX_COLS:
+        raise CellError(REF)
+    return RangeRef(ref.wb, ref.sheet, r1, c1, r1 + h - 1, c1 + w - 1)
+
+
+_R1C1_RE = re.compile(r"R(\d+)C(\d+)(?::R(\d+)C(\d+))?", re.I)
+
+
+@_register("INDIRECT", lazy=True)
+def _f_indirect(wb, nodes, sheet):
+    if len(nodes) not in (1, 2):
+        raise CellError(VALUE)
+    text = to_text(scalar(wb._eval(nodes[0], sheet))).strip()
+    a1 = len(nodes) < 2 or nodes[1][0] == "empty" or to_bool(scalar(wb._eval(nodes[1], sheet)))
+    sheet_ref = None
+    if "!" in text:
+        sheet_ref, text = text.rsplit("!", 1)
+        if len(sheet_ref) >= 2 and sheet_ref[0] == sheet_ref[-1] == "'":
+            sheet_ref = sheet_ref[1:-1].replace("''", "'")
+    if a1:
+        rect = parse_range(text)
+    else:
+        m = _R1C1_RE.fullmatch(text)
+        if m:
+            ra, ca = int(m.group(1)) - 1, int(m.group(2)) - 1
+            rb, cb = (int(m.group(3)) - 1, int(m.group(4)) - 1) if m.group(3) else (ra, ca)
+            rect = (min(ra, rb), min(ca, cb), max(ra, rb), max(ca, cb))
+        else:
+            rect = None
+    if rect is None:
+        raise CellError(REF)
+    return wb._range(sheet_ref, sheet, *rect)
+
+
 # conditional aggregation
 def _criteria(crit):
     """Predicate for COUNTIF/SUMIF-style criteria such as 5, ">5", "<>x" or "a*"."""
@@ -1673,7 +2202,7 @@ def _criteria(crit):
     t = target.lower()
     pattern = None
     if op in ("=", "<>") and ("*" in t or "?" in t):
-        pattern = re.compile("".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in t), re.S)
+        pattern = _wildcard_re(t)
 
     def pred(v):
         if op in ("=", "<>"):
@@ -1746,6 +2275,27 @@ def _f_averageif(rng, crit, avg_rng=None):
     if not nums:
         raise CellError(DIV0)
     return math.fsum(nums) / len(nums)
+
+
+@_register("AVERAGEIFS")
+def _f_averageifs(avg_rng, *pairs):
+    base, hits = _matching_cells(pairs)
+    nums = list(_numbers_at(_aligned(base, _range_arg(avg_rng)), hits))
+    if not nums:
+        raise CellError(DIV0)
+    return math.fsum(nums) / len(nums)
+
+
+@_register("MAXIFS")
+def _f_maxifs(max_rng, *pairs):
+    base, hits = _matching_cells(pairs)
+    return max(_numbers_at(_aligned(base, _range_arg(max_rng)), hits), default=0.0)
+
+
+@_register("MINIFS")
+def _f_minifs(min_rng, *pairs):
+    base, hits = _matching_cells(pairs)
+    return min(_numbers_at(_aligned(base, _range_arg(min_rng)), hits), default=0.0)
 
 
 # ------------------------------------------------------------------ workbook
@@ -2174,6 +2724,7 @@ class Workbook:
                     hidden.add(r)
                     break
         f["hidden"] = hidden
+        self.invalidate()  # SUBTOTAL results depend on which rows are filtered out
 
     # structure
     def insert_cells(self, sheet, r1, c1, r2, c2, shift="down"):

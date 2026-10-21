@@ -169,6 +169,124 @@ class FormulaTests(unittest.TestCase):
             wb.set_raw("Sheet1", 9, 0, formula)
             self.assertEqual(val(wb, "A10"), expected, formula)
 
+    def test_more_math_and_statistics(self):
+        wb = make({"A1": "3", "A2": "1", "A3": "4", "A4": "1", "A5": "5", "A6": "x"})
+        cases = {
+            "=LARGE(A1:A6,2)": 4, "=SMALL(A1:A6,1)": 1, "=LARGE(A1:A6,9)": CellError(fe.NUM),
+            "=RANK(4,A1:A5)": 2, "=RANK(4,A1:A5,1)": 4, "=RANK.AVG(1,A1:A5,1)": 1.5, "=RANK(9,A1:A5)": CellError(fe.NA),
+            "=MODE(A1:A5)": 1, "=PERCENTILE(A1:A5,0.5)": 3, "=QUARTILE(A1:A5,1)": 1, "=QUARTILE(A1:A5,4)": 5,
+            "=VARP(A1:A5)": 2.56, "=SUMSQ(A1:A3)": 26, "=MROUND(7,3)": 6, "=MROUND(-7,3)": CellError(fe.NUM),
+            "=QUOTIENT(-7,2)": -3, "=GCD(12,18)": 6, "=LCM(4,6)": 12, "=FACT(5)": 120, "=COMBIN(5,2)": 10,
+            "=EVEN(1.5)": 2, "=EVEN(-1)": -2, "=ODD(2)": 3, "=ODD(0)": 1, "=DEGREES(PI())": 180,
+            "=SIN(PI()/2)": 1, "=ATAN2(1,1)*4": 3.141592653589793,
+        }
+        for formula, expected in cases.items():
+            wb.set_raw("Sheet1", 9, 0, formula)
+            if isinstance(expected, CellError):
+                self.assertEqual(val(wb, "A10"), expected, formula)
+            else:
+                self.assertAlmostEqual(val(wb, "A10"), expected, msg=formula)
+
+    def test_conditional_ifs(self):
+        wb = make({"A1": "x", "B1": "5", "A2": "y", "B2": "15", "A3": "x", "B3": "25", "A4": "x", "B4": "1"})
+        cases = {
+            '=AVERAGEIFS(B1:B4,A1:A4,"x",B1:B4,">2")': 15,
+            '=MAXIFS(B1:B4,A1:A4,"x")': 25, '=MINIFS(B1:B4,A1:A4,"x")': 1, '=MAXIFS(B1:B4,A1:A4,"z")': 0,
+            '=AVERAGEIFS(B1:B4,A1:A4,"z")': CellError(fe.DIV0),
+        }
+        for formula, expected in cases.items():
+            wb.set_raw("Sheet1", 9, 0, formula)
+            self.assertEqual(val(wb, "A10"), expected, formula)
+
+    def test_subtotal_skips_hidden_rows_and_subtotals(self):
+        wb = make({"A1": "1", "A2": "2", "A3": "4", "A4": "=SUBTOTAL(9,A1:A3)", "A5": "8"})
+        wb.set_raw("Sheet1", 9, 0, "=SUBTOTAL(9,A1:A5)")
+        self.assertEqual(val(wb, "A10"), 15)  # A4 is a subtotal, so it is not counted twice
+        sh = wb.sheets["Sheet1"]
+        sh.hidden_rows.add(1)
+        wb.invalidate()
+        self.assertEqual(val(wb, "A10"), 15)  # code 9 keeps rows hidden by hand
+        wb.set_raw("Sheet1", 9, 0, "=SUBTOTAL(109,A1:A5)")
+        self.assertEqual(val(wb, "A10"), 13)
+        sh.filter = {"range": (0, 0, 4, 0), "criteria": {}, "hidden": {2}}
+        wb.set_raw("Sheet1", 9, 0, "=SUBTOTAL(9,A1:A5)")
+        self.assertEqual(val(wb, "A10"), 11)  # rows hidden by a filter are always skipped
+        wb.set_raw("Sheet1", 9, 0, "=SUBTOTAL(2,A1:A5)")
+        self.assertEqual(val(wb, "A10"), 3)
+
+    def test_xlookup_and_friends(self):
+        wb = make({"A1": "apple", "B1": "10", "C1": "a", "A2": "banana", "B2": "20", "C2": "b",
+                   "A3": "cherry", "B3": "30", "C3": "c", "A4": "banana", "B4": "40", "C4": "d",
+                   "E1": "1", "F1": "2", "G1": "3", "E2": "x", "F2": "y", "G2": "z"})
+        cases = {
+            '=XLOOKUP("banana",A1:A4,B1:B4)': 20,
+            '=XLOOKUP("banana",A1:A4,B1:B4,,0,-1)': 40,
+            '=XLOOKUP("kiwi",A1:A4,B1:B4)': CellError(fe.NA),
+            '=XLOOKUP("kiwi",A1:A4,B1:B4,"không có")': "không có",
+            '=XLOOKUP(25,B1:B4,A1:A4,,1)': "cherry",
+            '=XLOOKUP(25,B1:B4,A1:A4,,-1)': "banana",
+            '=XLOOKUP("ch*",A1:A4,C1:C4,,2)': "c",
+            '=SUM(XLOOKUP("cherry",A1:A4,B1:C4))': 30,  # a whole row comes back
+            "=XLOOKUP(2,E1:G1,E2:G2)": "y",
+            "=XLOOKUP(2,E1:G1,E2:F2)": CellError(fe.VALUE),
+            '=XMATCH("cherry",A1:A4)': 3, '=XMATCH("banana",A1:A4,0,-1)': 4,
+            "=SUM(OFFSET(A1,1,1,2,1))": 50, "=OFFSET(B1,3,0)": 40, "=OFFSET(A1,-1,0)": CellError(fe.REF),
+            '=INDIRECT("B"&2)': 20, '=SUM(INDIRECT("B1:B3"))': 60, '=INDIRECT("R3C2",FALSE)': 30,
+            '=INDIRECT("nope")': CellError(fe.REF),
+            '=SWITCH(C2,"a",1,"b",2)': 2, '=SWITCH(C4,"a",1,"b",2,"khác")': "khác", '=SWITCH(9,1,2)': CellError(fe.NA),
+            '=ISFORMULA(A1)': False, '=ISEVEN(4)': True, '=ISODD(-3)': True, '=ISNONTEXT(B1)': True,
+            '=IFNA(NA(),"ok")': "ok",
+            '=TEXTBEFORE("a-b-c","-")': "a", '=TEXTAFTER("a-b-c","-")': "b-c", '=TEXTBEFORE("a-b-c","-",-1)': "a-b",
+            '=TEXTAFTER("a-b-c","-",2)': "c", '=TEXTAFTER("a-b","+")': CellError(fe.NA),
+        }
+        for formula, expected in cases.items():
+            wb.set_raw("Sheet1", 9, 0, formula)
+            self.assertEqual(val(wb, "A10"), expected, formula)
+        wb.set_raw("Sheet1", 9, 1, '=INDIRECT("A10")')  # follows the formula above
+        self.assertEqual(val(wb, "B10"), CellError(fe.NA))
+
+    def test_more_dates(self):
+        d = fe.parse_literal
+
+        def ev(formula):
+            self.wb.set_raw("Sheet1", 99, 0, formula)
+            return self.wb.get_value("Sheet1", 99, 0)
+
+        def text(formula):
+            ev(formula)
+            return fe.format_value(*self.wb.cell_display("Sheet1", 99, 0))
+
+        self.assertEqual(text("=EDATE(DATE(2026,1,31),1)"), "28/02/2026")
+        self.assertEqual(text("=EDATE(DATE(2026,3,15),-3)"), "15/12/2025")
+        self.assertEqual(text("=EOMONTH(DATE(2024,1,10),1)"), "29/02/2024")
+        self.assertEqual(text("=WORKDAY(DATE(2026,10,23),1)"), "26/10/2026")  # Friday -> Monday
+        self.assertEqual(ev("=WORKDAY(DATE(2026,10,26),-1)"), d("23/10/2026")[0])
+        self.assertEqual(ev("=NETWORKDAYS(DATE(2026,10,1),DATE(2026,10,31))"), 22)
+        self.assertEqual(ev("=NETWORKDAYS(DATE(2026,10,31),DATE(2026,10,1))"), -22)
+        self.wb.set_raw("Sheet1", 0, 4, "02/10/2026")
+        self.assertEqual(ev("=NETWORKDAYS(DATE(2026,10,1),DATE(2026,10,31),E1)"), 21)
+        self.assertEqual(ev("=WORKDAY(DATE(2026,10,1),1,E1)"), d("05/10/2026")[0])
+        self.assertEqual(ev('=DATEDIF(DATE(2000,5,20),DATE(2026,10,21),"Y")'), 26)
+        self.assertEqual(ev('=DATEDIF(DATE(2000,5,20),DATE(2026,10,21),"M")'), 317)
+        self.assertEqual(ev('=DATEDIF(DATE(2000,5,20),DATE(2026,10,21),"YM")'), 5)
+        self.assertEqual(ev('=DATEDIF(DATE(2000,5,20),DATE(2026,10,21),"MD")'), 1)
+        self.assertEqual(ev('=DATEDIF(DATE(2026,1,1),DATE(2026,3,1),"D")'), 59)
+        self.assertEqual(ev('=DATEDIF(DATE(2026,3,1),DATE(2026,1,1),"D")'), CellError(fe.NUM))
+        self.assertEqual(ev('=DATEDIF(DATE(2025,12,25),DATE(2026,1,5),"YD")'), 11)
+        self.assertEqual(text("=TIME(14,30,0)"), "14:30")
+        self.assertEqual(ev("=SECOND(TIME(1,2,3))"), 3)
+        self.assertEqual(ev('=DATEVALUE("21/10/2026")'), d("21/10/2026")[0])
+        self.assertEqual(ev('=DATEVALUE("abc")'), CellError(fe.VALUE))
+        self.assertEqual(ev("=WEEKNUM(DATE(2026,1,3))"), 1)   # Saturday of the first week
+        self.assertEqual(ev("=WEEKNUM(DATE(2026,1,4))"), 2)   # Sunday starts week 2
+        self.assertEqual(ev("=WEEKNUM(DATE(2026,1,4),2)"), 1)  # weeks starting on Monday
+        self.assertEqual(ev("=ISOWEEKNUM(DATE(2026,10,21))"), 43)
+
+    def test_every_function_is_documented(self):
+        from function_info import CATEGORIES, FUNCTION_INFO
+        self.assertEqual(set(fe.function_names()) - set(FUNCTION_INFO), set())
+        self.assertTrue(all(info[0] in CATEGORIES for info in FUNCTION_INFO.values()))
+
     def test_circular(self):
         wb = make({"A1": "=B1+1", "B1": "=A1+1", "C1": "=C1"})
         self.assertEqual(val(wb, "A1"), CellError(fe.CIRC))
