@@ -377,6 +377,54 @@ def _icon_info(cv, P, k, c):
     _glyph(cv, P, k, 8, 8, "i", 10, "#ffffff", "bold", family="Georgia")
 
 
+def _icon_freeze(cv, P, k, c):
+    _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 4, GRAY, "#ffffff")
+    cv.create_rectangle(*P(1.5, 1.5, 14.5, 4.75), fill="#bdd7ee", outline=GRAY)
+    cv.create_rectangle(*P(1.5, 1.5, 4.75, 14.5), fill="#bdd7ee", outline=GRAY)
+    cv.create_line(*P(1.5, 4.75, 14.5, 4.75), fill=BLUE, width=max(1, round(1.4 * k)))
+    cv.create_line(*P(4.75, 1.5, 4.75, 14.5), fill=BLUE, width=max(1, round(1.4 * k)))
+
+
+def _icon_validation(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 3, 12.5, 8), fill="#ffffff", outline=GRAY)
+    cv.create_rectangle(*P(9, 3, 12.5, 8), fill="#e8e8e8", outline=GRAY)
+    cv.create_polygon(*P(9.75, 4.75, 11.75, 4.75, 10.75, 6.5), fill=DARK, outline="")
+    cv.create_line(*P(5, 12, 7.5, 14.5, 14.5, 7.5), fill=GREEN, width=max(2, round(1.8 * k)))
+    cv.create_line(*P(1.5, 10, 4.5, 13), fill=RED, width=max(1, round(1.4 * k)))
+    cv.create_line(*P(4.5, 10, 1.5, 13), fill=RED, width=max(1, round(1.4 * k)))
+
+
+def _icon_note(cv, P, k, c, delete=False):
+    cv.create_polygon(*P(2, 2, 14, 2, 14, 10.5, 10.5, 14, 2, 14), fill="#fff2a8", outline="#b89b00")
+    cv.create_polygon(*P(10.5, 14, 10.5, 10.5, 14, 10.5), fill="#e6cf4f", outline="#b89b00")
+    _lines(cv, P, k, [(4, 5, 12), (4, 7.5, 12), (4, 10, 9)], GRAY)
+    if delete:
+        cv.create_line(*P(9, 9, 15.5, 15.5), fill=RED, width=max(2, round(1.6 * k)))
+        cv.create_line(*P(15.5, 9, 9, 15.5), fill=RED, width=max(2, round(1.6 * k)))
+
+
+CHART_COLORS = ("#4472c4", "#ed7d31", "#a5a5a5", "#ffc000", "#5b9bd5", "#70ad47")
+
+
+def _icon_chart(cv, P, k, c, kind="column"):
+    if kind == "pie":
+        cv.create_arc(*P(1.5, 1.5, 14.5, 14.5), start=90, extent=-130, fill=CHART_COLORS[0], outline="#ffffff")
+        cv.create_arc(*P(1.5, 1.5, 14.5, 14.5), start=-40, extent=-110, fill=CHART_COLORS[1], outline="#ffffff")
+        cv.create_arc(*P(1.5, 1.5, 14.5, 14.5), start=-150, extent=-120, fill=CHART_COLORS[3], outline="#ffffff")
+        return
+    cv.create_line(*P(1.5, 1.5, 1.5, 14.5, 14.5, 14.5), fill=GRAY)
+    if kind == "line":
+        cv.create_line(*P(2.5, 11, 6, 7, 9, 9, 14, 3), fill=CHART_COLORS[0], width=max(2, round(1.6 * k)))
+        cv.create_line(*P(2.5, 13, 6, 11, 9, 12, 14, 8), fill=CHART_COLORS[1], width=max(2, round(1.6 * k)))
+    elif kind == "bar":
+        for i, (w, color) in enumerate(((9, CHART_COLORS[0]), (12, CHART_COLORS[1]), (6, CHART_COLORS[0]))):
+            cv.create_rectangle(*P(1.5, 2.5 + i * 4, 1.5 + w, 5 + i * 4), fill=color, outline="")
+    else:
+        for i, (h, color) in enumerate(((6, CHART_COLORS[0]), (10, CHART_COLORS[1]), (8, CHART_COLORS[0]),
+                                        (12, CHART_COLORS[1]))):
+            cv.create_rectangle(*P(3 + i * 3, 14.5 - h, 5 + i * 3, 14.5), fill=color, outline="")
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -417,6 +465,10 @@ ICONS = {
     "zoom": _icon_zoom, "zoom100": lambda *a: _icon_zoom(*a, label="1:1"),
     "zoom_sel": lambda *a: _icon_zoom(*a, label="□"),
     "remove_dup": _icon_remove_dup, "help": _icon_help, "info": _icon_info, "launcher": _icon_launcher,
+    "freeze": _icon_freeze, "validation": _icon_validation, "note": _icon_note,
+    "note_delete": lambda *a: _icon_note(*a, delete=True),
+    "chart_column": _icon_chart, "chart_bar": lambda *a: _icon_chart(*a, kind="bar"),
+    "chart_line": lambda *a: _icon_chart(*a, kind="line"), "chart_pie": lambda *a: _icon_chart(*a, kind="pie"),
 }
 
 

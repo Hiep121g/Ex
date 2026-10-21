@@ -2300,11 +2300,24 @@ def _f_minifs(min_rng, *pairs):
 
 # ------------------------------------------------------------------ workbook
 
+def _shift_freeze(freeze, axis, move_span):
+    """Frozen panes after rows (axis 0) or columns (axis 1) were inserted or deleted."""
+    a0, a1 = freeze[0:2] if axis == 0 else freeze[2:4]
+    if a1 > a0:
+        span = move_span(a0, a1 - 1)
+        a0, a1 = (span[0], span[1] + 1) if span else (0, 0)
+    elif a0:
+        span = move_span(a0, a0)
+        a0 = a1 = span[0] if span else 0
+    freeze = (a0, a1) + tuple(freeze[2:4]) if axis == 0 else tuple(freeze[0:2]) + (a0, a1)
+    return freeze if freeze[1] > freeze[0] or freeze[3] > freeze[2] else None
+
+
 class Sheet:
     """One worksheet. Format dicts are never mutated in place, only replaced."""
 
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
-              "hidden_cols", "merges", "cond_formats", "filter", "tab_color")
+              "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2322,6 +2335,7 @@ class Sheet:
         self.cond_formats = []  # [{"range": (r1, c1, r2, c2), "type": ..., ...}] - later rules win
         self.filter = None      # {"range": (r1, c1, r2, c2), "criteria": {col: set(texts)}, "hidden": set(rows)}
         self.tab_color = None
+        self.freeze = None      # (r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 stay put when scrolling
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -2823,6 +2837,8 @@ class Workbook:
                 elif band is None:
                     sh.filter["criteria"] = {n: v for c, v in sh.filter["criteria"].items()
                                              if (n := move(c)) is not None}
+        if band is None and sh.freeze:
+            sh.freeze = _shift_freeze(sh.freeze, axis, move_span)
         if band is None and axis == 0:
             sh.row_heights = {n: h for r, h in sh.row_heights.items() if (n := move(r)) is not None}
             sh.custom_rows, sh.hidden_rows = move_set(sh.custom_rows), move_set(sh.hidden_rows)
@@ -2856,6 +2872,8 @@ class Workbook:
                 "cond_formats": [dict(rule, range=range_name(*rule["range"])) for rule in s.cond_formats],
                 "tab_color": s.tab_color,
             }
+            if s.freeze:
+                d["freeze"] = list(s.freeze)
             if s.filter:
                 d["filter"] = {"range": range_name(*s.filter["range"]),
                                "criteria": {col_name(c): sorted(v) for c, v in s.filter["criteria"].items()}}
@@ -2889,6 +2907,9 @@ class Workbook:
             sh.cond_formats = [dict(rule, range=parse_range(rule["range"])) for rule in sd.get("cond_formats", [])
                                if parse_range(rule.get("range", ""))]
             sh.tab_color = sd.get("tab_color")
+            freeze = sd.get("freeze")
+            if isinstance(freeze, list) and len(freeze) == 4:
+                sh.freeze = tuple(int(v) for v in freeze)
             f = sd.get("filter")
             if f and parse_range(f.get("range", "")):
                 sh.filter = {"range": parse_range(f["range"]), "hidden": set(),
@@ -3110,6 +3131,19 @@ def _cf_rule_from_xlsx(rule):
     return None
 
 
+def _freeze_from_xlsx(ws):
+    view = ws.sheet_view
+    pane = view.pane
+    if pane is None or pane.state not in ("frozen", "frozenSplit"):
+        return None
+    origin = parse_address(view.topLeftCell or "A1")
+    r0, c0 = origin if origin and len(origin) == 2 else (0, 0)
+    ys, xs = int(pane.ySplit or 0), int(pane.xSplit or 0)
+    if not (ys or xs) or r0 + ys >= MAX_ROWS or c0 + xs >= MAX_COLS:
+        return None
+    return (r0, r0 + ys, c0, c0 + xs)
+
+
 def _load_xlsx(path):
     import openpyxl
 
@@ -3151,6 +3185,7 @@ def _load_xlsx(path):
         sh.set_merges((rg.min_row - 1, rg.min_col - 1, rg.max_row - 1, rg.max_col - 1)
                       for rg in ws.merged_cells.ranges if rg.max_row <= MAX_ROWS and rg.max_col <= MAX_COLS)
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
+        sh.freeze = _freeze_from_xlsx(ws)
         rules = []
         for cf in ws.conditional_formatting:
             for xl_rule in cf.rules:
@@ -3317,6 +3352,12 @@ def _save_xlsx(wb, path, active=None):
             ws.merge_cells(start_row=m[0] + 1, start_column=m[1] + 1, end_row=m[2] + 1, end_column=m[3] + 1)
         if sh.tab_color:
             ws.sheet_properties.tabColor = _xl_hex(sh.tab_color)
+        if sh.freeze:
+            r0, r1, c0, c1 = sh.freeze
+            ws.freeze_panes = cell_name(r1 - r0, c1 - c0)  # sets up the panes as if frozen from A1...
+            ws.sheet_view.pane.topLeftCell = cell_name(r1, c1)
+            if (r0, c0) != (0, 0):
+                ws.sheet_view.topLeftCell = cell_name(r0, c0)  # ...then moves them to where they start
         if sh.filter:
             r1, c1, r2, c2 = sh.filter["range"]
             ws.auto_filter.ref = range_name(r1, c1, r2, c2)

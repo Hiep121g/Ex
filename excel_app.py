@@ -6,6 +6,7 @@ Run:  python excel_app.py [file.xlsx | file.pyxl | file.csv]
 import csv
 import datetime as dt
 import io
+import itertools
 import math
 import os
 import re
@@ -34,6 +35,7 @@ HEADER_FULL_BG = "#a6d4b4"
 HEADER_SEL_FG = "#0b5a2f"
 SELECTION_TINT = "#a9cdb5"
 SHEETBAR_BG = "#ececec"
+FREEZE_LINE = "#8a8a8a"
 REF_COLORS = ("#2f6fd6", "#d13438", "#8e44ad", "#c55a11", "#00838f", "#c2185b")
 
 FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72]
@@ -122,6 +124,7 @@ THANH RIBBON
   • Nút có mũi tên ▾ mở thêm lựa chọn; mũi tên nhỏ ↘ ở góc nhóm mở hộp thoại Định dạng ô (Ctrl+1).
   • Ô "Cho tôi biết bạn muốn làm gì" trên thanh xanh: gõ tên lệnh (ví dụ "viền", "lọc") rồi Enter.
   • Nhấp đúp vào tên tab để thu gọn/mở rộng ribbon.
+  • Xem → Cố định ngăn: giữ các hàng phía trên và cột bên trái ô đang chọn luôn hiển thị khi cuộn.
 
 NHẬP DỮ LIỆU
   • Chọn ô rồi gõ; Enter/Tab để xác nhận, Esc để hủy. F2 hoặc nhấp đúp để sửa.
@@ -212,6 +215,7 @@ class SpreadsheetApp:
         self.last_fill, self.last_fg = "#ffff00", "#ff0000"
         self.border_style, self.border_color, self.last_border = "thin", "#000000", "bottom"
         self.vis_rows, self.vis_cols = [], []
+        self._scroll_rows = 0
         self._filter_buttons = []
         self._autoscroll_job = None
         self._last_mouse = (0, 0)
@@ -732,6 +736,17 @@ class SpreadsheetApp:
         self._btn(g, large=True, icon="zoom", text="Thu\nphóng", command=self.zoom_dialog)
         self._btn(g, large=True, icon="zoom100", text="100%\n", command=lambda: self.set_zoom(1.0))
         self._btn(g, large=True, icon="zoom_sel", text="Phóng theo\nvùng chọn", command=self.zoom_to_selection)
+        g = rb.group(page, "Cửa sổ")
+        freeze_menu = self._make_menu([
+            ("Cố định ngăn", lambda: self.freeze_panes(None if self.sh.freeze else "cell")),
+            ("Cố định hàng trên cùng", lambda: self.freeze_panes("row")),
+            ("Cố định cột đầu tiên", lambda: self.freeze_panes("col"))])
+        # like Excel, the first item turns into "Unfreeze Panes" while panes are frozen
+        freeze_menu.configure(postcommand=lambda: freeze_menu.entryconfigure(
+            0, label="Bỏ cố định ngăn" if self.sh.freeze else "Cố định ngăn"))
+        self.commands.append(("Bỏ cố định ngăn", lambda: self.freeze_panes(None)))
+        self._btn(g, large=True, icon="freeze", text="Cố định\nngăn", menu=freeze_menu,
+                  tooltip="Cố định ngăn\nGiữ hàng và cột tiêu đề luôn hiển thị khi cuộn")
 
     def _build_help_tab(self, page):
         g = self.ribbon.group(page, "Trợ giúp")
@@ -986,7 +1001,30 @@ class SpreadsheetApp:
             return 0
         return round(sh.row_heights.get(r, fe.DEFAULT_ROW_HEIGHT) * self.px)
 
+    def frozen(self):
+        """(r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 are frozen (empty spans when not)."""
+        return self.sh.freeze or (0, 0, 0, 0)
+
+    def pane_origin(self):
+        """Canvas (x, y) where the scrolling part of the grid starts, right of / below the frozen panes."""
+        r0, r1, c0, c1 = self.frozen()
+        return (self.header_w + sum(self.col_w(k) for k in range(c0, c1)),
+                self.header_h + sum(self.row_h(k) for k in range(r0, r1)))
+
+    def _clamp_view(self):
+        """Keep the scrolled area out of the frozen rows and columns."""
+        _, r1, _, c1 = self.frozen()
+        self.top, self.left = max(self.top, r1), max(self.left, c1)
+
     def col_x(self, c):
+        """Canvas x of the left edge of column c. With frozen columns, edges of columns hidden behind
+        them are clamped, so a range's box covers just its visible part."""
+        c0, c1 = self.frozen()[2:]
+        if c1 > c0:
+            if c <= c1:
+                return self.header_w + sum(self.col_w(k) for k in range(c0, c)) - (4 if c < c0 else 0)
+            x0 = self.pane_origin()[0]
+            return x0 if c <= self.left else x0 + sum(self.col_w(k) for k in range(self.left, c))
         x = self.header_w
         if c >= self.left:
             for k in range(self.left, c):
@@ -997,8 +1035,16 @@ class SpreadsheetApp:
         return x
 
     def row_y(self, r):
-        """Canvas y of the top of row r (rows far off screen are estimated)."""
+        """Canvas y of the top of row r (rows far off screen are estimated; with frozen rows, edges
+        hidden behind them are clamped as in col_x)."""
+        r0, r1 = self.frozen()[:2]
         y = self.header_h
+        if r1 > r0:
+            if r <= r1:
+                return y + sum(self.row_h(k) for k in range(r0, r)) - (4 if r < r0 else 0)
+            y = self.pane_origin()[1]
+            if r <= self.top:
+                return y
         far = self.canvas.winfo_height() + 4000
         if r >= self.top:
             for k in range(self.top, r):
@@ -1022,12 +1068,19 @@ class SpreadsheetApp:
         return max(x0, self.header_w - 4), max(y0, self.header_h - 4), min(x1, W + 4), min(y1, H + 4)
 
     def _visible_rows(self):
-        return max(1, len(self.vis_rows) - 1)
+        """Rows a page of scrolling moves (the scrolled part of the window, less one)."""
+        return max(1, self._scroll_rows - 1)
 
     def row_at(self, y):
+        r0, r1 = self.frozen()[:2]
         if y < self.header_h:
-            return max(0, self.top - 1)
-        edge, r = self.header_h, self.top
+            return r0 if r1 > r0 else max(0, self.top - 1)
+        edge = self.header_h
+        for r in range(r0, r1):
+            edge += self.row_h(r)
+            if y < edge:
+                return r
+        r = self.top
         while r < MAX_ROWS - 1:
             edge += self.row_h(r)
             if y < edge:
@@ -1036,9 +1089,15 @@ class SpreadsheetApp:
         return MAX_ROWS - 1
 
     def col_at(self, x):
+        c0, c1 = self.frozen()[2:]
         if x < self.header_w:
-            return max(0, self.left - 1)
-        edge, c = self.header_w, self.left
+            return c0 if c1 > c0 else max(0, self.left - 1)
+        edge = self.header_w
+        for c in range(c0, c1):
+            edge += self.col_w(c)
+            if x < edge:
+                return c
+        c = self.left
         while c < MAX_COLS - 1:
             edge += self.col_w(c)
             if x < edge:
@@ -1110,21 +1169,28 @@ class SpreadsheetApp:
 
     def ensure_visible(self, r, c):
         H, W = self.canvas.winfo_height(), self.canvas.winfo_width()
-        if r < self.top:
+        self._clamp_view()
+        x0, y0 = self.pane_origin()
+        _, r1, _, c1 = self.frozen()
+        if r < r1:  # frozen rows are always on screen
+            pass
+        elif r < self.top:
             self.top = r
         elif self.row_y(r + 1) > H:
-            avail, acc, t = H - self.header_h, 0, r
-            while t >= 0:
+            avail, acc, t = H - y0, 0, r
+            while t >= r1:
                 acc += self.row_h(t)
                 if acc > avail:
                     break
                 t -= 1
             self.top = min(r, t + 1)
-        if c < self.left:
+        if c < c1:
+            pass
+        elif c < self.left:
             self.left = c
         elif self.col_x(c + 1) > W:
-            avail, acc, t = W - self.header_w, 0, c
-            while t >= 0:
+            avail, acc, t = W - x0, 0, c
+            while t >= c1:
                 acc += self.col_w(t)
                 if acc > avail:
                     break
@@ -1142,19 +1208,25 @@ class SpreadsheetApp:
         sh = self.sh
         cells, formats = sh.cells, sh.formats
         hw, hh, pad = self.header_w, self.header_h, self.pad
-        cols, x, c = [], hw, self.left
-        while x < W and c < MAX_COLS:
-            w = self.col_w(c)
-            if w:
-                cols.append((c, x, x + w))
-            x, c = x + w, c + 1
-        rows, y, r = [], hh, self.top
-        while y < H and r < MAX_ROWS:
-            h = self.row_h(r)
-            if h:
-                rows.append((r, y, y + h))
-            y, r = y + h, r + 1
+        self._clamp_view()
+        fr0, fr1, fc0, fc1 = self.frozen()
+
+        def strip(first, frozen, limit, size, origin, end):
+            """[(index, start, end)] of the frozen lines, then of the scrolled ones from `first`."""
+            out, pos = [], origin
+            for i in itertools.chain(frozen, range(first, limit)):
+                if pos >= end:
+                    break
+                n = size(i)
+                if n:
+                    out.append((i, pos, pos + n))
+                pos += n
+            return out
+
+        cols = strip(self.left, range(fc0, fc1), MAX_COLS, self.col_w, hw, W)
+        rows = strip(self.top, range(fr0, fr1), MAX_ROWS, self.row_h, hh, H)
         self.vis_cols, self.vis_rows = cols, rows
+        self._scroll_rows = sum(1 for r, _, _ in rows if r >= self.top)
         self._filter_buttons = []
         r1, c1, r2, c2 = self.sel_rect()
         if not cols or not rows:
@@ -1335,6 +1407,8 @@ class SpreadsheetApp:
             m = sh.merge_at(r, c)
             if m:
                 box = self._rect_bbox(*m)
+                if box[2] <= box[0] or box[3] <= box[1]:  # scrolled behind the frozen panes
+                    continue
                 style = cf.get((r, c)) if (r, c) in cf else self.wb.cond_format(self.sheet, r, c)
             else:
                 box = (col_pos[c][0], row_pos[r][0], col_pos[c][1], row_pos[r][1])
@@ -1383,13 +1457,19 @@ class SpreadsheetApp:
         if box:
             cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT, width=line)
             hx, hy = sel_box[2] - 1, sel_box[3] - 1
-            if hw < hx < W and hh < hy < H and not self.is_editing():
+            corner_shown = not (fr1 <= r2 < self.top or fc1 <= c2 < self.left)
+            if hw < hx < W and hh < hy < H and corner_shown and not self.is_editing():
                 s = max(3, round(3 * self.px))
                 cv.create_rectangle(hx - s, hy - s, hx + s, hy + s, fill=ACCENT, outline="white")
         if self.drag and self.drag.get("mode") == "fill" and self.drag.get("target"):
             box = self._clip_box(self._rect_bbox(*self.drag["target"]), W, H)
             if box:
                 cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline="#555555", dash=(4, 3))
+        px, py = self.pane_origin()
+        if fr1 > fr0:
+            cv.create_line(hw, py - 1, right, py - 1, fill=FREEZE_LINE)
+        if fc1 > fc0:
+            cv.create_line(px - 1, hh, px - 1, bottom, fill=FREEZE_LINE)
         self._draw_headers(cv, W, H, (r1, c1, r2, c2), sel_box)
         self._place_editor()
 
@@ -1774,13 +1854,14 @@ class SpreadsheetApp:
         x, y = self._last_mouse
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
         mode, moved = self.drag["mode"], False
+        _, r1, _, c1 = self.frozen()
         if y > H and self.top < MAX_ROWS - 1:
             self.top, moved = self.top + 1, True
-        elif y < self.header_h and self.top > 0 and mode != "colsel":
+        elif y < self.header_h and self.top > r1 and mode != "colsel":
             self.top, moved = self.top - 1, True
         if x > W and self.left < MAX_COLS - 1:
             self.left, moved = self.left + 1, True
-        elif x < self.header_w and self.left > 0 and mode != "rowsel":
+        elif x < self.header_w and self.left > c1 and mode != "rowsel":
             self.left, moved = self.left - 1, True
         if moved:
             self._drag_to(x, y)
@@ -1932,7 +2013,8 @@ class SpreadsheetApp:
         sheet, r, c = self.edit_cell
         x0, y0, x1, y1 = self._rect_bbox(*self._cell_box(r, c))
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if sheet != self.sheet or y0 < self.header_h - 1 or y0 >= H or x1 <= self.header_w or x0 >= W:
+        if (sheet != self.sheet or y0 < self.header_h - 1 or y0 >= H or x1 <= self.header_w or x0 >= W
+                or x1 <= x0 or y1 <= y0):  # off screen, or scrolled behind frozen panes
             self.editor.place_forget()
             return
         needed = self.text_width(self._edit_font, self.edit_var.get()) + 4 * self.pad
@@ -3396,6 +3478,30 @@ class SpreadsheetApp:
         self.set_zoom(min(avail_w / max(1, width), avail_h / max(1, height)))
         self.top, self.left = r1, c1
         self.refresh()
+
+    def freeze_panes(self, kind):
+        """Freeze the rows above and columns left of the active cell ("cell"), the top visible row
+        ("row") or the first visible column ("col"); None unfreezes."""
+        self.commit_edit()
+        self._clamp_view()
+        r, c = self.cur
+        if kind == "cell":
+            freeze = (self.top, max(r, self.top), self.left, max(c, self.left))
+        elif kind == "row":
+            freeze = (self.top, self.top + 1, 0, 0)
+        elif kind == "col":
+            freeze = (0, 0, self.left, self.left + 1)
+        else:
+            freeze = None
+        if freeze and freeze[1] == freeze[0] and freeze[3] == freeze[2]:
+            messagebox.showinfo(APP_NAME, "Hãy chọn ô nằm dưới các hàng và bên phải các cột muốn cố định.",
+                                parent=self.root)
+            return
+        if freeze == self.sh.freeze:
+            return
+        if self._structural(lambda: setattr(self.sh, "freeze", freeze)) and freeze:
+            self.top, self.left = max(self.top, freeze[1]), max(self.left, freeze[3])
+            self.refresh_view()
 
     def toggle_grid(self):
         self.show_grid = self.grid_var.get()

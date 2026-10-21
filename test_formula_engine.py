@@ -479,6 +479,19 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual((sh.row_heights, sh.custom_rows, sh.hidden_rows), ({5: 40}, {5}, {7}))
         self.assertEqual((sh.hidden_cols, sh.col_widths), ({1}, {1: 120}))
 
+    def test_freeze_follows_row_and_column_changes(self):
+        wb = Workbook()
+        sh = wb.sheets["Sheet1"]
+        sh.freeze = (0, 2, 0, 1)
+        wb.insert_rows("Sheet1", 1)        # inside the frozen rows: one more row frozen
+        self.assertEqual(sh.freeze, (0, 3, 0, 1))
+        wb.insert_rows("Sheet1", 5)        # below them: no change
+        self.assertEqual(sh.freeze, (0, 3, 0, 1))
+        wb.delete_cols("Sheet1", 0)        # the only frozen column is gone
+        self.assertEqual(sh.freeze, (0, 3, 0, 0))
+        wb.delete_rows("Sheet1", 0, 3)
+        self.assertIsNone(sh.freeze)
+
     def test_snapshot_restore_and_copy_sheet(self):
         wb = make({"A1": "5", "B1": "=A1*2"})
         sh = wb.sheets["Sheet1"]
@@ -563,6 +576,9 @@ class LayoutFileTests(unittest.TestCase):
                            {"range": (1, 0, 2, 0), "type": "scale", "colors": ["#ffffff", "#63be7b"]}]
         sh.filter = {"range": (2, 0, 4, 0), "criteria": {0: {"x"}}, "hidden": set()}
         wb.apply_filter("Sheet1")
+        sh.freeze = (0, 1, 0, 2)
+        name = wb.add_sheet("Khác")  # add_sheet replaces wb.sheets, so look up afterwards
+        wb.sheets[name].freeze = (10, 12, 0, 0)  # frozen while scrolled: rows 11-12 stay on screen
         return wb
 
     def check(self, wb):
@@ -579,6 +595,8 @@ class LayoutFileTests(unittest.TestCase):
         self.assertTrue(wb.cond_format("Sheet1", 2, 0)["fg"] == "#9c0006")
         self.assertEqual((sh.filter["range"], sh.filter["hidden"]), ((2, 0, 4, 0), {4}))
         self.assertNotIn(4, sh.hidden_rows)
+        self.assertEqual(sh.freeze, (0, 1, 0, 2))
+        self.assertEqual(wb.sheets["Khác"].freeze, (10, 12, 0, 0))
 
     def roundtrip(self, ext):
         with tempfile.TemporaryDirectory() as tmp:
