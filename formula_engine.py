@@ -2445,12 +2445,40 @@ def _shift_freeze(freeze, axis, at, move_span):
     return freeze if freeze[1] > freeze[0] or freeze[3] > freeze[2] else None
 
 
+MAX_OUTLINE = 7  # outline levels Excel allows
+# SUBTOTAL function numbers -> (label after each group's value, label of the grand total row)
+SUBTOTAL_NAMES = {9: ("Tổng", "Tổng Cuối"), 3: ("Đếm", "Đếm chung"), 1: ("Trung bình", "Trung bình chung"),
+                  4: ("Lớn nhất", "Lớn nhất chung"), 5: ("Nhỏ nhất", "Nhỏ nhất chung"), 6: ("Tích", "Tích chung"),
+                  2: ("Đếm số", "Đếm số chung"), 7: ("Độ lệch chuẩn", "Độ lệch chuẩn chung"),
+                  8: ("Độ lệch chuẩn TT", "Độ lệch chuẩn TT chung"), 10: ("Phương sai", "Phương sai chung"),
+                  11: ("Phương sai TT", "Phương sai TT chung")}
+
+
+def outline_groups(levels):
+    """[(level, first, last)] of the groups an outline {index: level} makes, outer levels first."""
+    groups = []
+    for level in range(1, max(levels.values(), default=0) + 1):
+        run = None
+        for i in sorted(levels):
+            if levels[i] < level:
+                continue
+            if run and i == run[1] + 1:
+                run[1] = i
+            else:
+                if run:
+                    groups.append((level, *run))
+                run = [i, i]
+        if run:
+            groups.append((level, *run))
+    return groups
+
+
 class Sheet:
     """One worksheet. Format dicts are never mutated in place, only replaced."""
 
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
               "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
-              "charts", "pivots", "page_setup")
+              "charts", "pivots", "page_setup", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2475,6 +2503,10 @@ class Sheet:
                                 #   "anchor": (row, col, dx, dy), "size": (w, h)}] - offsets and size in pixels at 96 DPI
         self.pivots = []        # PivotTables whose reports sit on this sheet (see pivot.new_pivot)
         self.page_setup = None  # printing options that differ from printing.DEFAULT_SETUP
+        self.row_levels = {}    # row -> outline (group) level 1..MAX_OUTLINE; summary rows sit below groups
+        self.col_levels = {}    # col -> outline level; summary columns sit right of groups
+        self.collapsed_rows = set()  # summary rows of collapsed groups (Excel's "collapsed" flag)
+        self.collapsed_cols = set()
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -3217,8 +3249,136 @@ class Workbook:
         elif band is None:
             sh.col_widths = {n: w for c, w in sh.col_widths.items() if (n := move(c)) is not None}
             sh.hidden_cols = move_set(sh.hidden_cols)
+        if band is None:
+            levels = {n: v for i, v in (sh.row_levels if axis == 0 else sh.col_levels).items()
+                      if (n := move(i)) is not None}
+            if delta > 0:  # rows inserted inside a group join it, as in Excel
+                inner = min(levels.get(at - 1, 0), levels.get(at + delta, 0))
+                levels.update({i: inner for i in range(at, min(at + delta, limit)) if inner})
+            if axis == 0:
+                sh.row_levels, sh.collapsed_rows = levels, move_set(sh.collapsed_rows)
+            else:
+                sh.col_levels, sh.collapsed_cols = levels, move_set(sh.collapsed_cols)
         self._ast.clear()
         self.invalidate()
+
+    # outline (Data > Group)
+    def _outline(self, sheet, axis):
+        sh = self.sheets[sheet]
+        if axis == 0:
+            return sh.row_levels, sh.hidden_rows, sh.collapsed_rows
+        return sh.col_levels, sh.hidden_cols, sh.collapsed_cols
+
+    def group(self, sheet, axis, i1, i2, delta=1):
+        """Group (delta 1) or ungroup (delta -1) rows (axis 0) or columns i1..i2 by one outline level.
+        Returns False when there was nothing to ungroup."""
+        levels, hidden, marks = self._outline(sheet, axis)
+        changed = False
+        for i in range(i1, i2 + 1):
+            n = max(0, min(MAX_OUTLINE, levels.get(i, 0) + delta))
+            changed |= n != levels.get(i, 0)
+            if n:
+                levels[i] = n
+            else:
+                levels.pop(i, None)
+        ends = {b + 1 for _, _, b in outline_groups(levels)}
+        marks.intersection_update(ends)
+        return changed
+
+    def clear_outline(self, sheet, axis):
+        """Ungroup everything on an axis, showing what collapsed groups had hidden."""
+        levels, hidden, marks = self._outline(sheet, axis)
+        for _, a, b in outline_groups(levels):
+            if b + 1 in marks:
+                hidden.difference_update(range(a, b + 1))
+        levels.clear()
+        marks.clear()
+
+    def set_collapsed(self, sheet, axis, level, start, end, collapsed):
+        """Collapse (hide) or expand a group; expanding keeps the collapsed groups inside it hidden."""
+        levels, hidden, marks = self._outline(sheet, axis)
+        if collapsed:
+            hidden.update(range(start, end + 1))
+            marks.add(end + 1)
+            return
+        marks.discard(end + 1)
+        hidden.difference_update(range(start, end + 1))
+        for lv, a, b in outline_groups(levels):
+            if lv > level and start <= a and b <= end and b + 1 in marks:
+                hidden.update(range(a, b + 1))
+
+    def show_level(self, sheet, axis, n):
+        """The outline's level buttons: show what is above level n, collapse every group of level n or deeper."""
+        levels, hidden, marks = self._outline(sheet, axis)
+        for i, lv in levels.items():
+            if lv >= n:
+                hidden.add(i)
+            else:
+                hidden.discard(i)
+        marks.clear()
+        marks.update(b + 1 for lv, _, b in outline_groups(levels) if lv >= n)
+
+    def remove_subtotals(self, sheet, rect):
+        """Data > Subtotal > Remove All: delete the rows holding SUBTOTAL formulas in a table and its
+        row outline. Returns the table's rectangle afterwards."""
+        r1, c1, r2, c2 = rect
+        sh = self.sheets[sheet]
+        rows = [r for r in range(r2, r1, -1)
+                if any(_SUBTOTAL_RE.match(sh.cells.get((r, c), "")) for c in range(c1, c2 + 1))]
+        for r in rows:
+            self.delete_rows(sheet, r)
+        r2 -= len(rows)
+        levels, hidden, marks = self._outline(sheet, 0)
+        for r in range(r1, r2 + 2):
+            levels.pop(r, None)
+            marks.discard(r)
+        hidden.difference_update(range(r1, r2 + 1))
+        return r1, c1, r2, c2
+
+    def add_subtotals(self, sheet, rect, by, func, columns, replace=True):
+        """Data > Subtotal on a table whose first row holds headers: after each run of equal values in
+        column `by` insert a row "<value> <name>" with =SUBTOTAL(func, ...) under `columns`, then a grand
+        total row, and outline the rows (level 1: grand total, 2: subtotals, 3: everything).
+        Returns the table's rectangle afterwards."""
+        if replace:
+            rect = self.remove_subtotals(sheet, rect)
+        r1, c1, r2, c2 = rect
+        sh = self.sheets[sheet]
+        name, grand = SUBTOTAL_NAMES.get(func, SUBTOTAL_NAMES[9])
+        runs = []
+        for r in range(r1 + 1, r2 + 1):
+            key = self.display_text(sheet, r, by)
+            if runs and runs[-1][2] == key:
+                runs[-1][1] = r
+            else:
+                runs.append([r, r, key])
+        if not runs:
+            return rect
+        bold = {"bold": True}
+
+        def total_row(row, label, first, last):
+            self.set_raw(sheet, row, by, label)
+            self.set_format(sheet, row, by, {**(self.get_format(sheet, last, by) or {}), **bold})
+            for c in columns:
+                self.set_raw(sheet, row, c, f"=SUBTOTAL({func},{range_name(first, c, last, c)})")
+                num = (self.get_format(sheet, last, c) or {}).get("num")
+                self.set_format(sheet, row, c, {**bold, **({"num": num} if num else {})})
+        offset, groups = 0, []
+        for start, end, key in runs:
+            start, end = start + offset, end + offset
+            self.insert_rows(sheet, end + 1)
+            total_row(end + 1, f"{key} {name}".strip(), start, end)
+            groups.append((start, end))
+            offset += 1
+        last = r2 + offset
+        self.insert_rows(sheet, last + 1)
+        total_row(last + 1, grand, r1 + 1, last)
+        sh.row_levels.pop(last + 1, None)  # the grand total row is not part of the outline it closes
+        self.group(sheet, 0, r1 + 1, last)
+        for start, end in groups:
+            self.group(sheet, 0, start, end)
+        self.invalidate()
+        return r1, c1, last + 1, c2
 
     def snapshot(self):
         return [(s.name, s.copy_state()) for s in self.sheets.values()]
@@ -3246,6 +3406,11 @@ class Workbook:
             }
             if s.freeze:
                 d["freeze"] = list(s.freeze)
+            if s.row_levels or s.col_levels:
+                d["outline"] = {"rows": {str(r + 1): v for r, v in sorted(s.row_levels.items())},
+                                "cols": {col_name(c): v for c, v in sorted(s.col_levels.items())},
+                                "collapsed_rows": sorted(r + 1 for r in s.collapsed_rows),
+                                "collapsed_cols": [col_name(c) for c in sorted(s.collapsed_cols)]}
             if s.validations:
                 d["validations"] = [dict(rule, range=range_name(*rule["range"])) for rule in s.validations]
             if s.notes:
@@ -3295,6 +3460,11 @@ class Workbook:
             sh.custom_rows = {int(r) - 1 for r in sd.get("custom_rows", [])}
             sh.hidden_rows = {int(r) - 1 for r in sd.get("hidden_rows", [])}
             sh.hidden_cols = {col_index(c) for c in sd.get("hidden_cols", [])}
+            outline = sd.get("outline") or {}
+            sh.row_levels = {int(r) - 1: int(v) for r, v in outline.get("rows", {}).items()}
+            sh.col_levels = {col_index(c): int(v) for c, v in outline.get("cols", {}).items()}
+            sh.collapsed_rows = {int(r) - 1 for r in outline.get("collapsed_rows", [])}
+            sh.collapsed_cols = {col_index(c) for c in outline.get("collapsed_cols", [])}
             sh.set_merges(m for m in map(parse_range, sd.get("merges", [])) if m)
             sh.cond_formats = [dict(rule, range=parse_range(rule["range"])) for rule in sd.get("cond_formats", [])
                                if parse_range(rule.get("range", ""))]
@@ -3936,6 +4106,10 @@ def _load_xlsx(path):
                     sh.col_widths[c] = max(MIN_COL_WIDTH, round(dim.width * 7 + 5))
                 if dim.hidden:
                     sh.hidden_cols.add(c)
+                if dim.outlineLevel:
+                    sh.col_levels[c] = min(MAX_OUTLINE, int(dim.outlineLevel))
+                if dim.collapsed:
+                    sh.collapsed_cols.add(c)
         for idx, dim in ws.row_dimensions.items():
             r = idx - 1
             if r >= MAX_ROWS:
@@ -3945,6 +4119,10 @@ def _load_xlsx(path):
                 sh.custom_rows.add(r)
             if dim.hidden:
                 sh.hidden_rows.add(r)
+            if dim.outlineLevel:
+                sh.row_levels[r] = min(MAX_OUTLINE, int(dim.outlineLevel))
+            if dim.collapsed:
+                sh.collapsed_rows.add(r)
         sh.set_merges((rg.min_row - 1, rg.min_col - 1, rg.max_row - 1, rg.max_col - 1)
                       for rg in ws.merged_cells.ranges if rg.max_row <= MAX_ROWS and rg.max_col <= MAX_COLS)
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
@@ -4125,6 +4303,18 @@ def _save_xlsx(wb, path, active=None):
             ws.row_dimensions[r + 1].height = round(height * 0.75, 2)
         for r in sh.hidden_rows | (sh.filter["hidden"] if sh.filter else set()):
             ws.row_dimensions[r + 1].hidden = True
+        for r, level in sh.row_levels.items():
+            ws.row_dimensions[r + 1].outlineLevel = level
+        for r in sh.collapsed_rows:
+            ws.row_dimensions[r + 1].collapsed = True
+        for c, level in sh.col_levels.items():
+            ws.column_dimensions[col_name(c)].outlineLevel = level
+        for c in sh.collapsed_cols:
+            ws.column_dimensions[col_name(c)].collapsed = True
+        if sh.row_levels:
+            ws.sheet_format.outlineLevelRow = max(sh.row_levels.values())
+        if sh.col_levels:
+            ws.sheet_format.outlineLevelCol = max(sh.col_levels.values())
         for m in sh.merges:
             ws.merge_cells(start_row=m[0] + 1, start_column=m[1] + 1, end_row=m[2] + 1, end_column=m[3] + 1)
         if sh.tab_color:

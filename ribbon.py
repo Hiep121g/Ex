@@ -880,6 +880,40 @@ def _icon_page_setup(cv, P, k, c):
         cv.create_rectangle(*P(x - 1.2, y - 1, x + 1.2, y + 1), fill=BLUE, outline="")
 
 
+def _outline_box(cv, P, k, x, y, sign):
+    cv.create_rectangle(*P(x - 3, y - 3, x + 3, y + 3), fill="#ffffff", outline=GRAY)
+    cv.create_line(*P(x - 1.7, y, x + 1.9, y), fill=DARK, width=max(1, round(k)))
+    if sign == "+":
+        cv.create_line(*P(x, y - 1.7, x, y + 1.9), fill=DARK, width=max(1, round(k)))
+
+
+def _icon_group(cv, P, k, c, ungroup=False):
+    for i in range(4):
+        y = 2.5 + 3.5 * i
+        cv.create_rectangle(*P(7, y, 15, y + 2.5), fill="#ffffff" if i < 3 else "#e2efda", outline=GRAY)
+    if ungroup:
+        cv.create_line(*P(3, 2.5, 3, 10), fill=GRAY, width=max(1, round(k)), dash=(2, 2))
+        _arrow(cv, P, k, 6.5, 6, 0.5, 6, RED, 1.3)
+    else:
+        cv.create_line(*P(5, 3.5, 3, 3.5, 3, 11.5), fill=BLUE, width=max(1, round(1.3 * k)))
+        _outline_box(cv, P, k, 3, 13.5, "-")
+
+
+def _icon_subtotal(cv, P, k, c):
+    for i in range(4):
+        y = 1.5 + 3.5 * i
+        total = i == 2 or i == 3
+        cv.create_rectangle(*P(6, y, 15, y + 3), fill="#dde8f6" if total else "#ffffff", outline=GRAY)
+    _glyph(cv, P, k, 3, 5.5, "Σ", 9, BLUE, "bold")
+    _outline_box(cv, P, k, 3, 12.5, "-")
+
+
+def _icon_detail(cv, P, k, c, show):
+    _grid(cv, P, k, 5.5, 1.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+    cv.create_rectangle(*P(5.5, 10.17, 14.5, 14.5), fill="#e2efda", outline=GRAY)
+    _outline_box(cv, P, k, 2.5, 12.3, "+" if show else "-")
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -970,6 +1004,8 @@ ICONS.update({
     "paper_size": _icon_paper_size, "print_area": _icon_print_area, "page_break": _icon_page_break,
     "print_titles": _icon_print_titles, "fit_page": _icon_fit_page, "print": _icon_print,
     "print_preview": _icon_print_preview, "pdf": _icon_pdf, "page_setup": _icon_page_setup,
+    "group": _icon_group, "ungroup": lambda *a: _icon_group(*a, ungroup=True), "subtotal": _icon_subtotal,
+    "show_detail": lambda *a: _icon_detail(*a, True), "hide_detail": lambda *a: _icon_detail(*a, False),
 })
 
 

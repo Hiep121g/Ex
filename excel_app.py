@@ -48,6 +48,7 @@ SELECTION_TINT = "#a9cdb5"
 SHEETBAR_BG = "#ececec"
 FREEZE_LINE = "#8a8a8a"
 BREAK_LINE = {False: "#8c8c8c", True: "#4f4f4f"}  # automatic / manual page breaks
+OUTLINE_BG, OUTLINE_FG = "#fbfbfb", "#7a7a7a"
 FILTERED_ROW_FG = "#2b579a"  # row numbers inside a filtered range, as in Excel
 NOTE_MARK = "#d13438"
 NOTE_BG = "#ffffe1"
@@ -126,6 +127,7 @@ STYLE_KEYS = ("font", "size", "bold", "italic", "underline", "strike", "fg", "bg
 MENU_ICONS = {
     "Mới": "file_new", "Mở": "file_open", "Lưu": "save", "Lưu thành": "file_save_as", "Thoát": "file_exit",
     "In": "print", "Xuất PDF": "pdf", "Thiết lập Trang": "page_setup",
+    "Nhóm": "group", "Bỏ nhóm": "ungroup", "Tổng phụ": "subtotal", "Xóa dàn bài": "clear",
     "Cắt": "cut", "Sao chép": "copy", "Dán": "paste", "Tùy chọn dán": "paste", "Dán công thức": "paste_formulas",
     "Dán giá trị": "paste_values", "Dán định dạng": "paste_formats", "Dán chuyển vị": "paste_transpose",
     "Dán đặc biệt": "paste_special", "Gạch chân": "underline", "Gạch chân kép": "underline_double",
@@ -196,6 +198,10 @@ THANH RIBBON
     có: sắp xếp (cả theo màu), lọc theo màu, Bộ lọc số / văn bản / ngày (lớn hơn, nằm giữa, có chứa, 10 mục
     đầu, trên trung bình, tháng này...), Bộ lọc tùy chỉnh (2 điều kiện Và/Hoặc, dùng * và ?) và danh sách
     giá trị có ô tìm kiếm. Thanh trạng thái cho biết số bản ghi tìm thấy.
+  • Dữ liệu → Nhóm (Alt+Shift+→): gom các hàng/cột đang chọn; nút −/+ ở lề trái (hoặc trên) thu gọn / mở
+    rộng nhóm, các nút 1 2 3 ở góc hiện theo mức. Bỏ nhóm (Alt+Shift+←), Xóa dàn bài, Hiện/Ẩn chi tiết.
+  • Dữ liệu → Tổng phụ: với bảng đã sắp xếp theo một cột (ví dụ Khu vực), thêm hàng "Bắc Tổng", "Nam Tổng"...
+    dùng hàm SUBTOTAL (tổng, đếm, trung bình...) và hàng Tổng Cuối, kèm dàn bài để xem gọn theo mức.
   • Chèn → Biểu đồ (Cột, Thanh, Đường, Tròn): chọn vùng dữ liệu kèm tiêu đề rồi bấm. Kéo để di chuyển, kéo
     các nút ở viền để đổi kích thước, nhấp đúp để sửa dữ liệu/tiêu đề, Delete để xóa.
 
@@ -320,6 +326,7 @@ class SpreadsheetApp:
         self.vis_rows, self.vis_cols = [], []
         self._scroll_rows = 0
         self._filter_buttons = []
+        self._outline_buttons = []
         self._autoscroll_job = None
         self._last_mouse = (0, 0)
         self._cursor = ""
@@ -368,10 +375,22 @@ class SpreadsheetApp:
         size = -max(6, round(12 * self.px))
         self.header_font = tkfont.Font(root=self.root, family=self.ui_family, size=size)
         self.header_bold = tkfont.Font(root=self.root, family=self.ui_family, size=size, weight="bold")
-        self.header_h = round(fe.DEFAULT_ROW_HEIGHT * self.px) if self.show_headings else 0
-        self.header_w = self.header_font.measure("100000") + round(8 * self.px) if self.show_headings else 0
+        self._head_h0 = round(fe.DEFAULT_ROW_HEIGHT * self.px) if self.show_headings else 0
+        self._head_w0 = self.header_font.measure("100000") + round(8 * self.px) if self.show_headings else 0
+        self._outline_metrics()
         self.pad = max(1, round(3 * self.px))
         self.default_row_px = max(1, round(fe.DEFAULT_ROW_HEIGHT * self.px))
+
+    def _outline_metrics(self):
+        """Room for the outline symbols left of the row headings and above the column headings."""
+        sh = self.wb.sheets.get(self.sheet)
+        rows = max(sh.row_levels.values(), default=0) if sh else 0
+        cols = max(sh.col_levels.values(), default=0) if sh else 0
+        self.outline_step = round(16 * self.scale)
+        self.outline_w = (rows + 1) * self.outline_step + 2 if rows else 0
+        self.outline_h = (cols + 1) * self.outline_step + 2 if cols else 0
+        self.header_w = max(self._head_w0, self.outline_step if cols else 0) + self.outline_w
+        self.header_h = max(self._head_h0, self.outline_step if rows else 0) + self.outline_h
 
     def font_for(self, fmt):
         fmt = fmt or {}
@@ -848,6 +867,18 @@ class SpreadsheetApp:
         self.btn_pivot_fields = self._btn(g, large=True, icon="pivot_fields", text="Danh sách\ntrường",
                                           command=self.toggle_pivot_fields,
                                           tooltip="Hiện/ẩn ngăn Các trường PivotTable")
+        g = rb.group(page, "Dàn bài")
+        self._btn(g, large=True, icon="group", text="Nhóm\n", command=lambda: self.group_selection(1),
+                  tooltip="Nhóm (Alt+Shift+→)\nGom các hàng hoặc cột để thu gọn / mở rộng bằng nút −/+")
+        self._btn(g, large=True, icon="ungroup", text="Bỏ\nnhóm", command=lambda: self.group_selection(-1),
+                  menu=self._make_menu([("Bỏ nhóm...", lambda: self.group_selection(-1), "Alt+Shift+←", "ungroup"),
+                                        ("Xóa dàn bài", self.clear_outline, "", "clear")]), split=True,
+                  tooltip="Bỏ nhóm (Alt+Shift+←)")
+        self._btn(g, large=True, icon="subtotal", text="Tổng\nphụ", command=self.subtotal_dialog,
+                  tooltip="Tổng phụ\nTính tổng (đếm, trung bình...) cho từng nhóm giá trị giống nhau")
+        col = g.column()
+        self._btn(g, col, side="top", icon="show_detail", text="Hiện chi tiết", command=lambda: self.outline_detail(True))
+        self._btn(g, col, side="top", icon="hide_detail", text="Ẩn chi tiết", command=lambda: self.outline_detail(False))
         g = rb.group(page, "Công cụ dữ liệu")
         self._btn(g, large=True, icon="remove_dup", text="Loại bỏ\ntrùng lặp", command=self.remove_duplicates)
         self._btn(g, large=True, icon="validation", text="Xác thực\ndữ liệu", command=self.data_validation_dialog,
@@ -1193,7 +1224,8 @@ class SpreadsheetApp:
                  "<Control-ampersand>": lambda: self.apply_border("outside"),
                  "<Control-underscore>": lambda: self.apply_border("none"), "<F9>": self.recalculate,
                  "<Shift-F3>": self.insert_function_dialog, "<Shift-F2>": self.edit_note,
-                 "<Alt-Down>": self.open_validation_list}
+                 "<Alt-Down>": self.open_validation_list,
+                 "<Alt-Shift-Right>": lambda: self.group_selection(1), "<Alt-Shift-Left>": lambda: self.group_selection(-1)}
         for seq, func in extra.items():
             cv.bind(seq, lambda e, f=func: self._key_action(f))
         global_keys = {"n": self.new_file, "o": self.open_file, "s": self.save_file, "f": self.open_find,
@@ -1343,11 +1375,11 @@ class SpreadsheetApp:
     def _border_hit(self, x, y):
         """('col', c) / ('row', r) when the pointer is on a header border used for resizing."""
         tolerance = 3 * self.scale
-        if y < self.header_h and x >= self.header_w:
+        if self.outline_h <= y < self.header_h and x >= self.header_w:
             for c, _, x1 in self.vis_cols:
                 if abs(x - x1) <= tolerance:
                     return "col", c
-        if x < self.header_w and y >= self.header_h:
+        if self.outline_w <= x < self.header_w and y >= self.header_h:
             for r, _, y1 in self.vis_rows:
                 if abs(y - y1) <= tolerance:
                     return "row", r
@@ -1432,6 +1464,7 @@ class SpreadsheetApp:
             return
         sh = self.sh
         cells, formats = sh.cells, sh.formats
+        self._outline_metrics()
         hw, hh, pad = self.header_w, self.header_h, self.pad
         self._clamp_view()
         fr0, fr1, fc0, fc1 = self.frozen()
@@ -1453,9 +1486,11 @@ class SpreadsheetApp:
         self.vis_cols, self.vis_rows = cols, rows
         self._scroll_rows = sum(1 for r, _, _ in rows if r >= self.top)
         self._filter_buttons = []
+        self._outline_buttons = []
         r1, c1, r2, c2 = self.sel_rect()
         if not cols or not rows:
             self._draw_headers(cv, W, H, (r1, c1, r2, c2))
+            self._draw_outline(cv, W, H, {}, {})
             return
         col_pos = {c: (x0, x1) for c, x0, x1 in cols}
         row_pos = {r: (y0, y1) for r, y0, y1 in rows}
@@ -1710,6 +1745,7 @@ class SpreadsheetApp:
         if fc1 > fc0:
             cv.create_line(px - 1, hh, px - 1, bottom, fill=FREEZE_LINE)
         self._draw_headers(cv, W, H, (r1, c1, r2, c2), sel_box)
+        self._draw_outline(cv, W, H, row_pos, col_pos)
         self._draw_cell_extras(cv, W, H, col_pos, row_pos)
         self._place_editor()
 
@@ -1878,43 +1914,100 @@ class SpreadsheetApp:
 
     def _draw_headers(self, cv, W, H, sel, sel_box=None):
         hw, hh = self.header_w, self.header_h
+        ow, oh = self.outline_w, self.outline_h  # outline symbols take the room before the headings
         if not self.show_headings:
             return
         r1, c1, r2, c2 = sel
-        cv.create_rectangle(0, 0, W, hh, fill=HEADER_BG, outline="")
-        cv.create_rectangle(0, 0, hw, H, fill=HEADER_BG, outline="")
+        cv.create_rectangle(0, oh, W, hh, fill=HEADER_BG, outline="")
+        cv.create_rectangle(ow, 0, hw, H, fill=HEADER_BG, outline="")
         full_cols = r1 == 0 and r2 == MAX_ROWS - 1
         full_rows = c1 == 0 and c2 == MAX_COLS - 1
         for c, x0, x1 in self.vis_cols:
             sel_col = c1 <= c <= c2
             if sel_col:
-                cv.create_rectangle(x0, 0, x1, hh, fill=HEADER_FULL_BG if full_cols else HEADER_SEL_BG, outline="")
-            cv.create_line(x1 - 1, 0, x1 - 1, hh, fill=HEADER_LINE)
-            cv.create_text((x0 + x1) // 2, hh // 2, text=col_name(c), fill=HEADER_SEL_FG if sel_col else HEADER_FG,
+                cv.create_rectangle(x0, oh, x1, hh, fill=HEADER_FULL_BG if full_cols else HEADER_SEL_BG, outline="")
+            cv.create_line(x1 - 1, oh, x1 - 1, hh, fill=HEADER_LINE)
+            cv.create_text((x0 + x1) // 2, (oh + hh) // 2, text=col_name(c), fill=HEADER_SEL_FG if sel_col else HEADER_FG,
                            font=self.header_bold if sel_col else self.header_font)
         f = self.sh.filter
         fr1, fr2 = (f["range"][0], f["range"][2]) if f and f["criteria"] else (0, -1)
         for r, y0, y1 in self.vis_rows:
             sel_row = r1 <= r <= r2
             if sel_row:
-                cv.create_rectangle(0, y0, hw, y1, fill=HEADER_FULL_BG if full_rows else HEADER_SEL_BG, outline="")
-            cv.create_line(0, y1 - 1, hw, y1 - 1, fill=HEADER_LINE)
+                cv.create_rectangle(ow, y0, hw, y1, fill=HEADER_FULL_BG if full_rows else HEADER_SEL_BG, outline="")
+            cv.create_line(ow, y1 - 1, hw, y1 - 1, fill=HEADER_LINE)
             if y1 - y0 >= self.header_font.metrics("linespace") * 0.6:
                 fg = HEADER_SEL_FG if sel_row else FILTERED_ROW_FG if fr1 < r <= fr2 else HEADER_FG
-                cv.create_text(hw // 2, (y0 + y1) // 2, text=str(r + 1), fill=fg,
+                cv.create_text((ow + hw) // 2, (y0 + y1) // 2, text=str(r + 1), fill=fg,
                                font=self.header_bold if sel_row else self.header_font)
-        cv.create_line(0, hh - 1, W, hh - 1, fill=HEADER_LINE)
-        cv.create_line(hw - 1, 0, hw - 1, H, fill=HEADER_LINE)
+        cv.create_line(ow, hh - 1, W, hh - 1, fill=HEADER_LINE)
+        cv.create_line(hw - 1, oh, hw - 1, H, fill=HEADER_LINE)
         if sel_box:
             sx0, sy0, sx1, sy1 = sel_box
             if sx1 > hw and sx0 < W:
                 cv.create_line(max(sx0, hw), hh - 1, min(sx1, W), hh - 1, fill=ACCENT, width=2)
             if sy1 > hh and sy0 < H:
                 cv.create_line(hw - 1, max(sy0, hh), hw - 1, min(sy1, H), fill=ACCENT, width=2)
-        cv.create_rectangle(0, 0, hw - 1, hh - 1, fill=HEADER_BG, outline="")
-        t = round(hh * 0.45)
+        cv.create_rectangle(ow, oh, hw - 1, hh - 1, fill=HEADER_BG, outline="")
+        t = round((hh - oh) * 0.45)
         cv.create_polygon(hw - 5, hh - 5 - t, hw - 5, hh - 5, hw - 5 - t, hh - 5, outline="",
                           fill=ACCENT if full_cols and full_rows else "#c4c4c4")
+
+    def _draw_outline(self, cv, W, H, row_pos, col_pos):
+        """Excel's outline symbols beside the headings: level buttons 1, 2, ..., a bracket along each group
+        and a +/- button at its summary row or column. Button boxes go to self._outline_buttons."""
+        self._outline_buttons = []
+        ow, oh, hw, hh, step = self.outline_w, self.outline_h, self.header_w, self.header_h, self.outline_step
+        if not (ow or oh):
+            return
+        sh = self.sh
+        cv.create_rectangle(0, 0, W, oh, fill=OUTLINE_BG, outline="")
+        cv.create_rectangle(0, 0, ow, H, fill=OUTLINE_BG, outline="")
+        size = max(7, round(11 * self.scale))
+        font = (self.ui_family, -max(7, round(10 * self.scale)))
+
+        def button(x, y, text, action, side):
+            x0, y0, x1, y1 = x - side / 2, y - side / 2, x + side / 2, y + side / 2
+            cv.create_rectangle(x0, y0, x1, y1, fill="#ffffff", outline=OUTLINE_FG)
+            if text in "+-":
+                arm = side * 0.28
+                cv.create_line(x - arm, y, x + arm + 1, y, fill="#404040")
+                if text == "+":
+                    cv.create_line(x, y - arm, x, y + arm + 1, fill="#404040")
+            else:
+                cv.create_text(x, y, text=text, font=font, fill="#404040")
+            self._outline_buttons.append((x0, y0, x1, y1, action))
+
+        for axis, levels, pos, vis, room in ((0, sh.row_levels, row_pos, self.vis_rows, ow),
+                                             (1, sh.col_levels, col_pos, self.vis_cols, oh)):
+            if not room or not levels:
+                continue
+
+            def pt(across, along, axis=axis):
+                return (across, along) if axis == 0 else (along, across)
+            hidden = sh.hidden_rows if axis == 0 else sh.hidden_cols
+            start, end = (hh, H) if axis == 0 else (hw, W)
+            band = (oh + hh) / 2 if axis == 0 else (ow + hw) / 2
+            for n in range(1, max(levels.values()) + 2):
+                button(*pt((n - 1) * step + step / 2 + 1, band), str(n), ("level", axis, n), size + 2)
+            for level, a, b in fe.outline_groups(levels):
+                across = (level - 1) * step + step / 2 + 1
+                collapsed = a in hidden and b in hidden
+                summary = pos.get(b + 1)
+                if not collapsed and vis:
+                    seen = [(p0, p1) for i, p0, p1 in vis if a <= i <= b]
+                    span = ((seen[0][0], seen[-1][1]) if seen else
+                            (start, end) if a < vis[0][0] and b > vis[-1][0] else None)
+                    if span:
+                        lo = span[0] + 3 if a in pos else start
+                        hi = (summary[0] + summary[1]) / 2 - size / 2 if summary else span[1]
+                        if hi > lo:
+                            cv.create_line(*pt(across, lo), *pt(across, hi), fill=OUTLINE_FG)
+                        if a in pos:
+                            cv.create_line(*pt(across, lo), *pt(across + step * 0.4, lo), fill=OUTLINE_FG)
+                if summary:
+                    button(*pt(across, (summary[0] + summary[1]) / 2), "+" if collapsed else "-",
+                           ("toggle", axis, level, a, b, not collapsed), size)
 
     def update_scrollbars(self):
         rows, cols = self.wb.used_extent(self.sheet)
@@ -2198,6 +2291,13 @@ class SpreadsheetApp:
         if self.chart_sel is not None:
             self.chart_sel = None
             self.redraw()
+        for bx0, by0, bx1, by1, action in self._outline_buttons:
+            if bx0 - 2 <= e.x <= bx1 + 2 and by0 - 2 <= e.y <= by1 + 2:
+                self.commit_edit()
+                self.outline_action(action)
+                return "break"
+        if e.x < self.outline_w or e.y < self.outline_h:
+            return "break"
         for bx0, by0, bx1, by1, col in self._filter_buttons:
             if bx0 <= e.x <= bx1 and by0 <= e.y <= by1:
                 self.commit_edit()
@@ -3615,6 +3715,98 @@ class SpreadsheetApp:
     def recalculate(self):
         self.wb.invalidate()
         self.refresh()
+
+    # outline: Data > Group / Ungroup / Subtotal
+    def _outline_target(self, verb):
+        """(axis, first, last) to group: whole rows or columns selected decide, otherwise ask like Excel."""
+        r1, c1, r2, c2 = self.sel_rect()
+        if r1 == 0 and r2 == MAX_ROWS - 1 and not (c1 == 0 and c2 == MAX_COLS - 1):
+            return 1, c1, c2
+        if c1 == 0 and c2 == MAX_COLS - 1:
+            return (0, r1, r2) if r2 - r1 < 100000 else None
+        axis = dialogs.ChoiceDialog(self.root, verb, [("Hàng", "rows"), ("Cột", "cols")], "rows").show()
+        if axis is None:
+            return None
+        return (0, r1, r2) if axis == "rows" else (1, c1, c2)
+
+    def group_selection(self, delta=1):
+        """Data > Group (Alt+Shift+Right) / Ungroup (Alt+Shift+Left)."""
+        self.commit_edit()
+        target = self._outline_target("Nhóm" if delta > 0 else "Bỏ nhóm")
+        if target is None:
+            return
+        done = {}
+
+        def change():
+            done["changed"] = self.wb.group(self.sheet, *target, delta)
+        self._structural(change)
+        if not done.get("changed"):
+            self.root.bell()
+
+    def clear_outline(self):
+        self.commit_edit()
+        self._structural(lambda: (self.wb.clear_outline(self.sheet, 0), self.wb.clear_outline(self.sheet, 1)))
+
+    def outline_action(self, action):
+        """A click on an outline symbol: ("level", axis, n) or ("toggle", axis, level, first, last, collapse)."""
+        axis = action[1]
+        if action[0] == "level":
+            self._structural(lambda: self.wb.show_level(self.sheet, axis, action[2]))
+        else:
+            _, _, level, a, b, collapse = action
+            self._structural(lambda: self.wb.set_collapsed(self.sheet, axis, level, a, b, collapse))
+        hidden = self.sh.row_hidden(self.cur[0]) or self.cur[1] in self.sh.hidden_cols
+        if hidden:  # the active cell went into a collapsed group: stand on the group's summary instead
+            levels = self.sh.row_levels if axis == 0 else self.sh.col_levels
+            index = self.cur[axis]
+            end = max((b for _, a, b in fe.outline_groups(levels) if a <= index <= b), default=index)
+            self.cur = self.ext = (end + 1, self.cur[1]) if axis == 0 else (self.cur[0], end + 1)
+            self.refresh()
+
+    def outline_detail(self, show):
+        """Data > Show Detail / Hide Detail: expand or collapse the innermost group at the active cell."""
+        self.commit_edit()
+        r1, _, r2, _ = self.sel_rect()
+        axes = (1,) if r1 == 0 and r2 == MAX_ROWS - 1 else (0, 1)
+        for axis in axes:
+            index = self.cur[axis]
+            sh = self.sh
+            levels, hidden = (sh.row_levels, sh.hidden_rows) if axis == 0 else (sh.col_levels, sh.hidden_cols)
+            groups = [(lv, a, b) for lv, a, b in fe.outline_groups(levels)
+                      if a <= index <= b + 1 and (a in hidden and b in hidden) == show]
+            if groups:
+                lv, a, b = max(groups)
+                self.outline_action(("toggle", axis, lv, a, b, not show))
+                return
+        self.root.bell()
+
+    def subtotal_dialog(self):
+        """Data > Subtotal: totals after each group of equal values, with an outline to fold the table."""
+        self.commit_edit()
+        rect = self.sel_rect()
+        if rect == self._cell_box(*self.cur):
+            rect = self.current_region(*self.cur)
+        if rect[2] <= rect[0]:
+            messagebox.showinfo(APP_NAME, "Hãy chọn một ô trong bảng dữ liệu có hàng tiêu đề.", parent=self.root)
+            return
+        if self._pivot_guard(*rect):
+            return
+        columns = [(c, self.wb.display_text(self.sheet, rect[0], c)) for c in range(rect[1], rect[3] + 1)]
+        result = dialogs.SubtotalDialog(self.root, columns).show()
+        if not result:
+            return
+        out = {}
+
+        def change():
+            if result.get("remove"):
+                out["rect"] = self.wb.remove_subtotals(self.sheet, rect)
+            else:
+                out["rect"] = self.wb.add_subtotals(self.sheet, rect, result["by"], result["func"],
+                                                    result["columns"], result["replace"])
+        if self._structural(change):
+            r1, c1, r2, c2 = out["rect"]
+            self.cur, self.ext = (r1, c1), (r2, c2)
+            self.refresh()
 
     # sorting and filtering
     def current_region(self, r, c):

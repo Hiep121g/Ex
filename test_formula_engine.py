@@ -1225,5 +1225,60 @@ class FormulaAssistTests(unittest.TestCase):
         self.assertIsNone(fa.toggle_reference("=1+2", 4))
 
 
+class OutlineTests(unittest.TestCase):
+    def table(self):
+        wb = make({"A1": "Khu vực", "B1": "Tiền", "A2": "Bắc", "B2": "10", "A3": "Bắc", "B3": "20",
+                   "A4": "Nam", "B4": "5", "A5": "Nam", "B5": "7", "A6": "Trung", "B6": "1", "A8": "dưới"})
+        return wb
+
+    def test_groups_collapse_expand_and_levels(self):
+        wb = Workbook()
+        wb.group("Sheet1", 0, 1, 8)
+        wb.group("Sheet1", 0, 2, 4)
+        sh = wb.sheets["Sheet1"]
+        self.assertEqual(fe.outline_groups(sh.row_levels), [(1, 1, 8), (2, 2, 4)])
+        wb.set_collapsed("Sheet1", 0, 2, 2, 4, True)
+        wb.set_collapsed("Sheet1", 0, 1, 1, 8, True)
+        self.assertEqual(sh.hidden_rows, set(range(1, 9)))
+        wb.set_collapsed("Sheet1", 0, 1, 1, 8, False)  # the inner group stays collapsed
+        self.assertEqual(sh.hidden_rows, {2, 3, 4})
+        wb.show_level("Sheet1", 0, 3)
+        self.assertEqual((sh.hidden_rows, sh.collapsed_rows), (set(), set()))
+        wb.insert_rows("Sheet1", 3)  # inside the inner group: joins it
+        self.assertEqual(sh.row_levels[3], 2)
+        self.assertTrue(wb.group("Sheet1", 0, 1, 9, -1))
+        self.assertEqual(fe.outline_groups(sh.row_levels), [(1, 2, 5)])
+
+    def test_subtotals(self):
+        wb = self.table()
+        rect = wb.add_subtotals("Sheet1", (0, 0, 5, 1), 0, 9, [1])
+        self.assertEqual(rect, (0, 0, 9, 1))
+        col = [(wb.display_text("Sheet1", r, 0), wb.display_text("Sheet1", r, 1)) for r in range(10)]
+        self.assertEqual(col[3], ("Bắc Tổng", "30"))
+        self.assertEqual(col[6], ("Nam Tổng", "12"))
+        self.assertEqual(col[9], ("Tổng Cuối", "43"))  # SUBTOTAL skips the subtotals above it
+        self.assertEqual(wb.get_raw("Sheet1", 11, 0), "dưới")  # rows were inserted, not overwritten
+        sh = wb.sheets["Sheet1"]
+        self.assertEqual([sh.row_levels.get(r, 0) for r in range(10)], [0, 2, 2, 1, 2, 2, 1, 2, 1, 0])
+        rect = wb.add_subtotals("Sheet1", rect, 0, 1, [1])  # replaces the sums with averages
+        self.assertEqual(wb.display_text("Sheet1", 9, 1), "8.6")
+        self.assertEqual(wb.remove_subtotals("Sheet1", rect), (0, 0, 5, 1))
+        self.assertEqual((sh.row_levels, wb.get_raw("Sheet1", 7, 0)), ({}, "dưới"))
+
+    def test_outline_files(self):
+        wb = self.table()
+        wb.add_subtotals("Sheet1", (0, 0, 5, 1), 0, 9, [1])
+        wb.group("Sheet1", 1, 1, 1)
+        wb.show_level("Sheet1", 0, 2)
+        sh = wb.sheets["Sheet1"]
+        for ext in [".pyxl"] + ([".xlsx"] if fe.HAS_XLSX else []):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "o" + ext)
+                fe.save_workbook(wb, path)
+                got = fe.load_workbook(path).sheets["Sheet1"]
+            self.assertEqual((got.row_levels, got.col_levels, got.collapsed_rows, got.hidden_rows),
+                             (sh.row_levels, sh.col_levels, sh.collapsed_rows, sh.hidden_rows), ext)
+
+
 if __name__ == "__main__":
     unittest.main()

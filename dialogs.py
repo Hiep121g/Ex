@@ -1751,3 +1751,59 @@ class PageSetupDialog(Dialog):
                     header="" if header == HEADER_PRESETS[0] else header,
                     footer="" if footer == HEADER_PRESETS[0] else footer,
                     area=area, titles=titles, gridlines=self.gridlines.get())
+
+
+SUBTOTAL_FUNCS = [(9, "Tổng"), (3, "Đếm"), (1, "Trung bình"), (4, "Lớn nhất"), (5, "Nhỏ nhất"), (6, "Tích"),
+                  (2, "Đếm số"), (7, "Độ lệch chuẩn"), (8, "Độ lệch chuẩn tổng thể"), (10, "Phương sai"),
+                  (11, "Phương sai tổng thể")]
+
+
+class SubtotalDialog(Dialog):
+    """Data > Subtotal. collect() gives {"by": col, "func": SUBTOTAL number, "columns": [cols], "replace": bool};
+    the Remove All button gives {"remove": True}."""
+
+    def __init__(self, master, columns):
+        super().__init__(master, "Tổng phụ")
+        self.columns = columns
+        labels = [text or f"Cột {fe.col_name(c)}" for c, text in columns]
+        f = self.body
+        ttk.Label(f, text="Tại mỗi thay đổi trong:").pack(anchor="w")
+        self.by = ttk.Combobox(f, values=labels, state="readonly", width=34)
+        self.by.current(0)
+        self.by.pack(anchor="w", fill="x", pady=(2, 8))
+        ttk.Label(f, text="Dùng hàm:").pack(anchor="w")
+        self.func = ttk.Combobox(f, values=[name for _, name in SUBTOTAL_FUNCS], state="readonly", width=34)
+        self.func.current(0)
+        self.func.pack(anchor="w", fill="x", pady=(2, 8))
+        ttk.Label(f, text="Thêm tổng phụ vào:").pack(anchor="w")
+        box = ttk.Frame(f)
+        box.pack(fill="both", expand=True, pady=(2, 8))
+        self.targets = tk.Listbox(box, selectmode="multiple", exportselection=False, height=min(7, len(labels)),
+                                  activestyle="none")
+        bar = ttk.Scrollbar(box, command=self.targets.yview)
+        self.targets.configure(yscrollcommand=bar.set)
+        self.targets.pack(side="left", fill="both", expand=True)
+        if len(labels) > 7:
+            bar.pack(side="right", fill="y")
+        for label in labels:
+            self.targets.insert("end", label)
+        self.targets.selection_set(len(labels) - 1)
+        self.targets.see(len(labels) - 1)
+        self.replace = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="Thay thế tổng phụ hiện có", variable=self.replace).pack(anchor="w")
+        ttk.Label(f, text="Tổng phụ nằm bên dưới mỗi nhóm; hãy sắp xếp bảng theo cột nhóm trước.",
+                  foreground="#666").pack(anchor="w", pady=(6, 0))
+        bar = self.add_buttons()
+        ttk.Button(bar, text="Loại bỏ Tất cả", command=self.remove_all).pack(side="left")
+
+    def remove_all(self):
+        self.result = {"remove": True}
+        self.destroy()
+
+    def collect(self):
+        picked = [self.columns[i][0] for i in self.targets.curselection()]
+        if not picked:
+            self.bell()
+            return None
+        return {"by": self.columns[self.by.current()][0], "func": SUBTOTAL_FUNCS[self.func.current()][0],
+                "columns": picked, "replace": self.replace.get()}
