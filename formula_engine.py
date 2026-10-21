@@ -105,6 +105,25 @@ def parse_range(text):
 _ADDR_RE = re.compile(r"\$?([A-Za-z]{1,3})\$?(\d+)")
 
 
+def rect_minus(rect, cut):
+    """Parts of rectangle `rect` (r1, c1, r2, c2) outside rectangle `cut`, as up to four rectangles."""
+    r1, c1, r2, c2 = rect
+    a1, b1, a2, b2 = cut
+    if a1 > r2 or a2 < r1 or b1 > c2 or b2 < c1:
+        return [tuple(rect)]
+    parts = []
+    if r1 < a1:
+        parts.append((r1, c1, a1 - 1, c2))
+    if a2 < r2:
+        parts.append((a2 + 1, c1, r2, c2))
+    top, bottom = max(r1, a1), min(r2, a2)
+    if c1 < b1:
+        parts.append((top, c1, bottom, b1 - 1))
+    if b2 < c2:
+        parts.append((top, b2 + 1, bottom, c2))
+    return parts
+
+
 def parse_address(text):
     """'B3' -> (2, 1); 'A1:C4' -> (0, 0, 3, 2); None when invalid."""
     parts = text.strip().split(":")
@@ -2300,6 +2319,10 @@ def _f_minifs(min_rng, *pairs):
 
 # ------------------------------------------------------------------ workbook
 
+VALIDATION_TYPES = ("any", "whole", "decimal", "list", "date", "length", "custom")
+VALIDATION_OPS = ("between", "notbetween", "=", "<>", ">", "<", ">=", "<=")
+
+
 def _shift_freeze(freeze, axis, move_span):
     """Frozen panes after rows (axis 0) or columns (axis 1) were inserted or deleted."""
     a0, a1 = freeze[0:2] if axis == 0 else freeze[2:4]
@@ -2317,7 +2340,7 @@ class Sheet:
     """One worksheet. Format dicts are never mutated in place, only replaced."""
 
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
-              "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze")
+              "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2336,6 +2359,8 @@ class Sheet:
         self.filter = None      # {"range": (r1, c1, r2, c2), "criteria": {col: set(texts)}, "hidden": set(rows)}
         self.tab_color = None
         self.freeze = None      # (r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 stay put when scrolling
+        self.validations = []   # [{"range": (r1, c1, r2, c2), "type": ..., ...}] - later rules win, see VALIDATION_TYPES
+        self.notes = {}         # (row, col) -> note text
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -2715,6 +2740,94 @@ class Workbook:
         self.sheets[sheet].cond_formats = rules
         self.invalidate()
 
+    # data validation
+    def validation_at(self, sheet, r, c):
+        """The data-validation rule covering (r, c), or None."""
+        for rule in reversed(self.sheets[sheet].validations):
+            r1, c1, r2, c2 = rule["range"]
+            if r1 <= r <= r2 and c1 <= c <= c2:
+                return rule
+        return None
+
+    def _rule_eval(self, sheet, rule, text, r, c):
+        """Value of a rule operand, with relative references moved from the rule's first cell to (r, c)."""
+        text = str(text or "").strip()
+        if is_formula(text):
+            text = shift_formula(text, r - rule["range"][0], c - rule["range"][1])
+        self._stack.append((sheet, r, c))
+        try:
+            if not is_formula(text):
+                return parse_literal(text)[0] if text else None
+            return self._eval(parse_formula(text), sheet)
+        except CellError as err:
+            return CellError(err.code)
+        finally:
+            self._stack.pop()
+
+    def validation_options(self, sheet, r, c, rule=None):
+        """Texts offered by a list rule: its comma-separated items or the cells of its source range."""
+        rule = rule or self.validation_at(sheet, r, c)
+        source = str(rule.get("source", "")).strip()
+        if not is_formula(source):
+            return [item.strip() for item in re.split(r"[,;]", source) if item.strip()]
+        value = self._rule_eval(sheet, rule, source, r, c)
+        if isinstance(value, RangeRef):
+            texts = (self.display_text(value.sheet, rr, cc) for rr in range(value.r1, value.r2 + 1)
+                     for cc in range(value.c1, value.c2 + 1))
+            return [t for t in texts if t != ""]
+        return [] if value is None or isinstance(value, CellError) else [to_text(value)]
+
+    def validate(self, sheet, r, c, raw):
+        """The rule that typing `raw` into (r, c) breaks, or None when the entry is allowed."""
+        rule = self.validation_at(sheet, r, c)
+        if rule is None or rule.get("type", "any") == "any":
+            return None
+        if not raw:
+            return None if rule.get("blank", True) else rule
+        old = self.get_raw(sheet, r, c)
+        self.set_raw(sheet, r, c, raw)  # judge the value the cell would really get
+        try:
+            ok = self._valid_value(sheet, rule, r, c, raw)
+        finally:
+            self.set_raw(sheet, r, c, old)
+        return None if ok else rule
+
+    def _valid_value(self, sheet, rule, r, c, raw):
+        value, kind = self.get_value(sheet, r, c), rule["type"]
+        if isinstance(value, CellError):
+            return False
+        if kind == "custom":  # the formula must come out TRUE (or a non-zero number)
+            try:
+                result = scalar(self._rule_eval(sheet, rule, rule.get("v1"), r, c))
+            except CellError:
+                return False
+            return (isinstance(result, bool) or is_number(result)) and bool(result)
+        if kind == "list":
+            options = self.validation_options(sheet, r, c, rule)
+            text = self.display_text(sheet, r, c).lower()
+            typed = (raw[1:] if raw.startswith("'") else raw).strip().lower()
+            return any(o.lower() in (text, typed) or (is_number(value) and parse_literal(o)[0] == value)
+                       for o in options)
+        if kind == "length":
+            x = float(len(to_text(value)))
+        elif is_number(value):
+            x = float(value)
+            if kind == "whole" and not x.is_integer():
+                return False
+        else:
+            return False
+        a = self._rule_eval(sheet, rule, rule.get("v1"), r, c)
+        b = self._rule_eval(sheet, rule, rule.get("v2"), r, c)
+        try:
+            a = to_number(scalar(a))
+            b = to_number(scalar(b)) if rule.get("op", "between") in ("between", "notbetween") else a
+        except CellError:
+            return False
+        op = rule.get("op", "between")
+        if op in ("between", "notbetween"):
+            return (min(a, b) <= x <= max(a, b)) == (op == "between")
+        return _CMP_OPS[op](x, a)
+
     # filtering
     def filter_values(self, sheet, col):
         """Distinct display texts in a filter column (data rows only), sorted like Excel."""
@@ -2822,10 +2935,12 @@ class Workbook:
             return {n for i in indices if (n := move(i)) is not None}
 
         sh = self.sheets[sheet]
-        sh.cells, sh.formats = remap(sh.cells), remap(sh.formats)
+        sh.cells, sh.formats, sh.notes = remap(sh.cells), remap(sh.formats), remap(sh.notes)
         sh.set_merges(m for m in map(move_rect, sh.merges) if m and (m[0], m[1]) != (m[2], m[3]))
         sh.cond_formats = [dict(rule, range=rect) for rule in sh.cond_formats
                            if (rect := move_rect(rule["range"])) is not None]
+        sh.validations = [dict(rule, range=rect) for rule in sh.validations
+                          if (rect := move_rect(rule["range"])) is not None]
         if sh.filter:
             rect = move_rect(sh.filter["range"])
             if rect is None:
@@ -2874,6 +2989,10 @@ class Workbook:
             }
             if s.freeze:
                 d["freeze"] = list(s.freeze)
+            if s.validations:
+                d["validations"] = [dict(rule, range=range_name(*rule["range"])) for rule in s.validations]
+            if s.notes:
+                d["notes"] = {cell_name(r, c): text for (r, c), text in sorted(s.notes.items())}
             if s.filter:
                 d["filter"] = {"range": range_name(*s.filter["range"]),
                                "criteria": {col_name(c): sorted(v) for c, v in s.filter["criteria"].items()}}
@@ -2910,6 +3029,12 @@ class Workbook:
             freeze = sd.get("freeze")
             if isinstance(freeze, list) and len(freeze) == 4:
                 sh.freeze = tuple(int(v) for v in freeze)
+            sh.validations = [dict(rule, range=parse_range(rule["range"])) for rule in sd.get("validations", [])
+                              if parse_range(rule.get("range", ""))]
+            for addr, text in sd.get("notes", {}).items():
+                pos = parse_address(addr)
+                if pos and len(pos) == 2 and text:
+                    sh.notes[pos] = str(text)
             f = sd.get("filter")
             if f and parse_range(f.get("range", "")):
                 sh.filter = {"range": parse_range(f["range"]), "hidden": set(),
@@ -3131,6 +3256,78 @@ def _cf_rule_from_xlsx(rule):
     return None
 
 
+_XL_VALIDATION = {"whole": "whole", "decimal": "decimal", "list": "list", "date": "date",
+                  "textLength": "length", "custom": "custom"}
+_XL_ERROR_STYLES = {"stop": "stop", "warning": "warning", "information": "info"}
+
+
+def _validation_operand(formula, kind):
+    if formula is None:
+        return ""
+    text = _cf_value_from_xlsx(formula)
+    if kind == "date" and _NUM_RE.fullmatch(text):
+        return format_date(float(text), "dd/mm/yyyy")
+    return text
+
+
+def _validations_from_xlsx(ws):
+    rules = []
+    for dv in ws.data_validations.dataValidation:
+        kind = _XL_VALIDATION.get(dv.type)
+        if kind is None:
+            continue
+        rule = {"type": kind, "blank": bool(dv.allow_blank), "style": _XL_ERROR_STYLES.get(dv.errorStyle, "stop"),
+                "error_title": dv.errorTitle or "", "error": dv.error or "",
+                "prompt_title": dv.promptTitle or "", "prompt": dv.prompt or ""}
+        if kind == "list":
+            f = str(dv.formula1 or "")
+            rule["source"] = f[1:-1].replace('""', '"') if f.startswith('"') else "=" + f
+            rule["dropdown"] = not dv.showDropDown  # Excel's flag is inverted: set means "hide the arrow"
+        else:
+            rule["op"] = {v: k for k, v in _XL_OPS.items()}.get(dv.operator or "between", "between")
+            rule["v1"] = "=" + str(dv.formula1) if kind == "custom" else _validation_operand(dv.formula1, kind)
+            if rule["op"] in ("between", "notbetween"):
+                rule["v2"] = _validation_operand(dv.formula2, kind)
+        for rg in dv.sqref.ranges:
+            if rg.min_row <= MAX_ROWS and rg.min_col <= MAX_COLS:
+                rect = (rg.min_row - 1, rg.min_col - 1, min(rg.max_row, MAX_ROWS) - 1, min(rg.max_col, MAX_COLS) - 1)
+                rules.append(dict(rule, range=rect))
+    return rules
+
+
+def _xl_validation(rule):
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    kind = rule["type"]
+
+    def operand(text):
+        text = str(text or "").strip()
+        if is_formula(text):
+            return text[1:]
+        value = parse_literal(text)[0] if text else 0
+        return number_text(value) if is_number(value) else '"' + str(value).replace('"', '""') + '"'
+
+    dv = DataValidation(type={v: k for k, v in _XL_VALIDATION.items()}[kind], allow_blank=rule.get("blank", True),
+                        showErrorMessage=True, errorStyle={v: k for k, v in _XL_ERROR_STYLES.items()}.get(
+                            rule.get("style", "stop"), "stop"),
+                        errorTitle=rule.get("error_title") or None, error=rule.get("error") or None,
+                        promptTitle=rule.get("prompt_title") or None, prompt=rule.get("prompt") or None,
+                        showInputMessage=bool(rule.get("prompt")))
+    if kind == "list":
+        source = str(rule.get("source", "")).strip()
+        dv.formula1 = source[1:] if is_formula(source) else '"' + source.replace('"', '""') + '"'
+        dv.showDropDown = not rule.get("dropdown", True)
+    elif kind == "custom":
+        dv.formula1 = operand(rule.get("v1"))
+    else:
+        dv.operator = _XL_OPS.get(rule.get("op", "between"), "between")
+        dv.formula1 = operand(rule.get("v1"))
+        if rule.get("op", "between") in ("between", "notbetween"):
+            dv.formula2 = operand(rule.get("v2"))
+    dv.add(range_name(*rule["range"]))
+    return dv
+
+
 def _freeze_from_xlsx(ws):
     view = ws.sheet_view
     pane = view.pane
@@ -3164,6 +3361,8 @@ def _load_xlsx(path):
                     sh.cells[pos] = raw
                 if fmt:
                     sh.formats[pos] = fmt
+                if cell.comment is not None and cell.comment.text:
+                    sh.notes[pos] = cell.comment.text.strip()
         for key, dim in ws.column_dimensions.items():
             lo = dim.min or (col_index(key) + 1 if re.fullmatch(r"[A-Z]{1,3}", key) else None)
             if lo is None:
@@ -3186,6 +3385,7 @@ def _load_xlsx(path):
                       for rg in ws.merged_cells.ranges if rg.max_row <= MAX_ROWS and rg.max_col <= MAX_COLS)
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
         sh.freeze = _freeze_from_xlsx(ws)
+        sh.validations = _validations_from_xlsx(ws)
         rules = []
         for cf in ws.conditional_formatting:
             for xl_rule in cf.rules:
@@ -3303,8 +3503,14 @@ def _save_xlsx(wb, path, active=None):
 
     book = openpyxl.Workbook()
     book.remove(book.active)
+    from openpyxl.comments import Comment
+
     for sh in wb.sheets.values():
         ws = book.create_sheet(sh.name)
+        for (r, c), text in sh.notes.items():
+            comment = Comment(text, FILE_TAG)
+            comment.width, comment.height = 200, max(60, 20 * (text.count("\n") + 2))
+            ws.cell(row=r + 1, column=c + 1).comment = comment
         for r, c in set(sh.cells) | set(sh.formats):
             cell = ws.cell(row=r + 1, column=c + 1)
             raw = sh.cells.get((r, c))
@@ -3363,6 +3569,9 @@ def _save_xlsx(wb, path, active=None):
             ws.auto_filter.ref = range_name(r1, c1, r2, c2)
             for col, allowed in sorted(sh.filter["criteria"].items()):
                 ws.auto_filter.add_filter_column(col - c1, sorted(v for v in allowed if v), blank="" in allowed)
+        for rule in sh.validations:
+            if rule.get("type", "any") != "any":
+                ws.add_data_validation(_xl_validation(rule))
         for rule in reversed(sh.cond_formats):  # Excel: the first rule added gets the top priority
             xl_rule = _xl_cf_rule(rule)
             if xl_rule is not None:

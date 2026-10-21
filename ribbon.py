@@ -403,6 +403,14 @@ def _icon_note(cv, P, k, c, delete=False):
         cv.create_line(*P(15.5, 9, 9, 15.5), fill=RED, width=max(2, round(1.6 * k)))
 
 
+def _icon_note_step(cv, P, k, c, forward):
+    cv.create_polygon(*P(5, 2, 14, 2, 14, 9, 11, 12, 5, 12), fill="#fff2a8", outline="#b89b00")
+    if forward:
+        _arrow(cv, P, k, 1, 14, 8, 14, BLUE)
+    else:
+        _arrow(cv, P, k, 8, 14, 1, 14, BLUE)
+
+
 CHART_COLORS = ("#4472c4", "#ed7d31", "#a5a5a5", "#ffc000", "#5b9bd5", "#70ad47")
 
 
@@ -467,6 +475,7 @@ ICONS = {
     "remove_dup": _icon_remove_dup, "help": _icon_help, "info": _icon_info, "launcher": _icon_launcher,
     "freeze": _icon_freeze, "validation": _icon_validation, "note": _icon_note,
     "note_delete": lambda *a: _icon_note(*a, delete=True),
+    "note_prev": lambda *a: _icon_note_step(*a, False), "note_next": lambda *a: _icon_note_step(*a, True),
     "chart_column": _icon_chart, "chart_bar": lambda *a: _icon_chart(*a, kind="bar"),
     "chart_line": lambda *a: _icon_chart(*a, kind="line"), "chart_pie": lambda *a: _icon_chart(*a, kind="pie"),
 }

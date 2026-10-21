@@ -558,6 +558,104 @@ class FilterTests(unittest.TestCase):
         self.assertEqual((sh.filter["range"], sh.filter["hidden"]), ((1, 0, 5, 1), {3, 5}))
 
 
+class ValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.wb = make({"E1": "Hà Nội", "E2": "Huế", "E3": "", "E4": "Đà Nẵng", "F1": "10"})
+        self.sh = self.wb.sheets["Sheet1"]
+
+    def allowed(self, rule, raw, addr="A1"):
+        self.sh.validations = [dict(rule, range=(0, 0, 9, 0))]
+        r, c = fe.parse_address(addr)
+        return self.wb.validate("Sheet1", r, c, raw) is None
+
+    def test_list_from_text_and_range(self):
+        rule = {"type": "list", "source": "Có, Không"}
+        self.assertTrue(self.allowed(rule, "có"))
+        self.assertFalse(self.allowed(rule, "Có lẽ"))
+        rule = {"type": "list", "source": "=$E$1:$E$4"}
+        self.assertEqual(self.wb.validation_options("Sheet1", 0, 0, dict(rule, range=(0, 0, 9, 0))),
+                         ["Hà Nội", "Huế", "Đà Nẵng"])
+        self.assertTrue(self.allowed(rule, "Huế"))
+        self.assertFalse(self.allowed(rule, "Sài Gòn"))
+        self.assertTrue(self.allowed({"type": "list", "source": "1,2,3"}, "2"))
+
+    def test_numbers_dates_and_length(self):
+        whole = {"type": "whole", "op": "between", "v1": "1", "v2": "=F1"}
+        self.assertTrue(self.allowed(whole, "10"))
+        self.assertFalse(self.allowed(whole, "11"))
+        self.assertFalse(self.allowed(whole, "2.5"))
+        self.assertFalse(self.allowed(whole, "abc"))
+        self.assertTrue(self.allowed(whole, ""))  # blanks are allowed unless "blank" is off
+        self.assertFalse(self.allowed(dict(whole, blank=False), ""))
+        self.assertTrue(self.allowed({"type": "decimal", "op": ">", "v1": "0"}, "=F1/4"))
+        date = {"type": "date", "op": ">=", "v1": "01/01/2026"}
+        self.assertTrue(self.allowed(date, "21/10/2026"))
+        self.assertFalse(self.allowed(date, "31/12/2025"))
+        self.assertTrue(self.allowed({"type": "length", "op": "<=", "v1": "3"}, "abc"))
+        self.assertFalse(self.allowed({"type": "length", "op": "<=", "v1": "3"}, "abcd"))
+
+    def test_custom_formula_is_relative_to_each_cell(self):
+        rule = {"type": "custom", "v1": "=COUNTIF($A$1:$A$10,A1)=1"}  # no duplicates in the column
+        self.wb.set_raw("Sheet1", 0, 0, "x")
+        self.assertFalse(self.allowed(rule, "x", "A2"))
+        self.assertTrue(self.allowed(rule, "y", "A2"))
+        self.assertEqual(self.wb.get_raw("Sheet1", 1, 0), "")  # the trial value is not kept
+
+    def test_rect_minus(self):
+        self.assertEqual(fe.rect_minus((0, 0, 9, 0), (20, 0, 30, 0)), [(0, 0, 9, 0)])
+        self.assertEqual(fe.rect_minus((0, 0, 9, 0), (3, 0, 4, 5)), [(0, 0, 2, 0), (5, 0, 9, 0)])
+        self.assertEqual(fe.rect_minus((0, 0, 2, 2), (1, 1, 1, 1)),
+                         [(0, 0, 0, 2), (2, 0, 2, 2), (1, 0, 1, 0), (1, 2, 1, 2)])
+        self.assertEqual(fe.rect_minus((0, 0, 2, 2), (0, 0, 5, 5)), [])
+
+    def test_rules_and_notes_follow_inserted_rows(self):
+        self.sh.validations = [{"range": (2, 0, 4, 0), "type": "list", "source": "a,b"}]
+        self.sh.notes = {(3, 1): "ghi chú"}
+        self.wb.insert_rows("Sheet1", 0, 2)
+        self.assertEqual(self.sh.validations[0]["range"], (4, 0, 6, 0))
+        self.assertEqual(self.sh.notes, {(5, 1): "ghi chú"})
+        self.assertIsNotNone(self.wb.validation_at("Sheet1", 5, 0))
+        self.assertIsNone(self.wb.validation_at("Sheet1", 2, 0))
+
+    def roundtrip(self, ext):
+        self.sh.validations = [
+            {"range": (0, 0, 9, 0), "type": "list", "source": "Có,Không", "dropdown": True, "blank": True,
+             "style": "stop", "error_title": "Sai", "error": "Chọn Có hoặc Không", "prompt_title": "", "prompt": ""},
+            {"range": (0, 1, 9, 1), "type": "list", "source": "=$E$1:$E$4", "dropdown": True, "blank": True,
+             "style": "warning", "error_title": "", "error": "", "prompt_title": "Thành phố", "prompt": "Chọn từ danh sách"},
+            {"range": (0, 2, 4, 2), "type": "whole", "op": "between", "v1": "1", "v2": "=F1", "blank": False,
+             "style": "info", "error_title": "", "error": "", "prompt_title": "", "prompt": ""},
+            {"range": (0, 3, 4, 3), "type": "date", "op": ">=", "v1": "01/01/2026", "blank": True,
+             "style": "stop", "error_title": "", "error": "", "prompt_title": "", "prompt": ""},
+        ]
+        self.sh.notes = {(0, 0): "Ghi chú đầu tiên\nhai dòng", (7, 7): "Ô trống có ghi chú"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dv" + ext)
+            fe.save_workbook(self.wb, path)
+            wb = fe.load_workbook(path)
+        sh = wb.sheets["Sheet1"]
+        self.assertEqual(sh.notes, {(0, 0): "Ghi chú đầu tiên\nhai dòng", (7, 7): "Ô trống có ghi chú"})
+        by_col = {rule["range"][1]: rule for rule in sh.validations}
+        self.assertEqual(sorted(by_col), [0, 1, 2, 3])
+        self.assertEqual((by_col[0]["source"], by_col[0]["error"], by_col[0]["style"]),
+                         ("Có,Không", "Chọn Có hoặc Không", "stop"))
+        self.assertEqual((by_col[1]["source"], by_col[1]["style"], by_col[1]["prompt"]),
+                         ("=$E$1:$E$4", "warning", "Chọn từ danh sách"))
+        self.assertEqual((by_col[2]["op"], by_col[2]["v1"], by_col[2]["v2"], by_col[2]["blank"]),
+                         ("between", "1", "=F1", False))
+        self.assertEqual((by_col[3]["op"], by_col[3]["v1"]), (">=", "01/01/2026"))
+        self.assertTrue(by_col[0]["dropdown"])
+        self.assertIsNotNone(wb.validate("Sheet1", 0, 2, "11"))
+        self.assertIsNone(wb.validate("Sheet1", 0, 1, "Huế"))
+
+    def test_json_roundtrip(self):
+        self.roundtrip(".pyxl")
+
+    @unittest.skipUnless(fe.HAS_XLSX, "openpyxl not installed")
+    def test_xlsx_roundtrip(self):
+        self.roundtrip(".xlsx")
+
+
 class LayoutFileTests(unittest.TestCase):
     def build(self):
         wb = make({"A1": "Báo cáo", "A2": "10", "A3": "20", "B2": "=A2*2", "A4": "x", "A5": "y"})

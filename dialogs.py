@@ -1,6 +1,6 @@
 """Dialog boxes for PyExcel: Format Cells, conditional-formatting rules, sorting, series,
 insert/delete cells, paste special, the filter dropdown, insert function, format as table,
-remove duplicates and rule management."""
+remove duplicates, rule management, data validation (with its in-cell list) and notes."""
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -100,6 +100,7 @@ class Dialog(tk.Toplevel):
         ttk.Button(bar, text="Hủy", command=self.cancel, width=10).pack(side="right")
         ttk.Button(bar, text=ok_text, command=self.ok, width=10).pack(side="right", padx=(0, 6))
         self.bind("<Return>", lambda e: self.ok())
+        return bar
 
     def show(self, focus=None):
         self.update_idletasks()
@@ -971,3 +972,203 @@ class FilterPopup:
         allowed = {v for v, var in self.vars.items() if var.get() and v in visible}
         self.pop.close()
         self.on_apply(None if allowed == set(self.values) else allowed)
+
+
+VALIDATION_ALLOW = [("any", "Bất kỳ giá trị nào"), ("whole", "Số nguyên"), ("decimal", "Số thập phân"),
+                    ("list", "Danh sách"), ("date", "Ngày"), ("length", "Độ dài văn bản"), ("custom", "Tùy chỉnh")]
+VALIDATION_OPS = [("between", "nằm giữa"), ("notbetween", "không nằm giữa"), ("=", "bằng"), ("<>", "khác"),
+                  (">", "lớn hơn"), ("<", "nhỏ hơn"), (">=", "lớn hơn hoặc bằng"), ("<=", "nhỏ hơn hoặc bằng")]
+ERROR_STYLES = [("stop", "Dừng"), ("warning", "Cảnh báo"), ("info", "Thông tin")]
+
+
+def _text_box(master, text, height):
+    box = tk.Text(master, width=46, height=height, wrap="word", font="TkDefaultFont", relief="solid", bd=1,
+                  highlightthickness=0)
+    box.insert("1.0", text or "")
+    return box
+
+
+class ValidationDialog(Dialog):
+    """Excel's Data Validation: what may be typed, the message shown while the cell is selected and
+    the alert for a wrong entry. collect() returns the rule without its range, or {"clear": True}."""
+
+    def __init__(self, master, rule):
+        super().__init__(master, "Xác thực dữ liệu")
+        rule = rule or {}
+        kind = rule.get("type", "any")
+        nb = ttk.Notebook(self.body)
+        nb.pack(fill="both", expand=True)
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Cài đặt")
+        ttk.Label(f, text="Cho phép:").grid(row=0, column=0, sticky="w")
+        self.allow = tk.StringVar(value=dict(VALIDATION_ALLOW)[kind])
+        allow_box = ttk.Combobox(f, values=[label for _, label in VALIDATION_ALLOW], textvariable=self.allow,
+                                 state="readonly", width=24)
+        allow_box.grid(row=1, column=0, sticky="w")
+        self.blank = tk.BooleanVar(value=rule.get("blank", True))
+        ttk.Checkbutton(f, text="Bỏ qua ô trống", variable=self.blank).grid(row=1, column=1, sticky="w", padx=12)
+        self.op_label = ttk.Label(f, text="Dữ liệu:")
+        self.op_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.op = tk.StringVar(value=dict(VALIDATION_OPS)[rule.get("op", "between")])
+        self.op_box = ttk.Combobox(f, values=[label for _, label in VALIDATION_OPS], textvariable=self.op,
+                                   state="readonly", width=24)
+        self.op_box.grid(row=3, column=0, sticky="w")
+        self.v1 = tk.StringVar(value=rule.get("source", "") if kind == "list" else rule.get("v1", ""))
+        self.v2 = tk.StringVar(value=rule.get("v2", ""))
+        self.label1 = ttk.Label(f)
+        self.label1.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.entry1 = ttk.Entry(f, textvariable=self.v1, width=48)
+        self.entry1.grid(row=5, column=0, columnspan=2, sticky="we")
+        self.label2 = ttk.Label(f)
+        self.label2.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.entry2 = ttk.Entry(f, textvariable=self.v2, width=48)
+        self.entry2.grid(row=7, column=0, columnspan=2, sticky="we")
+        self.dropdown = tk.BooleanVar(value=rule.get("dropdown", True))
+        self.dropdown_check = ttk.Checkbutton(f, text="Hiện mũi tên thả xuống trong ô", variable=self.dropdown)
+        self.dropdown_check.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        for box in (allow_box, self.op_box):
+            box.bind("<<ComboboxSelected>>", lambda e: self._update())
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Thông báo nhập")
+        ttk.Label(f, text="Khi chọn ô, hiện thông báo này:").pack(anchor="w")
+        ttk.Label(f, text="Tiêu đề:").pack(anchor="w", pady=(8, 0))
+        self.prompt_title = tk.StringVar(value=rule.get("prompt_title", ""))
+        ttk.Entry(f, textvariable=self.prompt_title, width=48).pack(anchor="w")
+        ttk.Label(f, text="Thông báo:").pack(anchor="w", pady=(8, 0))
+        self.prompt = _text_box(f, rule.get("prompt"), 5)
+        self.prompt.pack(anchor="w")
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Cảnh báo lỗi")
+        ttk.Label(f, text="Khi nhập dữ liệu không hợp lệ, hiện cảnh báo:").pack(anchor="w")
+        ttk.Label(f, text="Kiểu:").pack(anchor="w", pady=(8, 0))
+        self.style = tk.StringVar(value=dict(ERROR_STYLES)[rule.get("style", "stop")])
+        ttk.Combobox(f, values=[label for _, label in ERROR_STYLES], textvariable=self.style, state="readonly",
+                     width=14).pack(anchor="w")
+        ttk.Label(f, text="Tiêu đề:").pack(anchor="w", pady=(8, 0))
+        self.error_title = tk.StringVar(value=rule.get("error_title", ""))
+        ttk.Entry(f, textvariable=self.error_title, width=48).pack(anchor="w")
+        ttk.Label(f, text="Thông báo lỗi:").pack(anchor="w", pady=(8, 0))
+        self.error = _text_box(f, rule.get("error"), 4)
+        self.error.pack(anchor="w")
+
+        bar = self.add_buttons()
+        ttk.Button(bar, text="Xóa tất cả", command=self._clear).pack(side="left")
+        self.unbind("<Return>")  # Enter belongs to the multi-line message boxes
+        self._update()
+
+    def _kind(self):
+        return next(k for k, label in VALIDATION_ALLOW if label == self.allow.get())
+
+    def _op(self):
+        return next(k for k, label in VALIDATION_OPS if label == self.op.get())
+
+    def _update(self):
+        kind, op = self._kind(), self._op()
+        numeric = kind in ("whole", "decimal", "date", "length")
+        two = numeric and op in ("between", "notbetween")
+        word = {"date": "Ngày", "length": "Độ dài"}.get(kind, "Giá trị")
+        for widget, shown in ((self.op_label, numeric), (self.op_box, numeric), (self.label1, kind != "any"),
+                              (self.entry1, kind != "any"), (self.label2, two), (self.entry2, two),
+                              (self.dropdown_check, kind == "list")):
+            if shown:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        if kind == "list":
+            self.label1.config(text="Nguồn (ví dụ  Có,Không  hoặc  =$A$1:$A$10):")
+        elif kind == "custom":
+            self.label1.config(text="Công thức phải cho kết quả TRUE (ví dụ  =A1>0):")
+        elif two:
+            self.label1.config(text=f"{word} tối thiểu:")
+            self.label2.config(text=f"{word} tối đa:")
+        else:
+            self.label1.config(text=f"{word}:")
+
+    def _clear(self):
+        self.result = {"clear": True}
+        self.destroy()
+
+    def collect(self):
+        kind, op = self._kind(), self._op()
+        rule = {"type": kind, "blank": self.blank.get(),
+                "style": next(k for k, label in ERROR_STYLES if label == self.style.get()),
+                "error_title": self.error_title.get().strip(), "error": self.error.get("1.0", "end").strip(),
+                "prompt_title": self.prompt_title.get().strip(), "prompt": self.prompt.get("1.0", "end").strip()}
+        v1, v2 = self.v1.get().strip(), self.v2.get().strip()
+        if kind == "any":
+            return rule
+        if not v1:
+            self.bell()
+            return None
+        if kind == "list":
+            return dict(rule, source=v1, dropdown=self.dropdown.get())
+        if kind == "custom":
+            return dict(rule, v1=v1 if v1.startswith("=") else "=" + v1)
+        values = [v1, v2] if op in ("between", "notbetween") else [v1]
+        for v in values:
+            if not (fe.is_formula(v) or fe.is_number(fe.parse_literal(v)[0])):
+                self.bell()
+                return None
+        rule.update(op=op, v1=v1)
+        if len(values) == 2:
+            rule["v2"] = v2
+        return rule
+
+
+class NoteDialog(Dialog):
+    """Text of a cell note; collect() returns it ("" removes the note)."""
+
+    def __init__(self, master, cell, text):
+        super().__init__(master, f"Ghi chú - {cell}")
+        self.box = _text_box(self.body, text, 7)
+        self.box.pack(fill="both", expand=True)
+        ttk.Label(self.body, text="Ctrl+Enter để lưu.", foreground="#666").pack(anchor="w", pady=(4, 0))
+        self.add_buttons()
+        self.unbind("<Return>")
+        self.box.bind("<Control-Return>", lambda e: (self.ok(), "break")[1])
+
+    def show(self):
+        self.box.mark_set("insert", "end")
+        return super().show(self.box)
+
+    def collect(self):
+        return self.box.get("1.0", "end").strip()
+
+
+class ListPopup:
+    """The in-cell dropdown of a list validation: click or Enter picks an item."""
+
+    def __init__(self, master, ui, items, current, x, y, width, on_pick):
+        self.on_pick, self.items = on_pick, items
+        self.pop = pop = Popup(master, x, y)
+        holder = tk.Frame(pop.inner, bg="#ffffff")
+        holder.pack(fill="both", expand=True)
+        self.listbox = lb = tk.Listbox(holder, height=min(8, max(1, len(items))), activestyle="none",
+                                       font=ui.font, relief="flat", bd=0, highlightthickness=0,
+                                       selectbackground="#cce4f7", selectforeground=TEXT_FG,
+                                       width=max(4, round(width / max(1, ui.font.measure("0")))))
+        if len(items) > 8:
+            bar = ttk.Scrollbar(holder, orient="vertical", command=lb.yview)
+            lb.config(yscrollcommand=bar.set)
+            bar.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+        for item in items:
+            lb.insert("end", item)
+        index = next((i for i, item in enumerate(items) if item.lower() == (current or "").lower()), 0)
+        lb.selection_set(index)
+        lb.activate(index)
+        lb.see(index)
+        lb.bind("<ButtonRelease-1>", lambda e: self._pick())
+        lb.bind("<Return>", lambda e: self._pick())
+        lb.bind("<Motion>", lambda e: (lb.selection_clear(0, "end"), lb.selection_set(lb.nearest(e.y))))
+        pop.show()
+        lb.focus_set()
+
+    def _pick(self):
+        sel = self.listbox.curselection()
+        self.pop.close()
+        if sel:
+            self.on_pick(self.items[sel[0]])

@@ -36,6 +36,9 @@ HEADER_SEL_FG = "#0b5a2f"
 SELECTION_TINT = "#a9cdb5"
 SHEETBAR_BG = "#ececec"
 FREEZE_LINE = "#8a8a8a"
+NOTE_MARK = "#d13438"
+NOTE_BG = "#ffffe1"
+NOTE_LINE = "#9a9a7a"
 REF_COLORS = ("#2f6fd6", "#d13438", "#8e44ad", "#c55a11", "#00838f", "#c2185b")
 
 FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72]
@@ -125,6 +128,9 @@ THANH RIBBON
   • Ô "Cho tôi biết bạn muốn làm gì" trên thanh xanh: gõ tên lệnh (ví dụ "viền", "lọc") rồi Enter.
   • Nhấp đúp vào tên tab để thu gọn/mở rộng ribbon.
   • Xem → Cố định ngăn: giữ các hàng phía trên và cột bên trái ô đang chọn luôn hiển thị khi cuộn.
+  • Dữ liệu → Xác thực dữ liệu: giới hạn giá trị được nhập (số, ngày, độ dài) hoặc tạo danh sách thả xuống
+    (nguồn  Có,Không  hoặc  =$A$1:$A$10). Nhấp mũi tên cạnh ô hoặc Alt+↓ để chọn.
+  • Xem lại → Ghi chú mới (Shift+F2): ô có ghi chú có tam giác đỏ ở góc, rê chuột vào để xem.
 
 NHẬP DỮ LIỆU
   • Chọn ô rồi gõ; Enter/Tab để xác nhận, Esc để hủy. F2 hoặc nhấp đúp để sửa.
@@ -212,6 +218,9 @@ class SpreadsheetApp:
         self.painter = None            # formats picked up by the Format Painter
         self.show_grid = self.show_headings = True
         self.show_formulas = False
+        self.show_notes = False        # every note shown, not just the one under the pointer
+        self.hover_note = None         # (sheet, row, col) of the note shown under the pointer
+        self._list_button = None       # canvas box of the active cell's validation-list arrow
         self.last_fill, self.last_fg = "#ffff00", "#ff0000"
         self.border_style, self.border_color, self.last_border = "thin", "#000000", "bottom"
         self.vis_rows, self.vis_cols = [], []
@@ -425,6 +434,7 @@ class SpreadsheetApp:
         self._build_insert_tab(rb.add_tab("Chèn"))
         self._build_formulas_tab(rb.add_tab("Công thức"))
         self._build_data_tab(rb.add_tab("Dữ liệu"))
+        self._build_review_tab(rb.add_tab("Xem lại"))
         self._build_view_tab(rb.add_tab("Xem"))
         self._build_help_tab(rb.add_tab("Trợ giúp"))
         rb.select("Trang chủ")
@@ -718,6 +728,22 @@ class SpreadsheetApp:
         self._btn(g, col, side="top", icon="calc", text="Áp dụng lại", command=self.reapply_filter)
         g = rb.group(page, "Công cụ dữ liệu")
         self._btn(g, large=True, icon="remove_dup", text="Loại bỏ\ntrùng lặp", command=self.remove_duplicates)
+        self._btn(g, large=True, icon="validation", text="Xác thực\ndữ liệu", command=self.data_validation_dialog,
+                  menu=self._make_menu([("Xác thực dữ liệu...", self.data_validation_dialog),
+                                        ("Xóa xác thực dữ liệu", self.clear_validation)]), split=True,
+                  tooltip="Xác thực dữ liệu\nGiới hạn những gì được nhập vào ô, ví dụ danh sách thả xuống")
+
+    def _build_review_tab(self, page):
+        rb = self.ribbon
+        g = rb.group(page, "Ghi chú")
+        self._btn(g, large=True, icon="note", text="Ghi chú\nmới", command=self.edit_note,
+                  tooltip="Thêm hoặc sửa ghi chú của ô (Shift+F2)")
+        col = g.column()
+        self._btn(g, col, side="top", icon="note_delete", text="Xóa ghi chú", command=self.delete_notes)
+        self._btn(g, col, side="top", icon="note_prev", text="Ghi chú trước", command=lambda: self.goto_note(-1))
+        self._btn(g, col, side="top", icon="note_next", text="Ghi chú tiếp", command=lambda: self.goto_note(1))
+        self.btn_show_notes = self._btn(g, large=True, icon="note", text="Hiện tất cả\nghi chú",
+                                        command=self.toggle_show_notes, tooltip="Hiện/ẩn mọi ghi chú trên trang tính")
 
     def _build_view_tab(self, page):
         rb = self.ribbon
@@ -922,6 +948,7 @@ class SpreadsheetApp:
         cv.bind("<Double-Button-1>", self.on_double)
         cv.bind("<Button-3>", self.on_context)
         cv.bind("<Motion>", self.on_motion)
+        cv.bind("<Leave>", lambda e: self._set_hover_note(None))
         self.root.bind_all("<MouseWheel>", self.on_wheel)
         self.root.bind_all("<Shift-MouseWheel>", lambda e: self.on_wheel(e, horizontal=True))
 
@@ -935,6 +962,7 @@ class SpreadsheetApp:
             ("Dán đặc biệt...", self.paste_special), None,
             ("Chèn...", self.insert_cells_dialog, "Ctrl++"), ("Xóa...", self.delete_cells_dialog, "Ctrl+-"),
             ("Xóa nội dung", self.clear_contents, "Delete"), None,
+            ("Chèn/Sửa ghi chú...", self.edit_note, "Shift+F2"), ("Xóa ghi chú", self.delete_notes), None,
             ("Lọc", [("Lọc theo giá trị của ô đã chọn", self.filter_by_value), ("Bật/tắt bộ lọc", self.toggle_filter)]),
             ("Sắp xếp", [("Sắp xếp từ A đến Z", lambda: self.sort_selection(False)),
                          ("Sắp xếp từ Z đến A", lambda: self.sort_selection(True)),
@@ -969,7 +997,8 @@ class SpreadsheetApp:
                  "<Control-KP_Subtract>": self.delete_cells_dialog,
                  "<Control-ampersand>": lambda: self.apply_border("outside"),
                  "<Control-underscore>": lambda: self.apply_border("none"), "<F9>": self.recalculate,
-                 "<Shift-F3>": self.insert_function_dialog}
+                 "<Shift-F3>": self.insert_function_dialog, "<Shift-F2>": self.edit_note,
+                 "<Alt-Down>": self.open_validation_list}
         for seq, func in extra.items():
             cv.bind(seq, lambda e, f=func: self._key_action(f))
         global_keys = {"n": self.new_file, "o": self.open_file, "s": self.save_file, "f": self.open_find,
@@ -1415,6 +1444,17 @@ class SpreadsheetApp:
                 style = cf.get((r, c))
             draw_text(r, c, box, style, spill=not m)
 
+        mark = max(4, round(5 * self.px))
+        for r, c in visible(sh.notes):
+            m = sh.merge_at(r, c)
+            if (r, c) in covered or (m and (r, c) != (m[0], m[1])):
+                continue
+            if m:
+                _, y0, x1, _ = self._rect_bbox(*m)
+            else:
+                x1, y0 = col_pos[c][1], row_pos[r][0]
+            cv.create_polygon(x1 - 1 - mark, y0, x1 - 1, y0, x1 - 1, y0 + mark, fill=NOTE_MARK, outline="")
+
         if btn_size:
             fy0, fy1 = row_pos[f["range"][0]]
             for c in filter_cols:
@@ -1471,7 +1511,59 @@ class SpreadsheetApp:
         if fc1 > fc0:
             cv.create_line(px - 1, hh, px - 1, bottom, fill=FREEZE_LINE)
         self._draw_headers(cv, W, H, (r1, c1, r2, c2), sel_box)
+        self._draw_cell_extras(cv, W, H, col_pos, row_pos)
         self._place_editor()
+
+    def _draw_cell_extras(self, cv, W, H, col_pos, row_pos):
+        """The validation-list arrow and input message of the active cell, and note callouts."""
+        self._list_button = None
+        r, c = self.cur
+        box = self._rect_bbox(*self._cell_box(r, c))
+        shown = self._clip_box(box, W, H) is not None and box[2] > box[0] and box[3] > box[1]
+        rule = self.wb.validation_at(self.sheet, r, c)
+        if rule and shown and rule.get("type") == "list" and rule.get("dropdown", True) and not self.is_editing():
+            size = min(box[3] - box[1], round(18 * self.px))
+            bx0, by1 = box[2] + 1, box[3]
+            self._list_button = (bx0, by1 - size, bx0 + size, by1)
+            cv.create_rectangle(*self._list_button, fill="#f0f0f0", outline="#a6a6a6")
+            mx, my, d = bx0 + size / 2, by1 - size / 2, size * 0.2
+            cv.create_polygon(mx - d, my - d / 2, mx + d, my - d / 2, mx, my + d * 0.8, fill="#444444", outline="")
+        if rule and shown and (rule.get("prompt") or rule.get("prompt_title")):
+            self._callout(cv, W, H, box[0] + 8, box[3] + 6, rule.get("prompt_title"), rule.get("prompt"), None)
+        notes = self.sh.notes
+        if self.show_notes:
+            keys = [k for k in notes if k[0] in row_pos and k[1] in col_pos]
+        elif self.hover_note and self.hover_note[0] == self.sheet and self.hover_note[1:] in notes:
+            keys = [self.hover_note[1:]]
+        else:
+            keys = []
+        for nr, nc in sorted(keys):
+            nbox = self._rect_bbox(*self._cell_box(nr, nc))
+            if nbox[2] <= nbox[0] or nbox[3] <= nbox[1]:
+                continue
+            self._callout(cv, W, H, nbox[2] + 14, nbox[1] - 4, None, notes[(nr, nc)], (nbox[2] - 1, nbox[1]))
+
+    def _callout(self, cv, W, H, x, y, title, text, pointer):
+        """A note-style box at (x, y), moved left of `pointer` (x, y) or up when it would leave the canvas."""
+        font, bold, pad = self.ui.small_font, self.header_bold, round(6 * self.scale)
+        width = round(190 * self.scale)
+        lines = self.wrap_lines(text or "", font, width - 2 * pad) if text else []
+        ls = font.metrics("linespace")
+        height = 2 * pad + len(lines) * ls + (bold.metrics("linespace") + 2 if title else 0)
+        if x + width > W and pointer:
+            x = pointer[0] - 14 - width
+        x = max(self.header_w + 2, min(x, W - width - 2))
+        y = max(self.header_h + 2, min(y, H - height - 2))
+        if pointer:
+            cv.create_line(pointer[0], pointer[1], x if x > pointer[0] else x + width, y + 6, fill=NOTE_LINE)
+        cv.create_rectangle(x + 2, y + 2, x + width + 2, y + height + 2, fill="#d8d8d8", outline="")
+        cv.create_rectangle(x, y, x + width, y + height, fill=NOTE_BG, outline=NOTE_LINE)
+        ty = y + pad
+        if title:
+            cv.create_text(x + pad, ty, text=title, anchor="nw", font=bold, fill="#000000")
+            ty += bold.metrics("linespace") + 2
+        if lines:
+            cv.create_text(x + pad, ty, text="\n".join(lines), anchor="nw", font=font, fill="#000000")
 
     def _draw_border(self, cv, key, spec, x0, y0, x1, y1):
         style, color = spec[0], spec[1] if len(spec) > 1 else "#000000"
@@ -1767,6 +1859,9 @@ class SpreadsheetApp:
     # ------------------------------------------------------------------ mouse
 
     def on_press(self, e):
+        if self._list_button and self._inside(self._list_button, e.x, e.y):
+            self.open_validation_list()
+            return "break"
         for bx0, by0, bx1, by1, col in self._filter_buttons:
             if bx0 <= e.x <= bx1 and by0 <= e.y <= by1:
                 self.commit_edit()
@@ -1899,13 +1994,26 @@ class SpreadsheetApp:
             self.start_edit(mode="edit")
         return "break"
 
+    @staticmethod
+    def _inside(box, x, y):
+        return box[0] <= x <= box[2] and box[1] <= y <= box[3]
+
+    def _set_hover_note(self, key):
+        if key != self.hover_note:
+            self.hover_note = key
+            self.redraw()
+
     def on_motion(self, e):
         if self.drag:
             return
+        kind, r, c = self.hit(e.x, e.y)
+        anchor = self._anchor((r, c)) if kind == "cell" else None
+        self._set_hover_note((self.sheet, *anchor) if anchor in self.sh.notes else None)
         border = self._border_hit(e.x, e.y)
         if border is not None:
             cursor = "sb_h_double_arrow" if border[0] == "col" else "sb_v_double_arrow"
-        elif any(b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3] for b in self._filter_buttons):
+        elif any(b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3] for b in self._filter_buttons) or (
+                self._list_button and self._inside(self._list_button, e.x, e.y)):
             cursor = "hand2"
         elif not self.is_editing() and self._on_fill_handle(e.x, e.y):
             cursor = "crosshair"
@@ -2072,6 +2180,9 @@ class SpreadsheetApp:
         self._end_edit()
         if sheet in self.wb.sheets:
             raw = fe.normalize_formula(text)
+            if not self._entry_allowed(sheet, r, c, raw, text):
+                self.refresh()
+                return
             cs = ChangeSet(self.wb)
             if fill and sheet == self.sheet:
                 for rr, cc in self._format_targets():
@@ -2083,6 +2194,36 @@ class SpreadsheetApp:
             self.move_active(*move)
         else:
             self.refresh()
+
+    def _entry_allowed(self, sheet, r, c, raw, text):
+        """Check an entry against the cell's data validation, asking the user like Excel does.
+        "Retry" (or "No" on a warning) reopens the editor with the text typed."""
+        rule = self.wb.validate(sheet, r, c, raw)
+        if rule is None:
+            return True
+        title = rule.get("error_title") or APP_NAME
+        msg = rule.get("error") or ("Giá trị này không khớp với các giới hạn xác thực dữ liệu đã đặt cho ô này."
+                                    if rule.get("type") != "list" else "Hãy chọn một giá trị trong danh sách.")
+        style = rule.get("style", "stop")
+        if style == "warning":
+            answer = messagebox.askyesnocancel(title, msg + "\n\nTiếp tục?", icon="warning", parent=self.root)
+        elif style == "info":
+            answer = messagebox.askokcancel(title, msg, icon="info", parent=self.root) or None
+        else:
+            answer = False if messagebox.askretrycancel(title, msg, icon="error", parent=self.root) else None
+        if answer:
+            return True
+        if answer is False:
+            self.root.after_idle(lambda: self._reopen_edit(sheet, r, c, text))
+        return False
+
+    def _reopen_edit(self, sheet, r, c, text):
+        if sheet not in self.wb.sheets or self.is_editing():
+            return
+        if sheet != self.sheet:
+            self.switch_sheet(sheet)
+        self.cur = self.ext = (r, c)
+        self.start_edit(initial=text, mode="edit")
 
     def cancel_edit(self):
         if not self.is_editing():
@@ -3232,6 +3373,110 @@ class SpreadsheetApp:
                             parent=self.root)
 
     # ------------------------------------------------------------------ rows, columns, cells, sheets
+
+    # ------------------------------------------------------------------ data validation and notes
+
+    def _validation_target(self):
+        r1, c1, r2, c2 = self.sel_rect()
+        if self._is_huge(r1, c1, r2, c2) and not (r1 == 0 and r2 == MAX_ROWS - 1):
+            rows, cols = self.wb.used_extent(self.sheet)
+            r2, c2 = max(r1, min(r2, rows - 1)), max(c1, min(c2, cols - 1))
+        return r1, c1, r2, c2
+
+    def _replace_validation(self, rect, rule):
+        """Rules after `rect` loses whatever validation it had and, unless rule is None, gets `rule`."""
+        rules = [dict(old, range=part) for old in self.sh.validations for part in fe.rect_minus(old["range"], rect)]
+        if rule is not None:
+            rules.append(dict(rule, range=rect))
+        return rules
+
+    def data_validation_dialog(self):
+        self.commit_edit()
+        rect = self._validation_target()
+        result = dialogs.ValidationDialog(self.root, self.wb.validation_at(self.sheet, *self.cur)).show()
+        if result is None:
+            return
+        rule = None if result.get("clear") or result.get("type") == "any" else result
+        rules = self._replace_validation(rect, rule)
+        if rules != self.sh.validations:
+            self._structural(lambda: setattr(self.sh, "validations", rules))
+
+    def clear_validation(self):
+        self.commit_edit()
+        rules = self._replace_validation(self._validation_target(), None)
+        if rules != self.sh.validations:
+            self._structural(lambda: setattr(self.sh, "validations", rules))
+
+    def open_validation_list(self):
+        self.commit_edit()
+        r, c = self.cur
+        rule = self.wb.validation_at(self.sheet, r, c)
+        if not rule or rule.get("type") != "list":
+            return
+        items = self.wb.validation_options(self.sheet, r, c, rule)
+        if not items:
+            self.root.bell()
+            return
+        self.ensure_visible(r, c)
+        self.refresh_view()
+        x0, _, x1, y1 = self._rect_bbox(*self._cell_box(r, c))
+        cv = self.canvas
+        width = max(x1 - x0 + (self._list_button[2] - self._list_button[0] if self._list_button else 0),
+                    max(self.ui.font.measure(t) for t in items) + 24)
+
+        def pick(text):
+            cs = ChangeSet(self.wb)
+            cs.set(self.sheet, r, c, raw="'" + text if text.startswith("=") else text)
+            self.commit(cs)
+            self.refresh()
+            self.canvas.focus_set()
+
+        dialogs.ListPopup(self.root, self.ui, items, self.wb.display_text(self.sheet, r, c),
+                          cv.winfo_rootx() + int(x0), cv.winfo_rooty() + int(y1) + 1, width, pick)
+
+    def edit_note(self):
+        self.commit_edit()
+        r, c = self.cur = self._anchor(self.cur)
+        old = self.sh.notes.get((r, c), "")
+        text = dialogs.NoteDialog(self.root, cell_name(r, c), old).show()
+        if text is None or text == old:
+            return
+
+        def change():
+            if text:
+                self.sh.notes[(r, c)] = text
+            else:
+                self.sh.notes.pop((r, c), None)
+        self._structural(change)
+
+    def delete_notes(self):
+        self.commit_edit()
+        r1, c1, r2, c2 = self.sel_rect()
+        doomed = [k for k in self.sh.notes if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
+        if not doomed:
+            self.root.bell()
+            return
+
+        def change():
+            for k in doomed:
+                del self.sh.notes[k]
+        self._structural(change)
+
+    def goto_note(self, step):
+        """Select the next (step 1) or previous (step -1) cell with a note, wrapping around."""
+        self.commit_edit()
+        keys = sorted(self.sh.notes)
+        if not keys:
+            self.root.bell()
+            return
+        after = [k for k in keys if (k > self.cur if step > 0 else k < self.cur)]
+        target = (after[0] if step > 0 else after[-1]) if after else (keys[0] if step > 0 else keys[-1])
+        self.select_to(target)
+
+    def toggle_show_notes(self):
+        self.show_notes = not self.show_notes
+        self.btn_show_notes.set_checked(self.show_notes)
+        self.redraw()
 
     def insert_rows(self):
         r1, _, r2, _ = self.sel_rect()
