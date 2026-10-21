@@ -70,6 +70,7 @@ fill_series
 fill_up
 filter
 filter_clear
+filter_color
 filter_reapply
 filter_value
 find
@@ -139,6 +140,7 @@ sheet_tab_color
 show_formulas
 shrink_font
 sort_az
+sort_color
 sort_custom
 sort_filter
 sort_za

@@ -38,6 +38,7 @@ HEADER_SEL_FG = "#0b5a2f"
 SELECTION_TINT = "#a9cdb5"
 SHEETBAR_BG = "#ececec"
 FREEZE_LINE = "#8a8a8a"
+FILTERED_ROW_FG = "#2b579a"  # row numbers inside a filtered range, as in Excel
 NOTE_MARK = "#d13438"
 NOTE_BG = "#ffffe1"
 NOTE_LINE = "#9a9a7a"
@@ -136,6 +137,7 @@ MENU_ICONS = {
     "Sắp xếp": "sort_az", "Sắp xếp từ A đến Z": "sort_az", "Sắp xếp từ Z đến A": "sort_za",
     "Sắp xếp tùy chỉnh": "sort_custom", "Lọc": "filter", "Bật/tắt bộ lọc": "filter", "Xóa bộ lọc": "filter_clear",
     "Áp dụng lại bộ lọc": "filter_reapply", "Lọc theo giá trị của ô đã chọn": "filter_value",
+    "Lọc theo màu của ô đã chọn": "filter_color", "Lọc theo màu phông của ô đã chọn": "filter_color",
     "Xoay ngược chiều kim đồng hồ": "angle_ccw", "Xoay theo chiều kim đồng hồ": "angle_cw",
     "Văn bản dọc": "angle_vertical", "Xoay văn bản lên": "angle_up", "Xoay văn bản xuống": "angle_down",
     "Quy tắc tô sáng ô": "cf_highlight", "Quy tắc trên/dưới": "cf_topbottom", "Thanh dữ liệu": "cf_databar",
@@ -175,6 +177,10 @@ THANH RIBBON
   • Dữ liệu → Xác thực dữ liệu: giới hạn giá trị được nhập (số, ngày, độ dài) hoặc tạo danh sách thả xuống
     (nguồn  Có,Không  hoặc  =$A$1:$A$10). Nhấp mũi tên cạnh ô hoặc Alt+↓ để chọn.
   • Xem lại → Ghi chú mới (Shift+F2): ô có ghi chú có tam giác đỏ ở góc, rê chuột vào để xem.
+  • Lọc dữ liệu: quét chọn bảng (kể cả hàng tiêu đề) rồi bấm Dữ liệu → Lọc (Ctrl+Shift+L). Nút ▾ ở tiêu đề
+    có: sắp xếp (cả theo màu), lọc theo màu, Bộ lọc số / văn bản / ngày (lớn hơn, nằm giữa, có chứa, 10 mục
+    đầu, trên trung bình, tháng này...), Bộ lọc tùy chỉnh (2 điều kiện Và/Hoặc, dùng * và ?) và danh sách
+    giá trị có ô tìm kiếm. Thanh trạng thái cho biết số bản ghi tìm thấy.
   • Chèn → Biểu đồ (Cột, Thanh, Đường, Tròn): chọn vùng dữ liệu kèm tiêu đề rồi bấm. Kéo để di chuyển, kéo
     các nút ở viền để đổi kích thước, nhấp đúp để sửa dữ liệu/tiêu đề, Delete để xóa.
 
@@ -1036,7 +1042,10 @@ class SpreadsheetApp:
             ("Chèn...", self.insert_cells_dialog, "Ctrl++"), ("Xóa...", self.delete_cells_dialog, "Ctrl+-"),
             ("Xóa nội dung", self.clear_contents, "Delete"), None,
             ("Chèn/Sửa ghi chú...", self.edit_note, "Shift+F2"), ("Xóa ghi chú", self.delete_notes), None,
-            ("Lọc", [("Lọc theo giá trị của ô đã chọn", self.filter_by_value), ("Bật/tắt bộ lọc", self.toggle_filter)]),
+            ("Lọc", [("Lọc theo giá trị của ô đã chọn", self.filter_by_value),
+                     ("Lọc theo màu của ô đã chọn", lambda: self.filter_by_color("bg")),
+                     ("Lọc theo màu phông của ô đã chọn", lambda: self.filter_by_color("fg")), None,
+                     ("Bật/tắt bộ lọc", self.toggle_filter)]),
             ("Sắp xếp", [("Sắp xếp từ A đến Z", lambda: self.sort_selection(False)),
                          ("Sắp xếp từ Z đến A", lambda: self.sort_selection(True)),
                          ("Sắp xếp tùy chỉnh...", self.custom_sort)]), None,
@@ -1773,13 +1782,16 @@ class SpreadsheetApp:
             cv.create_line(x1 - 1, 0, x1 - 1, hh, fill=HEADER_LINE)
             cv.create_text((x0 + x1) // 2, hh // 2, text=col_name(c), fill=HEADER_SEL_FG if sel_col else HEADER_FG,
                            font=self.header_bold if sel_col else self.header_font)
+        f = self.sh.filter
+        fr1, fr2 = (f["range"][0], f["range"][2]) if f and f["criteria"] else (0, -1)
         for r, y0, y1 in self.vis_rows:
             sel_row = r1 <= r <= r2
             if sel_row:
                 cv.create_rectangle(0, y0, hw, y1, fill=HEADER_FULL_BG if full_rows else HEADER_SEL_BG, outline="")
             cv.create_line(0, y1 - 1, hw, y1 - 1, fill=HEADER_LINE)
             if y1 - y0 >= self.header_font.metrics("linespace") * 0.6:
-                cv.create_text(hw // 2, (y0 + y1) // 2, text=str(r + 1), fill=HEADER_SEL_FG if sel_row else HEADER_FG,
+                fg = HEADER_SEL_FG if sel_row else FILTERED_ROW_FG if fr1 < r <= fr2 else HEADER_FG
+                cv.create_text(hw // 2, (y0 + y1) // 2, text=str(r + 1), fill=fg,
                                font=self.header_bold if sel_row else self.header_font)
         cv.create_line(0, hh - 1, W, hh - 1, fill=HEADER_LINE)
         cv.create_line(hw - 1, 0, hw - 1, H, fill=HEADER_LINE)
@@ -1822,6 +1834,9 @@ class SpreadsheetApp:
         self.build_tabs()
         self.refresh()
         self.update_title()
+        mode = self.mode_label.cget("text")
+        if mode == "Sẵn sàng" or mode.startswith("Bộ lọc:"):
+            self.set_mode("Sẵn sàng")
 
     def _focus_is(self, widget):
         # compare Tcl names: focus_get() raises KeyError while a combobox list is open
@@ -1906,7 +1921,17 @@ class SpreadsheetApp:
         self.root.title(f"{'*' if self.dirty else ''}{name} - {APP_NAME}")
 
     def set_mode(self, text):
+        if text == "Sẵn sàng":
+            text = self._ready_text()
         self.mode_label.config(text=text)
+
+    def _ready_text(self):
+        """'Ready', or how many records a filter shows (Excel's "5 of 20 records found")."""
+        f = self.sh.filter if self.sheet in self.wb.sheets else None
+        if f and f["criteria"]:
+            total = f["range"][2] - f["range"][0]
+            return f"Bộ lọc: tìm thấy {total - len(f['hidden'])} trên {total} bản ghi"
+        return "Sẵn sàng"
 
     def mark_dirty(self):
         if not self.dirty:
@@ -3504,7 +3529,9 @@ class SpreadsheetApp:
         if result:
             self._sort_rows((r1, c1, r2, c2), result["keys"], result["header"])
 
-    def _sort_rows(self, rect, keys, header):
+    def _sort_rows(self, rect, keys, header, first=None):
+        """Sort the rows of rect by keys [(col, descending)], or with first = (col, "bg" | "fg", colour)
+        put the rows whose cell in col shows that colour on top (Excel's Sort by Color)."""
         r1, c1, r2, c2 = rect
         start = r1 + 1 if header else r1
         if r2 <= start or c2 < c1:
@@ -3518,6 +3545,10 @@ class SpreadsheetApp:
             blanks = [it for it in items if it[1][i] is None or it[1][i] == ""]
             filled.sort(key=lambda it: fe.sort_key(it[1][i]), reverse=keys[i][1])
             items = filled + blanks
+        if first is not None:
+            col, what, color = first
+            hits = {it[0] for it in items if self.wb.cell_color(self.sheet, it[0], col, what) == color}
+            items = [it for it in items if it[0] in hits] + [it for it in items if it[0] not in hits]
         cs = ChangeSet(self.wb)
         for new_r, (old_r, _, cells) in zip(range(start, r2 + 1), items):
             for j, (raw, fmt) in enumerate(cells):
@@ -3569,25 +3600,58 @@ class SpreadsheetApp:
             return
         self._extend_filter_range()
         title = self.wb.display_text(self.sheet, f["range"][0], col) or f"Cột {col_name(col)}"
-        dialogs.FilterPopup(self.root, self.ui, title, self.wb.filter_values(self.sheet, col), f["criteria"].get(col),
-                            x, y, on_sort=lambda desc: self._sort_rows(f["range"], [(col, desc)], True),
-                            on_clear=lambda: self._set_filter_criteria(col, None),
-                            on_apply=lambda allowed: self._set_filter_criteria(col, allowed), icons=self.menu_icons)
+        crit = f["criteria"].get(col)
+        if isinstance(crit, dict):  # tick the values a rule lets through
+            r1, _, r2, _ = f["range"]
+            stats = {}
+            selected = {self.wb.display_text(self.sheet, r, col) for r in range(r1 + 1, r2 + 1)
+                        if self.wb.filter_match(self.sheet, r, col, crit, stats)}
+        else:
+            selected = crit
+        kind = self.wb.filter_kind(self.sheet, col)
+        colors = {what: self.wb.filter_colors(self.sheet, col, what) for what in ("bg", "fg")}
+        dialogs.FilterPopup(
+            self.root, self.ui, title, self.wb.filter_values(self.sheet, col), selected, x, y, kind=kind,
+            colors=colors, active=crit, icons=self.menu_icons,
+            on_sort=lambda desc: self._sort_rows(f["range"], [(col, desc)], True),
+            on_sort_color=lambda what, color: self._sort_rows(f["range"], [], True, first=(col, what, color)),
+            on_clear=lambda: self._set_filter_criteria(col, None),
+            on_apply=lambda allowed: self._set_filter_criteria(col, allowed),
+            on_criterion=lambda new: self._set_filter_criteria(col, new),
+            on_dialog=lambda name, preset: self._filter_dialog(col, title, name, preset, kind))
+
+    def _filter_dialog(self, col, title, name, preset, kind):
+        """The Top 10 ("top") or Custom AutoFilter ("custom") dialog for a filter column."""
+        if name == "top":
+            result = dialogs.Top10Dialog(self.root, preset).show()
+        else:
+            result = dialogs.CustomFilterDialog(self.root, title, self.wb.filter_values(self.sheet, col), preset,
+                                                kind).show()
+        if result:
+            self._set_filter_criteria(col, result)
 
     def _set_filter_criteria(self, col, allowed):
         def change():
             criteria = self.sh.filter["criteria"]
             if allowed is None:
                 criteria.pop(col, None)
-            else:
-                criteria[col] = set(allowed)
+            else:  # a set of texts from the checklist, or a rule (see formula_engine.FILTER_OPS)
+                criteria[col] = dict(allowed) if isinstance(allowed, dict) else set(allowed)
             self.wb.apply_filter(self.sheet)
         self._structural(change)
 
     def filter_by_value(self):
+        self._filter_by_cell(lambda r, c: {self.wb.display_text(self.sheet, r, c)})
+
+    def filter_by_color(self, what="bg"):
+        self._filter_by_cell(lambda r, c: {"type": "color", "what": what,
+                                           "color": self.wb.cell_color(self.sheet, r, c, what)})
+
+    def _filter_by_cell(self, criterion):
+        """Filter the active cell's column by criterion(row, col), turning the filter on if needed."""
         self.commit_edit()
         r, c = self.cur
-        text = self.wb.display_text(self.sheet, r, c)
+        crit = criterion(r, c)
 
         def change():
             if not self.sh.filter:
@@ -3595,7 +3659,7 @@ class SpreadsheetApp:
                 if rect[0] == rect[2]:
                     raise ValueError("Cần một vùng dữ liệu có tiêu đề để lọc.")
                 self.sh.filter = {"range": rect, "criteria": {}, "hidden": set()}
-            self.sh.filter["criteria"][c] = {text}
+            self.sh.filter["criteria"][c] = crit
             self.wb.apply_filter(self.sheet)
         self._structural(change)
 

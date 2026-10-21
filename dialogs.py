@@ -895,31 +895,76 @@ class ManageRulesDialog(Dialog):
         return self.rules
 
 
-class FilterPopup:
-    """Excel's filter dropdown: sorting, clearing, search and a checklist of values."""
+FILTER_OP_LABELS = [("=", "bằng"), ("<>", "không bằng"), (">", "lớn hơn"), (">=", "lớn hơn hoặc bằng"),
+                    ("<", "nhỏ hơn"), ("<=", "nhỏ hơn hoặc bằng"), ("begins", "bắt đầu bằng"),
+                    ("nbegins", "không bắt đầu bằng"), ("ends", "kết thúc bằng"), ("nends", "không kết thúc bằng"),
+                    ("contains", "có chứa"), ("ncontains", "không chứa")]
+DATE_OP_LABELS = {">": "sau", ">=": "sau hoặc bằng", "<": "trước", "<=": "trước hoặc bằng"}
+DYNAMIC_LABELS = {"tomorrow": "Ngày mai", "today": "Hôm nay", "yesterday": "Hôm qua", "nextweek": "Tuần tới",
+                  "thisweek": "Tuần này", "lastweek": "Tuần trước", "nextmonth": "Tháng tới", "thismonth": "Tháng này",
+                  "lastmonth": "Tháng trước", "nextyear": "Năm tới", "thisyear": "Năm nay", "lastyear": "Năm trước"}
 
-    def __init__(self, master, ui, title, values, selected, x, y, on_sort, on_clear, on_apply, icons=None):
-        self.values, self.on_apply = values, on_apply
+
+def describe_filter(crit, kind="text"):
+    """A short Vietnamese description of a column's filter, e.g. 'lớn hơn 10 và nhỏ hơn 20'."""
+    if crit is None:
+        return ""
+    if not isinstance(crit, dict):
+        return f"{len(crit)} giá trị được chọn"
+    labels = dict(FILTER_OP_LABELS, **(DATE_OP_LABELS if kind == "date" else {}))
+    t = crit["type"]
+    if t == "custom":
+        return (" và " if crit.get("join", "and") == "and" else " hoặc ").join(
+            f"{labels[op]} “{value}”" for op, value in crit["conds"])
+    if t == "top":
+        return (f"{'dưới' if crit.get('bottom') else 'trên'} {crit.get('n', 10)}"
+                f"{'%' if crit.get('percent') else ' mục'}")
+    if t == "average":
+        return "trên trung bình" if crit.get("above", True) else "dưới trung bình"
+    if t == "dynamic":
+        return DYNAMIC_LABELS[crit["kind"]].lower()
+    return ("màu ô " if crit.get("what", "bg") == "bg" else "màu phông ") + (crit.get("color") or "tự động")
+
+
+class FilterPopup:
+    """Excel's AutoFilter dropdown: sort (also by colour), clear, filter by colour, the Number / Text /
+    Date Filters menu, a search box and the checklist of values.
+
+    kind is "number", "date" or "text"; colors {"bg": [...], "fg": [...]} the colours to offer (None means
+    no fill / automatic); active the column's current criterion. Callbacks: on_sort(descending),
+    on_sort_color(what, color), on_clear(), on_apply(set of texts or None for all), on_criterion(criterion)
+    and on_dialog(name, preset) for the "custom" and "top" dialogs."""
+
+    def __init__(self, master, ui, title, values, selected, x, y, *, kind="text", colors=None, active=None,
+                 on_sort, on_clear, on_apply, on_sort_color=None, on_criterion=None, on_dialog=None, icons=None):
+        self.values, self.on_apply, self.ui, self.icons = values, on_apply, ui, icons
+        self.active, self.kind = active, kind
+        self.on_criterion, self.on_dialog = on_criterion, on_dialog
+        colors = colors or {}
         self.pop = pop = Popup(master, x, y)
         f = pop.inner
-        pad = ui.px(6)
-
-        def entry(text, command, enabled=True):
-            icon, _, text = text.partition(":")  # "icon name:label"
-            image = icons.get(icon) if icons else None
-            lbl = tk.Label(f, text=(" " + text) if image else text, bg="#ffffff",
-                           fg=TEXT_FG if enabled else "#a0a0a0", anchor="w", font=ui.font, padx=pad, pady=ui.px(3),
-                           **({"image": image, "compound": "left"} if image else {}))
-            lbl.pack(fill="x", padx=2)
-            if enabled:
-                lbl.bind("<Enter>", lambda e: lbl.config(bg=HOVER_BG))
-                lbl.bind("<Leave>", lambda e: lbl.config(bg="#ffffff"))
-                lbl.bind("<ButtonRelease-1>", lambda e: (pop.close(), command()))
-
-        entry("sort_az:Sắp xếp từ A đến Z", lambda: on_sort(False))
-        entry("sort_za:Sắp xếp từ Z đến A", lambda: on_sort(True))
+        self.pad = pad = ui.px(6)
+        asc, desc = {"number": ("Sắp xếp từ nhỏ nhất đến lớn nhất", "Sắp xếp từ lớn nhất đến nhỏ nhất"),
+                     "date": ("Sắp xếp từ cũ nhất đến mới nhất", "Sắp xếp từ mới nhất đến cũ nhất")}.get(
+            kind, ("Sắp xếp từ A đến Z", "Sắp xếp từ Z đến A"))
+        has_colors = bool(colors.get("bg") or colors.get("fg"))
+        self._entry(f, "sort_az", asc, lambda: on_sort(False))
+        self._entry(f, "sort_za", desc, lambda: on_sort(True))
+        self._entry(f, "sort_color", "Sắp xếp theo màu", lambda w: self._color_menu(w, colors, on_sort_color),
+                    has_colors and on_sort_color is not None, submenu=True)
         tk.Frame(f, bg=GROUP_LINE, height=1).pack(fill="x", padx=2, pady=2)
-        entry(f"filter_clear:Xóa bộ lọc khỏi “{title}”", on_clear, selected is not None)
+        self._entry(f, "filter_clear", f"Xóa bộ lọc khỏi “{title}”", on_clear, active is not None)
+        color_on = isinstance(active, dict) and active["type"] == "color"
+        self._entry(f, "filter_color", "Lọc theo màu",
+                    lambda w: self._color_menu(w, colors, lambda what, c: on_criterion(
+                        {"type": "color", "what": what, "color": c}), active if color_on else None),
+                    has_colors and on_criterion is not None, submenu=True, checked=color_on)
+        rules_on = isinstance(active, dict) and active["type"] != "color"
+        label = {"number": "Bộ lọc số", "date": "Bộ lọc ngày"}.get(kind, "Bộ lọc văn bản")
+        self._entry(f, None, label, self._rules_menu, on_criterion is not None, submenu=True, checked=rules_on)
+        if active is not None and not isinstance(active, set):
+            tk.Label(f, text="Đang lọc: " + describe_filter(active, kind), bg="#ffffff", fg="#2b579a", anchor="w",
+                     font=ui.small_font, padx=pad, wraplength=ui.px(250), justify="left").pack(fill="x", padx=2)
         tk.Frame(f, bg=GROUP_LINE, height=1).pack(fill="x", padx=2, pady=2)
         self.search = tk.StringVar()
         search = ttk.Entry(f, textvariable=self.search, width=30, font=ui.font)
@@ -937,9 +982,10 @@ class FilterPopup:
         pop.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(-round(e.delta / 120) or -1, "units"))
         self.vars = {v: tk.BooleanVar(value=selected is None or v in selected) for v in values}
         self.all_var = tk.BooleanVar(value=all(var.get() for var in self.vars.values()))
+        self.changed = False  # OK without touching the list keeps a rule filter as it is
         self.font = ui.font
         self._fill()
-        self.search.trace_add("write", lambda *a: self._fill())
+        self.search.trace_add("write", lambda *a: (setattr(self, "changed", True), self._fill()))
         buttons = tk.Frame(f, bg="#ffffff")
         buttons.pack(fill="x", padx=pad, pady=pad)
         ttk.Button(buttons, text="Hủy", width=9, command=pop.close).pack(side="right")
@@ -947,6 +993,120 @@ class FilterPopup:
         pop.show()
         search.focus_set()
         pop.bind("<Return>", lambda e: self._ok())
+
+    def _entry(self, parent, icon, text, command, enabled=True, submenu=False, checked=False, swatch=None,
+               popup=None):
+        """A menu-like row; `command` takes the row widget when it opens a submenu. Picking an entry of a
+        submenu (`popup`) closes it and the dropdown before running the command."""
+        # a picture (or a blank one, to keep labels aligned), unless a colour swatch stands in for it
+        image = self.icons.get(icon) if self.icons is not None and swatch is None else None
+        row = tk.Frame(parent, bg="#ffffff")
+        row.pack(fill="x", padx=2)
+        widgets, sw = [row], None
+        if swatch is not None:
+            sw = tk.Label(row, text="", bg=swatch[0], width=2, relief="solid", bd=1)
+            sw.pack(side="left", padx=(self.pad, 0), pady=2)
+            widgets.append(sw)
+        lbl = tk.Label(row, text=("✓ " if checked else "") + text, bg="#ffffff",
+                       fg=TEXT_FG if enabled else "#a0a0a0", anchor="w", font=self.ui.font, padx=self.pad,
+                       pady=self.ui.px(3), **({"image": image, "compound": "left"} if image is not None else {}))
+        lbl.pack(side="left", fill="x", expand=True)
+        widgets.append(lbl)
+        if submenu:
+            arrow = tk.Label(row, text="›", bg="#ffffff", fg="#606060" if enabled else "#c0c0c0", font=self.ui.font,
+                             padx=self.pad)
+            arrow.pack(side="right")
+            widgets.append(arrow)
+        if not enabled:
+            return row
+
+        def hover(on):
+            for w in widgets:
+                if w is not sw:
+                    w.config(bg=HOVER_BG if on else "#ffffff")
+
+        def run(e):
+            if submenu:
+                command(row)
+            elif popup is not None:
+                popup.close()
+                self.pop.close()
+                command()
+            else:
+                self.pop.close()
+                command()
+        for w in widgets:
+            w.bind("<Enter>", lambda e: hover(True))
+            w.bind("<Leave>", lambda e: hover(False))
+            w.bind("<ButtonRelease-1>", run)
+        return row
+
+    def _submenu(self, row, items):
+        """A dropdown to the right of `row`: items are (icon, label, command[, checked, swatch]) or None."""
+        sub = Popup(self.pop, row.winfo_rootx() + row.winfo_width(), row.winfo_rooty())
+        for item in items:
+            if item is None:
+                tk.Frame(sub.inner, bg=GROUP_LINE, height=1).pack(fill="x", padx=2, pady=2)
+            elif item[2] is None:  # a heading
+                tk.Label(sub.inner, text=item[1], bg="#f3f3f3", fg="#555555", anchor="w", font=self.ui.small_font,
+                         padx=self.pad, pady=self.ui.px(2)).pack(fill="x", padx=2)
+            else:
+                icon, label, command = item[:3]
+                checked = len(item) > 3 and item[3]
+                swatch = item[4] if len(item) > 4 else None
+                self._entry(sub.inner, icon, label, command, checked=checked, swatch=swatch, popup=sub)
+        sub.show()
+
+    def _color_menu(self, row, colors, pick, active=None):
+        items = []
+        for what, heading, none_label in (("bg", "Theo màu ô", "Không tô"), ("fg", "Theo màu phông", "Tự động")):
+            if not colors.get(what):
+                continue
+            items.append((None, heading, None))
+            for color in colors[what]:
+                checked = active is not None and active.get("what") == what and active.get("color") == color
+                swatch = (color or ("#ffffff" if what == "bg" else "#000000"),)
+                items.append((None, (color or none_label).upper() if color else none_label,
+                              lambda w=what, c=color: pick(w, c), checked, swatch))
+        self._submenu(row, items)
+
+    def _rules_menu(self, row):
+        active = self.active if isinstance(self.active, dict) else {}
+        on, dialog = self.on_criterion, self.on_dialog
+
+        def custom(*conds, join="and"):
+            return lambda: dialog("custom", {"type": "custom", "join": join, "conds": [[op, ""] for op in conds]})
+
+        def current_or(preset):  # "Custom Filter..." starts from the filter in place, like Excel
+            return lambda: dialog("custom", active if active.get("type") == "custom" else preset)
+
+        if self.kind == "date":
+            items = [(None, "Bằng...", custom("=")), (None, "Trước...", custom("<")), (None, "Sau...", custom(">")),
+                     (None, "Nằm giữa...", custom(">=", "<=")), None]
+            for i, kind in enumerate(DYNAMIC_LABELS):
+                items.append((None, DYNAMIC_LABELS[kind], lambda k=kind: on({"type": "dynamic", "kind": k}),
+                              active.get("type") == "dynamic" and active.get("kind") == kind))
+                if i % 3 == 2:
+                    items.append(None)
+        elif self.kind == "number":
+            items = [(None, "Bằng...", custom("=")), (None, "Không bằng...", custom("<>")),
+                     (None, "Lớn hơn...", custom(">")), (None, "Lớn hơn hoặc bằng...", custom(">=")),
+                     (None, "Nhỏ hơn...", custom("<")), (None, "Nhỏ hơn hoặc bằng...", custom("<=")),
+                     (None, "Nằm giữa...", custom(">=", "<=")), None,
+                     ("rank_top", "10 mục đầu...", lambda: dialog("top", active if active.get("type") == "top" else
+                                                                 {"type": "top", "n": 10}), active.get("type") == "top"),
+                     ("rank_above", "Trên trung bình", lambda: on({"type": "average", "above": True}),
+                      active.get("type") == "average" and active.get("above", True)),
+                     ("rank_below", "Dưới trung bình", lambda: on({"type": "average", "above": False}),
+                      active.get("type") == "average" and not active.get("above", True)), None]
+        else:
+            items = [(None, "Bằng...", custom("=")), (None, "Không bằng...", custom("<>")), None,
+                     (None, "Bắt đầu bằng...", custom("begins")), (None, "Kết thúc bằng...", custom("ends")), None,
+                     (None, "Có chứa...", custom("contains")), (None, "Không chứa...", custom("ncontains")), None]
+        items.append(("filter", "Bộ lọc tùy chỉnh...", current_or({"type": "custom", "join": "and",
+                                                                    "conds": [["=", ""]]}),
+                      active.get("type") == "custom"))
+        self._submenu(row, items)
 
     def _visible(self):
         q = self.search.get().strip().lower()
@@ -964,17 +1124,96 @@ class FilterPopup:
         self.canvas.yview_moveto(0)
 
     def _toggle_all(self):
+        self.changed = True
         for v in self._visible():
             self.vars[v].set(self.all_var.get())
 
     def _sync_all(self):
+        self.changed = True
         self.all_var.set(all(self.vars[v].get() for v in self._visible()))
 
     def _ok(self):
         visible = set(self._visible())
         allowed = {v for v, var in self.vars.items() if var.get() and v in visible}
         self.pop.close()
-        self.on_apply(None if allowed == set(self.values) else allowed)
+        if self.changed or not isinstance(self.active, dict):
+            self.on_apply(None if allowed == set(self.values) else allowed)
+
+
+class CustomFilterDialog(Dialog):
+    """Excel's Custom AutoFilter: one or two conditions joined by And / Or. collect() gives the criterion."""
+
+    def __init__(self, master, title, values, crit, kind="text"):
+        super().__init__(master, "Bộ lọc tự động tùy chỉnh")
+        self.labels = [(op, DATE_OP_LABELS.get(op, label) if kind == "date" else label)
+                       for op, label in FILTER_OP_LABELS]
+        conds = [list(c) for c in crit.get("conds", [])][:2] + [["", ""]] * 2
+        ttk.Label(self.body, text="Hiện các hàng có:").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.body, text=title, font=("TkDefaultFont", 9, "bold")).grid(row=1, column=0, columnspan=2,
+                                                                                sticky="w", pady=(2, 6))
+        self.ops, self.vals = [], []
+        for i in range(2):
+            op = tk.StringVar(value=dict(self.labels).get(conds[i][0], ""))
+            box = ttk.Combobox(self.body, values=([""] if i else []) + [label for _, label in self.labels],
+                               textvariable=op, state="readonly", width=20)
+            box.grid(row=2 + 2 * i, column=0, sticky="w", pady=2)
+            val = tk.StringVar(value=conds[i][1])
+            entry = ttk.Combobox(self.body, values=[v for v in values if v][:500], textvariable=val, width=26)
+            entry.grid(row=2 + 2 * i, column=1, sticky="w", padx=(6, 0), pady=2)
+            self.ops.append(op)
+            self.vals.append(val)
+            if i == 0:
+                self.first = entry
+                self.join = tk.StringVar(value=crit.get("join", "and"))
+                row = ttk.Frame(self.body)
+                row.grid(row=3, column=0, columnspan=2, sticky="w", padx=20)
+                ttk.Radiobutton(row, text="Và", value="and", variable=self.join).pack(side="left")
+                ttk.Radiobutton(row, text="Hoặc", value="or", variable=self.join).pack(side="left", padx=12)
+        ttk.Label(self.body, text="Dùng ? thay cho một ký tự bất kỳ\nDùng * thay cho một chuỗi ký tự bất kỳ",
+                  foreground="#666").grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.first)
+
+    def collect(self):
+        ops = {label: op for op, label in self.labels}
+        conds = [[ops[o.get()], v.get().strip()] for o, v in zip(self.ops, self.vals) if o.get()]
+        if not conds:
+            self.bell()
+            return None
+        return {"type": "custom", "join": self.join.get(), "conds": conds}
+
+
+class Top10Dialog(Dialog):
+    """Excel's Top 10 AutoFilter: the top or bottom n items or percent."""
+
+    def __init__(self, master, crit):
+        super().__init__(master, "Bộ lọc 10 mục đầu")
+        ttk.Label(self.body, text="Hiện").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self.side = tk.StringVar(value="Dưới" if crit.get("bottom") else "Trên")
+        ttk.Combobox(self.body, values=["Trên", "Dưới"], textvariable=self.side, state="readonly",
+                     width=8).grid(row=1, column=0)
+        self.n = tk.StringVar(value=str(crit.get("n", 10)))
+        self.spin = ttk.Spinbox(self.body, from_=1, to=500, textvariable=self.n, width=6)
+        self.spin.grid(row=1, column=1, padx=6)
+        self.unit = tk.StringVar(value="Phần trăm" if crit.get("percent") else "Mục")
+        ttk.Combobox(self.body, values=["Mục", "Phần trăm"], textvariable=self.unit, state="readonly",
+                     width=10).grid(row=1, column=2)
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.spin)
+
+    def collect(self):
+        try:
+            n = int(self.n.get())
+        except ValueError:
+            n = 0
+        if not 1 <= n <= (100 if self.unit.get() == "Phần trăm" else 500):
+            self.bell()
+            return None
+        return {"type": "top", "n": n, "bottom": self.side.get() == "Dưới", "percent": self.unit.get() == "Phần trăm"}
 
 
 VALIDATION_ALLOW = [("any", "Bất kỳ giá trị nào"), ("whole", "Số nguyên"), ("decimal", "Số thập phân"),

@@ -824,6 +824,101 @@ class MenuIconTests(unittest.TestCase):
             self.assertEqual((width, height), (MenuIcons.COLUMNS * size, -(-len(names) // MenuIcons.COLUMNS) * size))
 
 
+class AutoFilterTests(unittest.TestCase):
+    def setUp(self):
+        import datetime as dt
+        today = dt.date.today()
+        self.wb = make({"A1": "Tên", "B1": "Số", "C1": "Ngày"})
+        rows = [("Nguyễn An", "5", today - dt.timedelta(days=1)), ("Trần Bình", "15", today),
+                ("Lê Chi", "25", today + dt.timedelta(days=40)), ("Nguyễn Dũng", "35", dt.date(today.year - 1, 6, 1)),
+                ("Phạm Em", "x", today)]
+        for i, (name, num, day) in enumerate(rows, 2):
+            make({f"A{i}": name, f"B{i}": num, f"C{i}": day.strftime("%d/%m/%Y")}, wb=self.wb)
+        self.sh = self.wb.sheets["Sheet1"]
+        self.sh.filter = {"range": (0, 0, 5, 2), "criteria": {}, "hidden": set()}
+        self.wb.set_format("Sheet1", 2, 0, {"bg": "#ffff00"})
+        self.wb.set_format("Sheet1", 4, 0, {"bg": "#ffff00", "fg": "#ff0000"})
+
+    def shown(self, col, crit):
+        self.sh.filter["criteria"] = {col: crit}
+        self.wb.apply_filter("Sheet1")
+        return [r for r in range(1, 6) if r not in self.sh.filter["hidden"]]
+
+    def test_custom_number_and_text(self):
+        self.assertEqual(self.shown(1, {"type": "custom", "join": "and", "conds": [[">", "10"], ["<=", "25"]]}), [2, 3])
+        self.assertEqual(self.shown(1, {"type": "custom", "join": "or", "conds": [["<", "10"], [">", "30"]]}), [1, 4])
+        self.assertEqual(self.shown(0, {"type": "custom", "join": "and", "conds": [["begins", "nguyễn"]]}), [1, 4])
+        self.assertEqual(self.shown(0, {"type": "custom", "join": "and", "conds": [["ncontains", "n"]]}), [3, 5])
+        self.assertEqual(self.shown(0, {"type": "custom", "join": "and", "conds": [["=", "*ũng"]]}), [4])
+        self.assertEqual(self.shown(0, {"type": "custom", "join": "and", "conds": [["ends", "chi"]]}), [3])
+        self.assertEqual(self.shown(1, {"type": "custom", "join": "and", "conds": [["=", "15"]]}), [2])
+
+    def test_top_average_and_dates(self):
+        self.assertEqual(self.shown(1, {"type": "top", "n": 2}), [3, 4])
+        self.assertEqual(self.shown(1, {"type": "top", "n": 1, "bottom": True}), [1])
+        self.assertEqual(self.shown(1, {"type": "top", "n": 50, "percent": True}), [3, 4])
+        self.assertEqual(self.shown(1, {"type": "average", "above": True}), [3, 4])  # average 20
+        self.assertEqual(self.shown(1, {"type": "average", "above": False}), [1, 2])
+        self.assertEqual(self.shown(2, {"type": "dynamic", "kind": "today"}), [2, 5])
+        self.assertEqual(self.shown(2, {"type": "dynamic", "kind": "yesterday"}), [1])
+        self.assertEqual(self.shown(2, {"type": "dynamic", "kind": "lastyear"}), [4])
+        self.assertEqual(self.shown(2, {"type": "custom", "join": "and",
+                                        "conds": [[">", fe.format_date(fe.parse_literal(self.wb.display_text("Sheet1", 2, 2))[0], "dd/mm/yyyy")]]}), [3])
+        self.assertEqual(self.wb.filter_kind("Sheet1", 1), "number")
+        self.assertEqual(self.wb.filter_kind("Sheet1", 2), "date")
+        self.assertEqual(self.wb.filter_kind("Sheet1", 0), "text")
+
+    def test_colors(self):
+        self.assertEqual(self.wb.filter_colors("Sheet1", 0), [None, "#ffff00"])
+        self.assertEqual(self.wb.filter_colors("Sheet1", 1), [])  # one colour: nothing to filter by
+        self.assertEqual(self.shown(0, {"type": "color", "what": "bg", "color": "#ffff00"}), [2, 4])
+        self.assertEqual(self.shown(0, {"type": "color", "what": "bg", "color": None}), [1, 3, 5])
+        self.assertEqual(self.shown(0, {"type": "color", "what": "fg", "color": "#ff0000"}), [4])
+        self.sh.cond_formats = [{"range": (1, 1, 5, 1), "type": "cell", "op": ">", "v1": "20", "style": {"bg": "#ffc7ce"}}]
+        self.wb.invalidate()
+        # like Excel, the "greater than 20" rule also colours the text "x" (text sorts after numbers)
+        self.assertEqual(self.shown(1, {"type": "color", "what": "bg", "color": "#ffc7ce"}), [3, 4, 5])
+
+    def test_dynamic_spans(self):
+        import datetime as dt
+        wed = dt.date(2026, 10, 21)
+        self.assertEqual(fe.dynamic_date_span("thisweek", wed), (dt.date(2026, 10, 18), dt.date(2026, 10, 24)))
+        self.assertEqual(fe.dynamic_date_span("lastmonth", dt.date(2026, 1, 15)), (dt.date(2025, 12, 1), dt.date(2025, 12, 31)))
+        self.assertEqual(fe.dynamic_date_span("nextyear", wed), (dt.date(2027, 1, 1), dt.date(2027, 12, 31)))
+
+    def roundtrip(self, ext):
+        criteria = {0: {"type": "custom", "join": "or", "conds": [["begins", "Nguyễn"], ["contains", "Chi"]]},
+                    1: {"type": "top", "n": 3, "bottom": True, "percent": False}}
+        for crit2 in ({"type": "dynamic", "kind": "thismonth"}, {"type": "color", "what": "bg", "color": "#ffff00"},
+                      {"type": "average", "above": False}, {"type": "color", "what": "fg", "color": "#ff0000"},
+                      {"type": "custom", "join": "and", "conds": [[">=", "01/01/2026"], ["<", "31/12/2026"]]}):
+            col = 2 if crit2["type"] in ("dynamic", "custom") else 0 if crit2["type"] == "color" else 1
+            self.sh.filter["criteria"] = {**criteria, col: crit2}
+            self.wb.apply_filter("Sheet1")
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "f" + ext)
+                fe.save_workbook(self.wb, path)
+                loaded = fe.load_workbook(path).sheets["Sheet1"].filter
+            got = loaded["criteria"][col]
+            if crit2["type"] == "custom" and ext == ".xlsx":  # dates are stored as serial numbers
+                self.assertEqual([op for op, _ in got["conds"]], [">=", "<"])
+                self.assertEqual(fe.parse_literal(got["conds"][0][1])[0], fe.parse_literal("01/01/2026")[0])
+            else:
+                self.assertEqual(got, crit2)
+            self.assertEqual(loaded["hidden"], self.sh.filter["hidden"])
+            if col != 0:
+                self.assertEqual(loaded["criteria"][0], criteria[0])
+            if col != 1:
+                self.assertEqual(loaded["criteria"][1], criteria[1])
+
+    def test_json_roundtrip(self):
+        self.roundtrip(".pyxl")
+
+    @unittest.skipUnless(fe.HAS_XLSX, "openpyxl not installed")
+    def test_xlsx_roundtrip(self):
+        self.roundtrip(".xlsx")
+
+
 class LayoutFileTests(unittest.TestCase):
     def build(self):
         wb = make({"A1": "Báo cáo", "A2": "10", "A3": "20", "B2": "=A2*2", "A4": "x", "A5": "y"})

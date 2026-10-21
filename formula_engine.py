@@ -2317,6 +2317,60 @@ def _f_minifs(min_rng, *pairs):
     return min(_numbers_at(_aligned(base, _range_arg(min_rng)), hits), default=0.0)
 
 
+# ------------------------------------------------------------------ AutoFilter criteria
+
+# A filter column's criterion is either a set of displayed texts to keep (the checklist) or a dict:
+#   {"type": "custom", "join": "and" | "or", "conds": [[op, text], ...]}   op in FILTER_OPS
+#   {"type": "top", "n": 10, "bottom": bool, "percent": bool}
+#   {"type": "average", "above": bool}
+#   {"type": "dynamic", "kind": one of DYNAMIC_FILTERS}                      dates relative to today
+#   {"type": "color", "what": "bg" | "fg", "color": "#rrggbb" | None}         None: no fill / automatic
+FILTER_OPS = ("=", "<>", ">", ">=", "<", "<=", "begins", "nbegins", "ends", "nends", "contains", "ncontains")
+DYNAMIC_FILTERS = ("tomorrow", "today", "yesterday", "nextweek", "thisweek", "lastweek", "nextmonth", "thismonth",
+                   "lastmonth", "nextyear", "thisyear", "lastyear")
+_TEXT_OPS = {"begins": "{}*", "ends": "*{}", "contains": "*{}*"}
+
+
+def filter_condition(op, target, value, text):
+    """Whether a cell (its value and displayed text) meets one custom AutoFilter condition. Text
+    comparisons ignore case and take Excel's wildcards; a number or date target compares numbers."""
+    target = str(target)
+    negate = op.startswith("n") and op[1:] in _TEXT_OPS
+    base = op[1:] if negate else op
+    if base in _TEXT_OPS:
+        return (_wildcard_re(_TEXT_OPS[base].format(target.lower())).fullmatch(text.lower()) is not None) != negate
+    goal = parse_literal(target)[0] if target.strip() else ""
+    if op in ("=", "<>"):
+        if is_number(goal):
+            hit = is_number(value) and abs(value - goal) < 1e-9
+        elif isinstance(goal, str) and ("*" in goal or "?" in goal):
+            hit = _wildcard_re(goal.lower()).fullmatch(text.lower()) is not None
+        else:
+            hit = text.lower() == target.strip().lower()
+        return hit == (op == "=")
+    if is_number(goal):
+        return is_number(value) and _CMP_OPS[op](value, goal)
+    return isinstance(value, str) and value != "" and _CMP_OPS[op](value.lower(), str(goal).lower())
+
+
+def dynamic_date_span(kind, today):
+    """(first, last) date that a relative date filter such as "thismonth" keeps."""
+    step = {"last": -1, "this": 0, "next": 1}
+    if kind in ("today", "yesterday", "tomorrow"):
+        day = today + dt.timedelta(days={"yesterday": -1, "today": 0, "tomorrow": 1}[kind])
+        return day, day
+    when, unit = kind[:4], kind[4:]
+    n = step[when]
+    if unit == "week":  # Sunday to Saturday, as in Excel
+        start = today - dt.timedelta(days=(today.weekday() + 1) % 7) + dt.timedelta(weeks=n)
+        return start, start + dt.timedelta(days=6)
+    if unit == "month":
+        y, m = divmod(today.month - 1 + n, 12)
+        year, month = today.year + y, m + 1
+        return dt.date(year, month, 1), dt.date(year, month, calendar.monthrange(year, month)[1])
+    return dt.date(today.year + n, 1, 1), dt.date(today.year + n, 12, 31)
+
+
 # ------------------------------------------------------------------ workbook
 
 CHART_TYPES = ("column", "bar", "line", "pie")
@@ -2889,16 +2943,77 @@ class Workbook:
             texts.setdefault(self.display_text(sheet, r, col), self.get_value(sheet, r, col))
         return sorted(texts, key=lambda t: (t == "", sort_key(texts[t]) if texts[t] is not None else (9,)))
 
+    def cell_color(self, sheet, r, c, what="bg"):
+        """Fill ("bg") or font ("fg") colour a cell shows, conditional formatting included; None when
+        it has none of its own."""
+        style = self.cond_format(sheet, r, c) or {}
+        fmt = self.sheets[sheet].formats.get((r, c)) or {}
+        return style.get(what) or fmt.get(what)
+
+    def filter_colors(self, sheet, col, what="bg"):
+        """Colours of a filter column's data cells, in order of appearance (None: no fill / automatic),
+        when they are not all the same - like Excel, which offers colour filters only then."""
+        r1, _, r2, _ = self.sheets[sheet].filter["range"]
+        colors = list(dict.fromkeys(self.cell_color(sheet, r, col, what) for r in range(r1 + 1, r2 + 1)))
+        return colors if len(colors) > 1 else []
+
+    def filter_kind(self, sheet, col):
+        """"number", "date" or "text": what most data cells of a filter column hold (picks Excel's
+        Number / Date / Text Filters menu)."""
+        r1, _, r2, _ = self.sheets[sheet].filter["range"]
+        counts = Counter()
+        for r in range(r1 + 1, r2 + 1):
+            value = self.get_value(sheet, r, col)
+            if is_number(value):
+                fmt = self.cell_display(sheet, r, col)[1]
+                counts["date" if fmt and is_date_format(fmt) else "number"] += 1
+            elif value not in (None, ""):
+                counts["text"] += 1
+        return counts.most_common(1)[0][0] if counts else "text"
+
+    def filter_match(self, sheet, r, col, crit, stats=None):
+        """Whether row r passes a filter column's criterion (see FILTER_OPS above). `stats` caches the
+        sorted numbers of each column for top-10 and average filters."""
+        if not isinstance(crit, dict):
+            return self.display_text(sheet, r, col) in crit
+        kind = crit["type"]
+        if kind == "color":
+            return self.cell_color(sheet, r, col, crit.get("what", "bg")) == crit.get("color")
+        value = self.get_value(sheet, r, col)
+        if kind == "custom":
+            text = self.display_text(sheet, r, col)
+            hits = [filter_condition(op, target, value, text) for op, target in crit["conds"]]
+            return all(hits) if crit.get("join", "and") == "and" else any(hits)
+        if not is_number(value):
+            return False
+        if kind == "dynamic":
+            first, last = dynamic_date_span(crit["kind"], dt.date.today())
+            return first <= serial_to_datetime(math.floor(value)).date() <= last
+        stats = {} if stats is None else stats
+        if col not in stats:
+            r1, _, r2, _ = self.sheets[sheet].filter["range"]
+            stats[col] = sorted(float(v) for v in (self.get_value(sheet, rr, col) for rr in range(r1 + 1, r2 + 1))
+                                if is_number(v))
+        nums = stats[col]
+        if kind == "average":
+            avg = math.fsum(nums) / len(nums)
+            return value > avg if crit.get("above", True) else value < avg
+        n = int(crit.get("n", 10))
+        if crit.get("percent"):
+            n = int(len(nums) * n / 100)
+        n = max(1, min(n, len(nums)))
+        return value <= nums[n - 1] if crit.get("bottom") else value >= nums[-n]
+
     def apply_filter(self, sheet):
         """Recompute which data rows the filter criteria hide."""
         f = self.sheets[sheet].filter
         if not f:
             return
         r1, _, r2, _ = f["range"]
-        hidden = set()
+        hidden, stats = set(), {}
         for r in range(r1 + 1, r2 + 1):
-            for col, allowed in f["criteria"].items():
-                if self.display_text(sheet, r, col) not in allowed:
+            for col, crit in f["criteria"].items():
+                if not self.filter_match(sheet, r, col, crit, stats):
                     hidden.add(r)
                     break
         f["hidden"] = hidden
@@ -3061,7 +3176,8 @@ class Workbook:
                                     size=list(ch["size"])) for ch in s.charts]
             if s.filter:
                 d["filter"] = {"range": range_name(*s.filter["range"]),
-                               "criteria": {col_name(c): sorted(v) for c, v in s.filter["criteria"].items()}}
+                               "criteria": {col_name(c): v if isinstance(v, dict) else sorted(v)
+                                            for c, v in s.filter["criteria"].items()}}
             return d
         return {"format": FILE_TAG, "version": 2, "active": active,
                 "sheets": [sheet_dict(s) for s in self.sheets.values()]}
@@ -3109,7 +3225,8 @@ class Workbook:
             f = sd.get("filter")
             if f and parse_range(f.get("range", "")):
                 sh.filter = {"range": parse_range(f["range"]), "hidden": set(),
-                             "criteria": {col_index(c): set(v) for c, v in f.get("criteria", {}).items()}}
+                             "criteria": {col_index(c): dict(v) if isinstance(v, dict) else set(v)
+                                          for c, v in f.get("criteria", {}).items()}}
         if not wb.sheets:
             wb.add_sheet()
         for name in wb.sheets:  # after every sheet exists, so cross-sheet formulas resolve
@@ -3482,6 +3599,89 @@ def _xl_chart(wb, sheet, ws, chart):
     return xl
 
 
+_XL_FILTER_OPS = {"=": "equal", "<>": "notEqual", ">": "greaterThan", ">=": "greaterThanOrEqual",
+                  "<": "lessThan", "<=": "lessThanOrEqual"}
+_XL_DYNAMIC = {kind: kind.replace("week", "Week").replace("month", "Month").replace("year", "Year")
+               for kind in DYNAMIC_FILTERS}
+
+
+def _filter_from_xlsx(fc, book):
+    """A filter column's criterion from Excel's filterColumn, or None for kinds PyExcel lacks."""
+    if fc.filters is not None:
+        allowed = {str(v) for v in fc.filters.filter}
+        if fc.filters.blank:
+            allowed.add("")
+        return allowed
+    if fc.customFilters is not None:
+        conds = []
+        for cf in fc.customFilters.customFilter:
+            op = {v: k for k, v in _XL_FILTER_OPS.items()}.get(cf.operator or "equal", "=")
+            val = str(cf.val if cf.val is not None else "")
+            core = val.strip("*")
+            if op in ("=", "<>") and len(val) > 1 and "*" not in core and "?" not in core and val != core:
+                kind = "contains" if val.startswith("*") and val.endswith("*") else "ends" if val.startswith("*") else "begins"
+                op, val = (kind if op == "=" else "n" + kind), core
+            conds.append([op, val])
+        return {"type": "custom", "join": "and" if fc.customFilters._and else "or", "conds": conds}
+    if fc.top10 is not None:
+        return {"type": "top", "n": int(fc.top10.val or 10), "bottom": fc.top10.top is False,
+                "percent": bool(fc.top10.percent)}
+    if fc.dynamicFilter is not None:
+        kind = fc.dynamicFilter.type
+        if kind in ("aboveAverage", "belowAverage"):
+            return {"type": "average", "above": kind == "aboveAverage"}
+        kind = {v: k for k, v in _XL_DYNAMIC.items()}.get(kind)
+        return {"type": "dynamic", "kind": kind} if kind else None
+    if fc.colorFilter is not None and fc.colorFilter.dxfId is not None:
+        try:
+            dxf = book._differential_styles[fc.colorFilter.dxfId]
+        except (IndexError, TypeError):
+            return None
+        cell = fc.colorFilter.cellColor is not False
+        color = (_xl_color(dxf.fill.bgColor) or _xl_color(dxf.fill.fgColor)) if cell and dxf.fill is not None else \
+            _xl_color(dxf.font.color) if not cell and dxf.font is not None else None
+        return {"type": "color", "what": "bg" if cell else "fg", "color": color}
+    return None
+
+
+def _xl_filter_column(col_id, crit, book):
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.styles.differential import DifferentialStyle
+    from openpyxl.worksheet.filters import (ColorFilter, CustomFilter, CustomFilters, DynamicFilter, FilterColumn,
+                                            Filters, Top10)
+
+    if not isinstance(crit, dict):
+        return FilterColumn(colId=col_id, filters=Filters(filter=sorted(v for v in crit if v), blank="" in crit or None))
+    kind = crit["type"]
+    if kind == "custom":
+        items = []
+        for op, val in crit["conds"][:2]:  # Excel keeps two conditions
+            val = str(val)
+            negate = op.startswith("n") and op[1:] in _TEXT_OPS
+            if (op[1:] if negate else op) in _TEXT_OPS:
+                val, op = _TEXT_OPS[op[1:] if negate else op].format(val), "<>" if negate else "="
+            else:
+                lit = parse_literal(val)[0] if val.strip() else ""
+                val = number_text(lit) if is_number(lit) else val
+            items.append(CustomFilter(operator=_XL_FILTER_OPS[op], val=val))
+        return FilterColumn(colId=col_id, customFilters=CustomFilters(customFilter=items,
+                                                                      _and=crit.get("join", "and") == "and" or None))
+    if kind == "top":
+        return FilterColumn(colId=col_id, top10=Top10(top=not crit.get("bottom") or False, val=int(crit.get("n", 10)),
+                                                      percent=bool(crit.get("percent")) or None))
+    if kind == "average":
+        return FilterColumn(colId=col_id, dynamicFilter=DynamicFilter(
+            type="aboveAverage" if crit.get("above", True) else "belowAverage"))
+    if kind == "dynamic":
+        return FilterColumn(colId=col_id, dynamicFilter=DynamicFilter(type=_XL_DYNAMIC[crit["kind"]]))
+    color = _xl_hex(crit.get("color")) or "FFFFFFFF"
+    cell = crit.get("what", "bg") == "bg"
+    dxf = (DifferentialStyle(fill=PatternFill(fill_type="solid", fgColor=color, bgColor=color)) if cell
+           else DifferentialStyle(font=Font(color=color)))
+    return FilterColumn(colId=col_id, colorFilter=ColorFilter(dxfId=book._differential_styles.add(dxf),
+                                                              cellColor=None if cell else False))
+
+
 def _freeze_from_xlsx(ws):
     view = ws.sheet_view
     pane = view.pane
@@ -3556,12 +3756,9 @@ def _load_xlsx(path):
         if rect:
             criteria = {}
             for fc in af.filterColumn:
-                filters = getattr(fc, "filters", None)
-                if filters is not None:
-                    allowed = {str(v) for v in filters.filter}
-                    if filters.blank:
-                        allowed.add("")
-                    criteria[rect[1] + fc.colId] = allowed
+                crit = _filter_from_xlsx(fc, book)
+                if crit is not None:
+                    criteria[rect[1] + fc.colId] = crit
             sh.filter = {"range": rect, "criteria": criteria, "hidden": set()}
     if not wb.sheets:
         wb.add_sheet()
@@ -3722,8 +3919,8 @@ def _save_xlsx(wb, path, active=None):
         if sh.filter:
             r1, c1, r2, c2 = sh.filter["range"]
             ws.auto_filter.ref = range_name(r1, c1, r2, c2)
-            for col, allowed in sorted(sh.filter["criteria"].items()):
-                ws.auto_filter.add_filter_column(col - c1, sorted(v for v in allowed if v), blank="" in allowed)
+            for col, crit in sorted(sh.filter["criteria"].items()):
+                ws.auto_filter.filterColumn.append(_xl_filter_column(col - c1, crit, book))
         for rule in sh.validations:
             if rule.get("type", "any") != "any":
                 ws.add_data_validation(_xl_validation(rule))

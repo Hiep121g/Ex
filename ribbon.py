@@ -755,6 +755,18 @@ def _icon_chart_edit(cv, P, k, c):
     _pencil(cv, P, k, 6, 6, 0.6)
 
 
+def _icon_by_color(cv, P, k, c, sort):
+    """Sort by colour (coloured cells and an arrow) / filter by colour (funnel and colours)."""
+    if sort:
+        for i, color in enumerate(("#f8696b", "#ffd65c", "#5b9bd5")):
+            cv.create_rectangle(*P(7.5, 1.5 + 4.6 * i, 14.5, 5.3 + 4.6 * i), fill=color, outline="#7f7f7f")
+        _arrow(cv, P, k, 3.5, 2, 3.5, 14.5, DARK, 1.2)
+        return
+    cv.create_polygon(*P(1.5, 1.5, 12.5, 1.5, 8.5, 6.5, 8.5, 11, 5.5, 12.5, 5.5, 6.5), fill="#7f9fcf", outline=BLUE)
+    for i, color in enumerate(("#f8696b", "#ffd65c", "#70ad47")):
+        cv.create_oval(*P(9 + 2.2 * i - 1.6, 12.6, 9 + 2.2 * i + 1.6, 15.8), fill=color, outline="#7f7f7f")
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -838,6 +850,7 @@ ICONS.update({
     "replace": _icon_replace, "goto": _icon_goto, "freeze_row": lambda *a: _icon_freeze_part(*a, "row"),
     "freeze_col": lambda *a: _icon_freeze_part(*a, "col"), "validation_clear": _icon_validation_clear,
     "delete_x": _icon_delete_x, "chart_edit": _icon_chart_edit,
+    "sort_color": lambda *a: _icon_by_color(*a, True), "filter_color": lambda *a: _icon_by_color(*a, False),
 })
 
 
