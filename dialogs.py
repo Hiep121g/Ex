@@ -898,25 +898,28 @@ class ManageRulesDialog(Dialog):
 class FilterPopup:
     """Excel's filter dropdown: sorting, clearing, search and a checklist of values."""
 
-    def __init__(self, master, ui, title, values, selected, x, y, on_sort, on_clear, on_apply):
+    def __init__(self, master, ui, title, values, selected, x, y, on_sort, on_clear, on_apply, icons=None):
         self.values, self.on_apply = values, on_apply
         self.pop = pop = Popup(master, x, y)
         f = pop.inner
         pad = ui.px(6)
 
         def entry(text, command, enabled=True):
-            lbl = tk.Label(f, text=text, bg="#ffffff", fg=TEXT_FG if enabled else "#a0a0a0", anchor="w",
-                           font=ui.font, padx=pad, pady=ui.px(3))
+            icon, _, text = text.partition(":")  # "icon name:label"
+            image = icons.get(icon) if icons else None
+            lbl = tk.Label(f, text=(" " + text) if image else text, bg="#ffffff",
+                           fg=TEXT_FG if enabled else "#a0a0a0", anchor="w", font=ui.font, padx=pad, pady=ui.px(3),
+                           **({"image": image, "compound": "left"} if image else {}))
             lbl.pack(fill="x", padx=2)
             if enabled:
                 lbl.bind("<Enter>", lambda e: lbl.config(bg=HOVER_BG))
                 lbl.bind("<Leave>", lambda e: lbl.config(bg="#ffffff"))
                 lbl.bind("<ButtonRelease-1>", lambda e: (pop.close(), command()))
 
-        entry("↑  Sắp xếp từ A đến Z", lambda: on_sort(False))
-        entry("↓  Sắp xếp từ Z đến A", lambda: on_sort(True))
+        entry("sort_az:Sắp xếp từ A đến Z", lambda: on_sort(False))
+        entry("sort_za:Sắp xếp từ Z đến A", lambda: on_sort(True))
         tk.Frame(f, bg=GROUP_LINE, height=1).pack(fill="x", padx=2, pady=2)
-        entry(f"✕  Xóa bộ lọc khỏi “{title}”", on_clear, selected is not None)
+        entry(f"filter_clear:Xóa bộ lọc khỏi “{title}”", on_clear, selected is not None)
         tk.Frame(f, bg=GROUP_LINE, height=1).pack(fill="x", padx=2, pady=2)
         self.search = tk.StringVar()
         search = ttk.Entry(f, textvariable=self.search, width=30, font=ui.font)

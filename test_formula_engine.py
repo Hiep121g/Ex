@@ -1,5 +1,6 @@
 """Unit tests for the PyExcel formula engine.  Run:  python -m unittest -v"""
 
+import importlib.util
 import os
 import sys
 import tempfile
@@ -803,6 +804,24 @@ class RichClipboardTests(unittest.TestCase):
         self.assertEqual(payloads[0], "a\tb\r\nc\0".encode("utf-16-le"))
         self.assertEqual(sum(1 for n in names if n == "CreatePen"), 2)
         self.assertFalse(richclip.copy_to_clipboard(123, "x", self.TABLE) if sys.platform != "win32" else False)
+
+
+@unittest.skipUnless(importlib.util.find_spec("tkinter"), "tkinter not installed")
+class MenuIconTests(unittest.TestCase):
+    def test_every_icon_is_in_the_sprite_sheets(self):
+        """Fails when an icon was added without rerunning tools/make_menu_icons.py."""
+        import excel_app
+        from ribbon import ICONS, MenuIcons
+        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+        with open(os.path.join(folder, "menu_icons.txt"), encoding="utf-8") as f:
+            names = [n for n in f.read().split("\n") if n]
+        self.assertEqual(set(ICONS) - set(names), set())
+        self.assertEqual(set(excel_app.MENU_ICONS.values()) - set(ICONS), set())
+        for size in MenuIcons.SIZES:
+            with open(os.path.join(folder, f"menu_{size}.png"), "rb") as f:
+                header = f.read(24)
+            width, height = int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+            self.assertEqual((width, height), (MenuIcons.COLUMNS * size, -(-len(names) // MenuIcons.COLUMNS) * size))
 
 
 class LayoutFileTests(unittest.TestCase):

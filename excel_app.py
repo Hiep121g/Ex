@@ -22,7 +22,7 @@ import formula_engine as fe
 import richclip
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
 from function_info import CATEGORIES, FUNCTION_INFO
-from ribbon import (RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, Ribbon, RibbonButton, RibbonStyle, StyleTile,
+from ribbon import (RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, MenuIcons, Ribbon, RibbonButton, RibbonStyle, StyleTile,
                     Tooltip, color_popup, gallery_popup, mix)
 
 APP_NAME = "PyExcel"
@@ -110,6 +110,48 @@ CELL_STYLES = [
 STYLE_LOOKUP = {name: style for _, items in CELL_STYLES for name, style in items}
 QUICK_STYLES = ["Chuẩn", "Trung tính", "Xấu", "Tốt", "Ô kiểm tra", "Ghi chú", "Ô liên kết", "Tính toán"]
 STYLE_KEYS = ("font", "size", "bold", "italic", "underline", "strike", "fg", "bg") + fe.BORDER_KEYS
+
+# picture shown beside a menu entry, by label (without a trailing "..."); see ribbon.ICONS
+MENU_ICONS = {
+    "Mới": "file_new", "Mở": "file_open", "Lưu": "save", "Lưu thành": "file_save_as", "Thoát": "file_exit",
+    "Cắt": "cut", "Sao chép": "copy", "Dán": "paste", "Tùy chọn dán": "paste", "Dán công thức": "paste_formulas",
+    "Dán giá trị": "paste_values", "Dán định dạng": "paste_formats", "Dán chuyển vị": "paste_transpose",
+    "Dán đặc biệt": "paste_special", "Gạch chân": "underline", "Gạch chân kép": "underline_double",
+    "Hợp nhất & Căn giữa": "merge", "Hợp nhất ngang hàng": "merge_across", "Hợp nhất ô": "merge_cells",
+    "Bỏ hợp nhất ô": "merge_unmerge", "Định dạng kế toán khác": "format_cells", "Định dạng ô": "format_cells",
+    "Định dạng căn chỉnh ô": "format_cells", "Thêm viền": "format_cells",
+    "Chèn": "insert_cells", "Chèn ô": "insert_cells", "Chèn hàng trang tính": "insert_row",
+    "Chèn cột trang tính": "insert_col", "Chèn trang tính": "sheet", "Xóa": "delete_cells", "Xóa ô": "delete_cells",
+    "Xóa hàng trang tính": "delete_row", "Xóa cột trang tính": "delete_col", "Xóa trang tính": "sheet_delete",
+    "Chiều cao hàng": "row_size", "Tự động khớp chiều cao hàng": "row_autofit", "Độ rộng cột": "col_size",
+    "Tự động khớp độ rộng cột": "col_autofit", "Ẩn & Bỏ ẩn": "hide_row", "Ẩn hàng": "hide_row", "Ẩn cột": "hide_col",
+    "Bỏ ẩn hàng": "unhide_row", "Bỏ ẩn cột": "unhide_col", "Đổi tên trang tính": "sheet_rename",
+    "Đổi tên": "sheet_rename", "Sao chép trang tính": "sheet_copy", "Màu tab": "sheet_tab_color",
+    "Di chuyển sang trái": "sheet_left", "Di chuyển sang phải": "sheet_right",
+    "Tổng": "autosum", "Trung bình": "stat_avg", "Đếm số": "stat_count", "Lớn nhất": "stat_max",
+    "Nhỏ nhất": "stat_min", "Hàm khác": "function",
+    "Xuống": "fill_down", "Sang phải": "fill_right", "Lên": "fill_up", "Sang trái": "fill_left", "Chuỗi": "fill_series",
+    "Xóa tất cả": "clear", "Xóa định dạng": "clear_formats", "Xóa nội dung": "clear_contents",
+    "Tìm": "find", "Thay thế": "replace", "Đi tới": "goto",
+    "Sắp xếp": "sort_az", "Sắp xếp từ A đến Z": "sort_az", "Sắp xếp từ Z đến A": "sort_za",
+    "Sắp xếp tùy chỉnh": "sort_custom", "Lọc": "filter", "Bật/tắt bộ lọc": "filter", "Xóa bộ lọc": "filter_clear",
+    "Áp dụng lại bộ lọc": "filter_reapply", "Lọc theo giá trị của ô đã chọn": "filter_value",
+    "Xoay ngược chiều kim đồng hồ": "angle_ccw", "Xoay theo chiều kim đồng hồ": "angle_cw",
+    "Văn bản dọc": "angle_vertical", "Xoay văn bản lên": "angle_up", "Xoay văn bản xuống": "angle_down",
+    "Quy tắc tô sáng ô": "cf_highlight", "Quy tắc trên/dưới": "cf_topbottom", "Thanh dữ liệu": "cf_databar",
+    "Thang màu": "cf_scale", "Xóa quy tắc": "clear", "Xóa quy tắc khỏi ô đã chọn": "clear",
+    "Xóa quy tắc khỏi toàn bộ trang tính": "clear", "Quản lý quy tắc": "cf_manage",
+    "Lớn hơn": "cf_rule_gt", "Nhỏ hơn": "cf_rule_lt", "Nằm giữa": "cf_rule_between", "Bằng": "cf_rule_eq",
+    "Văn bản có chứa": "cf_rule_text", "Giá trị trùng lặp": "cf_rule_dup", "10 mục đầu": "rank_top",
+    "10% đầu": "rank_top_pct", "10 mục cuối": "rank_bottom", "10% cuối": "rank_bottom_pct",
+    "Trên trung bình": "rank_above", "Dưới trung bình": "rank_below",
+    "Cố định ngăn": "freeze", "Cố định hàng trên cùng": "freeze_row", "Cố định cột đầu tiên": "freeze_col",
+    "Xác thực dữ liệu": "validation", "Xóa xác thực dữ liệu": "validation_clear",
+    "Chèn/Sửa ghi chú": "note", "Xóa ghi chú": "note_delete",
+    "Đổi kiểu biểu đồ": "chart_column", "Biểu đồ cột": "chart_column", "Biểu đồ thanh": "chart_bar",
+    "Biểu đồ đường": "chart_line", "Biểu đồ tròn": "chart_pie", "Dữ liệu và tiêu đề biểu đồ": "chart_edit",
+    "Xóa biểu đồ": "delete_x",
+}
 
 SHIFT, CONTROL, ALT = 0x0001, 0x0004, 0x20000
 MODIFIER_KEYS = {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Caps_Lock", "Win_L", "Win_R"}
@@ -246,12 +288,14 @@ class SpreadsheetApp:
         self.find_win = None
         self.fonts, self._widths, self._tints, self._images = {}, {}, {}, []
         self.commands = []  # (label, callable) for the "tell me" search
+        self.command_icons = {}  # label -> icon of the ribbon button it came from
 
         families = set(tkfont.families(root))
         self.font_families = sorted(f for f in families if not f.startswith("@"))
         self.default_family = "Calibri" if "Calibri" in families else "Arial"
         self.ui_family = "Segoe UI" if "Segoe UI" in families else "Arial"
         self._init_metrics()
+        self.menu_icons = MenuIcons(root, self.scale, os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons"))
         self._build_styles()
         self._build_ribbon()
         self._build_formula_bar()
@@ -370,22 +414,30 @@ class SpreadsheetApp:
         style = ttk.Style(self.root)
         style.configure("Ribbon.TCheckbutton", background=RIBBON_BG)
 
+    def _menu_image(self, label, icon=None):
+        """image/compound options showing the entry's picture (by MENU_ICONS unless `icon` is given)."""
+        image = self.menu_icons.get(icon or MENU_ICONS.get(label.rstrip(". ")))
+        return {"image": image, "compound": "left"} if image is not None else {}
+
     def _make_menu(self, items, parent=None):
-        """tk.Menu from [(label, command[, accelerator]) | (label, [sub items]) | (label, None) | None]."""
+        """tk.Menu from [(label, command[, accelerator[, icon]]) | (label, [sub items]) | (label, None) | None].
+
+        Entries get the picture MENU_ICONS gives their label, or the icon named in the item."""
         menu = tk.Menu(parent or self.root, tearoff=0)
         for item in items:
             if item is None:
                 menu.add_separator()
                 continue
             label, target = item[0], item[1]
+            image = self._menu_image(label, item[3] if len(item) > 3 else None)
             if isinstance(target, list):
-                menu.add_cascade(label=label, menu=self._make_menu(target, menu))
+                menu.add_cascade(label=label, menu=self._make_menu(target, menu), **image)
             elif isinstance(target, tuple):  # ("palette", on_pick, none_label): colour submenu
-                menu.add_cascade(label=label, menu=self._palette_menu(menu, target[1], target[2]))
+                menu.add_cascade(label=label, menu=self._palette_menu(menu, target[1], target[2]), **image)
             elif target is None:
                 menu.add_command(label=label, state="disabled")
             else:
-                menu.add_command(label=label, command=target, accelerator=item[2] if len(item) > 2 else "")
+                menu.add_command(label=label, command=target, accelerator=item[2] if len(item) > 2 else "", **image)
                 self.commands.append((label.rstrip(". "), target))
         return menu
 
@@ -422,6 +474,7 @@ class SpreadsheetApp:
         name = label or kw.get("text", "").replace("\n", " ") or (kw.get("tooltip") or "").split(" (")[0]
         if kw.get("command") and name:
             self.commands.append((name.split("\n")[0], kw["command"]))
+            self.command_icons.setdefault(name.split("\n")[0], kw.get("icon"))
         if large:
             return group.large(**kw)
         return group.small(parent, side=side, **kw)
@@ -488,7 +541,8 @@ class SpreadsheetApp:
             return
         menu = tk.Menu(self.root, tearoff=0)
         for label, command in matches[:15]:
-            menu.add_command(label=label, command=lambda c=command: (self.canvas.focus_set(), c()))
+            menu.add_command(label=label, command=lambda c=command: (self.canvas.focus_set(), c()),
+                             **self._menu_image(label, self.command_icons.get(label)))
         menu.tk_popup(entry.winfo_rootx(), entry.winfo_rooty() + entry.winfo_height())
         menu.grab_release()
 
@@ -536,7 +590,7 @@ class SpreadsheetApp:
                                        command=lambda: self.toggle_style("underline"), menu=underline_menu,
                                        split=True, tooltip="Gạch chân (Ctrl+U)")
         g.gap(row1)
-        self.btn_border = self._btn(g, row1, icon="borders", label="Viền",
+        self.btn_border = self._btn(g, row1, icon=f"border_{self.last_border}", label="Viền",
                                     command=lambda: self.apply_border(self.last_border),
                                     menu=self._border_menu(), split=True, tooltip="Viền")
         g.gap(row1)
@@ -801,19 +855,23 @@ class SpreadsheetApp:
                 menu.add_separator()
                 continue
             label, kind = item
-            menu.add_command(label=label, command=lambda k=kind: self.apply_border(k))
+            menu.add_command(label=label, command=lambda k=kind: self.apply_border(k),
+                             **self._menu_image(label, f"border_{kind}"))
             self.commands.append((label, lambda k=kind: self.apply_border(k)))
         menu.add_separator()
         menu.add_cascade(label="Màu đường kẻ", menu=self._palette_menu(
-            menu, lambda c: setattr(self, "border_color", c or "#000000"), "Tự động"))
+            menu, lambda c: setattr(self, "border_color", c or "#000000"), "Tự động"),
+            **self._menu_image("", "line_color"))
         styles = tk.Menu(menu, tearoff=0)
         self.border_style_var = tk.StringVar(self.root, value="thin")
         for key, name in dialogs.BORDER_NAMES:
             styles.add_radiobutton(label=name, value=key, variable=self.border_style_var,
-                                   command=lambda: setattr(self, "border_style", self.border_style_var.get()))
-        menu.add_cascade(label="Kiểu đường kẻ", menu=styles)
+                                   command=lambda: setattr(self, "border_style", self.border_style_var.get()),
+                                   **self._menu_image("", f"line_{key}"))
+        menu.add_cascade(label="Kiểu đường kẻ", menu=styles, **self._menu_image("", "line_medium"))
         menu.add_separator()
-        menu.add_command(label="Thêm viền...", command=lambda: self.format_cells_dialog("border"))
+        menu.add_command(label="Thêm viền...", command=lambda: self.format_cells_dialog("border"),
+                         **self._menu_image("Thêm viền"))
         return menu
 
     def _orientation_menu(self):
@@ -830,10 +888,10 @@ class SpreadsheetApp:
                ("10 mục cuối...", lambda: self.cf_rule("bottom")),
                ("10% cuối...", lambda: self.cf_rule("bottom", percent=True)), None,
                ("Trên trung bình...", lambda: self.cf_rule("above")), ("Dưới trung bình...", lambda: self.cf_rule("below"))]
-        bars = [(f"Thanh dữ liệu {name.lower()}", lambda c=color: self.cf_add({"type": "databar", "color": c}))
-                for name, color in DATA_BARS]
-        scales = [(f"Thang màu {name}", lambda cs=colors: self.cf_add({"type": "scale", "colors": list(cs)}))
-                  for name, colors in COLOR_SCALES]
+        bars = [(f"Thanh dữ liệu {name.lower()}", lambda c=color: self.cf_add({"type": "databar", "color": c}), "",
+                 f"cf_databar@{color}") for name, color in DATA_BARS]
+        scales = [(f"Thang màu {name}", lambda cs=colors: self.cf_add({"type": "scale", "colors": list(cs)}), "",
+                   f"cf_scale@{','.join(colors)}") for name, colors in COLOR_SCALES]
         return self._make_menu([
             ("Quy tắc tô sáng ô", highlight), ("Quy tắc trên/dưới", top), ("Thanh dữ liệu", bars),
             ("Thang màu", scales), None,
@@ -989,13 +1047,15 @@ class SpreadsheetApp:
             ("Dữ liệu và tiêu đề biểu đồ...", self.edit_chart), None, ("Xóa biểu đồ", self.delete_chart)])
         common = [("Cắt", self.cut), ("Sao chép", self.copy), ("Dán", self.paste), None]
         self.row_menu = self._make_menu(common + [
-            ("Chèn", self.insert_rows), ("Xóa", self.delete_rows), ("Xóa nội dung", self.clear_contents), None,
+            ("Chèn", self.insert_rows, "", "insert_row"), ("Xóa", self.delete_rows, "", "delete_row"),
+            ("Xóa nội dung", self.clear_contents), None,
             ("Định dạng ô...", lambda: self.format_cells_dialog()), ("Chiều cao hàng...", self.ask_row_height),
-            ("Ẩn", self.hide_rows), ("Bỏ ẩn", self.unhide_rows)])
+            ("Ẩn", self.hide_rows, "", "hide_row"), ("Bỏ ẩn", self.unhide_rows, "", "unhide_row")])
         self.col_menu = self._make_menu(common + [
-            ("Chèn", self.insert_cols), ("Xóa", self.delete_cols), ("Xóa nội dung", self.clear_contents), None,
+            ("Chèn", self.insert_cols, "", "insert_col"), ("Xóa", self.delete_cols, "", "delete_col"),
+            ("Xóa nội dung", self.clear_contents), None,
             ("Định dạng ô...", lambda: self.format_cells_dialog()), ("Độ rộng cột...", self.ask_column_width),
-            ("Ẩn", self.hide_cols), ("Bỏ ẩn", self.unhide_cols)])
+            ("Ẩn", self.hide_cols, "", "hide_col"), ("Bỏ ẩn", self.unhide_cols, "", "unhide_col")])
 
     def _bind_keys(self):
         cv = self.canvas
@@ -2890,6 +2950,9 @@ class SpreadsheetApp:
     def apply_border(self, kind):
         self.commit_edit()
         self.last_border = kind
+        if self.btn_border.icon != f"border_{kind}":  # like Excel, the button repeats the last border used
+            self.btn_border.icon = f"border_{kind}"
+            self.btn_border.draw()
         targets = self._format_targets()
         if not targets:
             return
@@ -3509,7 +3572,7 @@ class SpreadsheetApp:
         dialogs.FilterPopup(self.root, self.ui, title, self.wb.filter_values(self.sheet, col), f["criteria"].get(col),
                             x, y, on_sort=lambda desc: self._sort_rows(f["range"], [(col, desc)], True),
                             on_clear=lambda: self._set_filter_criteria(col, None),
-                            on_apply=lambda allowed: self._set_filter_criteria(col, allowed))
+                            on_apply=lambda allowed: self._set_filter_criteria(col, allowed), icons=self.menu_icons)
 
     def _set_filter_criteria(self, col, allowed):
         def change():
@@ -3924,16 +3987,17 @@ class SpreadsheetApp:
         index = list(self.wb.sheets).index(name)
         last = len(self.wb.sheets) - 1
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Chèn trang tính", command=self.add_sheet)
-        menu.add_command(label="Xóa", command=lambda: self.delete_sheet(name))
-        menu.add_command(label="Đổi tên...", command=lambda: self.rename_sheet(name))
-        menu.add_command(label="Sao chép trang tính", command=self.copy_sheet)
-        menu.add_cascade(label="Màu tab", menu=self._palette_menu(menu, self.set_tab_color, "Không màu"))
+        menu.add_command(label="Chèn trang tính", command=self.add_sheet, **self._menu_image("Chèn trang tính"))
+        menu.add_command(label="Xóa", command=lambda: self.delete_sheet(name), **self._menu_image("", "sheet_delete"))
+        menu.add_command(label="Đổi tên...", command=lambda: self.rename_sheet(name), **self._menu_image("Đổi tên"))
+        menu.add_command(label="Sao chép trang tính", command=self.copy_sheet, **self._menu_image("Sao chép trang tính"))
+        menu.add_cascade(label="Màu tab", menu=self._palette_menu(menu, self.set_tab_color, "Không màu"),
+                         **self._menu_image("Màu tab"))
         menu.add_separator()
         menu.add_command(label="Di chuyển sang trái", command=lambda: self.move_sheet(name, index - 1),
-                         state="normal" if index > 0 else "disabled")
+                         state="normal" if index > 0 else "disabled", **self._menu_image("Di chuyển sang trái"))
         menu.add_command(label="Di chuyển sang phải", command=lambda: self.move_sheet(name, index + 1),
-                         state="normal" if index < last else "disabled")
+                         state="normal" if index < last else "disabled", **self._menu_image("Di chuyển sang phải"))
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
