@@ -26,6 +26,7 @@ import pivot as pv
 import printing
 import richclip
 import ttf
+from formula_assist import FormulaAssist
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
 from function_info import CATEGORIES, FUNCTION_INFO
 from pivot_pane import PivotPane
@@ -202,6 +203,9 @@ NHẬP DỮ LIỆU
   • Chọn ô rồi gõ; Enter/Tab để xác nhận, Esc để hủy. F2 hoặc nhấp đúp để sửa.
   • Công thức bắt đầu bằng "=":  =SUM(A1:A10)*2   =IF(B2>=5,"Đạt","Chưa đạt")   =Sheet2!A1+1
   • Khi đang gõ công thức, nhấp hoặc kéo chuột lên ô để chèn địa chỉ.
+  • Gõ vài chữ đầu của tên hàm (=vl...) sẽ hiện danh sách hàm kèm mô tả: ↑/↓ để chọn, Tab hoặc nhấp đúp để
+    chèn, Esc để đóng. Trong dấu ngoặc của hàm có chú thích các đối số, đối số đang nhập được in đậm.
+  • F4 khi đang gõ công thức: đổi địa chỉ cạnh con trỏ lần lượt A1 → $A$1 → A$1 → $A1 → A1.
   • Gõ ' ở đầu để giữ nguyên dạng chữ ('007). Ngày nhập dạng 21/10/2026; phần trăm như 15%.
 
 CHUỘT
@@ -1076,6 +1080,7 @@ class SpreadsheetApp:
         self.fx.bind("<Control-Return>", lambda e: self._key_action(lambda: self.commit_edit(fill=True)))
         self.fx.bind("<Escape>", lambda e: self._key_action(self.cancel_edit))
         self.fx.bind("<Key>", self._reset_point, add="+")
+        self._formula_assist(self.fx)
         tk.Frame(self.root, bg=HEADER_LINE, height=1).pack(side="top", fill="x")
 
     def _build_status_bar(self):
@@ -2482,6 +2487,7 @@ class SpreadsheetApp:
         for key, d in (("Up", (-1, 0)), ("Down", (1, 0)), ("Left", (0, -1)), ("Right", (0, 1))):
             e.bind(f"<{key}>", lambda ev, d=d: self._editor_arrow(d))
         e.bind("<Key>", self._reset_point, add="+")
+        self._formula_assist(e)
         self.set_mode("Nhập" if mode == "enter" else "Sửa")
         self.update_formula_bar()
         self.redraw()
@@ -2524,6 +2530,19 @@ class SpreadsheetApp:
             self.edit_cell, self.edit_mode = (self.sheet, *self.cur), "edit"
         self.set_mode("Sửa")
         self.update_formula_bar()
+
+    def _formula_assist(self, entry):
+        """Function list while typing a name, argument tip inside a call, and F4 for $ references."""
+        names = fe.function_names()
+
+        def info(name):
+            item = FUNCTION_INFO.get(name)
+            return item[1:] if item else None
+
+        def changed():
+            self.point = None
+            self.set_mode("Nhập" if self.edit_mode == "enter" else "Sửa")
+        return FormulaAssist(entry, self.ui.font, self.ui.small_font, lambda: names, info, changed)
 
     def _editor_commit(self, e, move):
         if e.state & SHIFT:

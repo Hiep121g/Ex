@@ -1195,5 +1195,35 @@ class PrintingTests(unittest.TestCase):
         self.assertIn(b"/FontFile2", data)
 
 
+class FormulaAssistTests(unittest.TestCase):
+    def test_completion_and_call_context(self):
+        import formula_assist as fa
+        names = fe.function_names()
+        self.assertEqual(fa.completion_prefix("=A1+vl", 6), (4, "vl"))
+        self.assertIn("VLOOKUP", fa.matching_functions("vl", names))
+        for text in ('="SU', "=Sheet2!A", "=SUM(", "abc"):
+            self.assertIsNone(fa.completion_prefix(text, len(text)), text)
+        self.assertEqual(fa.call_context("=IF(A1>2,SUM(B1,", 17), ("SUM", 1))
+        self.assertEqual(fa.call_context('=IF(A1,"a,b",', 14), ("IF", 2))
+        self.assertEqual(fa.call_context("=SUM((A1+B1),", 13), ("SUM", 1))
+        self.assertIsNone(fa.call_context("=SUM(A1)", 8))
+        args = fa.signature_args("SUM(số1, [số2], ...)")[1]
+        self.assertEqual((fa.current_arg(args, 1), fa.current_arg(args, 6)), (1, 2))
+        self.assertIsNone(fa.current_arg(fa.signature_args("ABS(số)")[1], 1))
+
+    def test_f4_cycles_references(self):
+        import formula_assist as fa
+        text, steps = "=A1", []
+        for _ in range(4):
+            text, pos = fa.toggle_reference(text, len(text))
+            steps.append(text)
+        self.assertEqual(steps, ["=$A$1", "=A$1", "=$A1", "=A1"])
+        self.assertEqual(fa.toggle_reference("=SUM(A1:B2)", 7), ("=SUM($A$1:$B$2)", 14))
+        self.assertEqual(fa.toggle_reference("=LOG10(B3)+C4", 9)[0], "=LOG10($B$3)+C4")
+        self.assertEqual(fa.toggle_reference('="A1"&B2', 8)[0], '="A1"&$B$2')
+        self.assertEqual(fa.toggle_reference("=Sheet2!C3*2", 10)[0], "=Sheet2!$C$3*2")
+        self.assertIsNone(fa.toggle_reference("=1+2", 4))
+
+
 if __name__ == "__main__":
     unittest.main()
