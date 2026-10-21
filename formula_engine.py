@@ -2450,7 +2450,7 @@ class Sheet:
 
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
               "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
-              "charts", "pivots")
+              "charts", "pivots", "page_setup")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2474,6 +2474,7 @@ class Sheet:
         self.charts = []        # [{"type": CHART_TYPES[i], "range": (r1, c1, r2, c2), "title": str,
                                 #   "anchor": (row, col, dx, dy), "size": (w, h)}] - offsets and size in pixels at 96 DPI
         self.pivots = []        # PivotTables whose reports sit on this sheet (see pivot.new_pivot)
+        self.page_setup = None  # printing options that differ from printing.DEFAULT_SETUP
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -3166,6 +3167,17 @@ class Workbook:
             for p in other.pivots:
                 if p["source"]["sheet"].lower() == target:
                     p["source"]["range"] = move_rect(p["source"]["range"]) or p["source"]["range"]
+        if band is None and sh.page_setup:
+            ps = dict(sh.page_setup)
+            if ps.get("area"):
+                ps["area"] = move_rect(ps["area"])
+            if axis == 0 and ps.get("titles"):
+                span = move_span(*ps["titles"])
+                ps["titles"] = tuple(span) if span else None
+            key = "breaks" if axis == 0 else "col_breaks"
+            if ps.get(key):
+                ps[key] = sorted(move_set(ps[key]))
+            sh.page_setup = ps
         if band is None:
             for p in sh.pivots:
                 r, c = p["anchor"]
@@ -3243,6 +3255,16 @@ class Workbook:
                                     size=list(ch["size"])) for ch in s.charts]
             if s.pivots:
                 d["pivots"] = [_pivot_to_dict(p) for p in s.pivots]
+            if s.page_setup:
+                ps = dict(s.page_setup)
+                if ps.get("area"):
+                    ps["area"] = range_name(*ps["area"])
+                if ps.get("titles"):
+                    ps["titles"] = [ps["titles"][0] + 1, ps["titles"][1] + 1]
+                for key in ("breaks", "col_breaks"):
+                    if ps.get(key):
+                        ps[key] = [i + 1 for i in ps[key]]
+                d["page_setup"] = ps
             if s.filter:
                 d["filter"] = {"range": range_name(*s.filter["range"]),
                                "criteria": {col_name(c): v if isinstance(v, dict) else sorted(v)
@@ -3287,6 +3309,14 @@ class Workbook:
                 if pos and len(pos) == 2 and text:
                     sh.notes[pos] = str(text)
             sh.pivots = [p for p in map(_pivot_from_dict, sd.get("pivots", [])) if p]
+            ps = sd.get("page_setup")
+            if isinstance(ps, dict):
+                ps = dict(ps)
+                ps["area"] = parse_range(ps["area"]) if ps.get("area") else None
+                ps["titles"] = (int(ps["titles"][0]) - 1, int(ps["titles"][1]) - 1) if ps.get("titles") else None
+                for key in ("breaks", "col_breaks"):
+                    ps[key] = [int(i) - 1 for i in ps.get(key, [])]
+                sh.page_setup = ps
             for ch in sd.get("charts", []):
                 rect = parse_range(ch.get("range", ""))
                 if rect and ch.get("type") in CHART_TYPES:
@@ -3781,6 +3811,84 @@ def _xl_filter_column(col_id, crit, book):
                                                               cellColor=None if cell else False))
 
 
+_XL_PAPER = {9: "A4", 8: "A3", 11: "A5", 1: "Letter", 5: "Legal"}
+
+
+def _page_setup_from_xlsx(ws):
+    """The printing options PyExcel keeps (see printing.DEFAULT_SETUP), or None when all are default."""
+    ps, setup = ws.page_setup, {}
+    if ps.orientation == "landscape":
+        setup["orientation"] = "landscape"
+    paper = _XL_PAPER.get(int(ps.paperSize)) if ps.paperSize else None
+    if paper and paper != "A4":
+        setup["paper"] = paper
+    m = ws.page_margins
+    margins = [m.top, m.bottom, m.left, m.right, m.header, m.footer]
+    if margins != [0.75, 0.75, 0.7, 0.7, 0.3, 0.3] and all(v is not None for v in margins):
+        setup["margins"] = [float(v) for v in margins]
+    props = ws.sheet_properties.pageSetUpPr
+    if props is not None and props.fitToPage:
+        setup["fit"] = "page" if ps.fitToHeight not in (0, "0") else "width"
+    elif ps.scale and int(ps.scale) != 100:
+        setup["scale"] = int(ps.scale)
+    area = ws.print_area
+    if area:
+        first = area if isinstance(area, str) else area[0]
+        rect = parse_range(first.split("!")[-1].replace("$", ""))
+        if rect:
+            setup["area"] = rect
+    titles = ws.print_title_rows
+    if titles:
+        parts = titles.replace("$", "").split(":")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            setup["titles"] = (int(parts[0]) - 1, int(parts[1]) - 1)
+    opts = ws.print_options
+    for key, on in (("gridlines", opts.gridLines), ("center_h", opts.horizontalCentered),
+                    ("center_v", opts.verticalCentered)):
+        if on:
+            setup[key] = True
+    for key, hf in (("header", ws.oddHeader), ("footer", ws.oddFooter)):
+        if hf is not None and hf.center is not None and hf.center.text:
+            setup[key] = hf.center.text
+    for key, brks in (("breaks", ws.row_breaks), ("col_breaks", ws.col_breaks)):
+        ids = sorted(b.id for b in brks.brk if b.id)  # break after row/column `id`: our 0-based first of the next
+        if ids:
+            setup[key] = ids
+    return setup or None
+
+
+def _xl_page_setup(ws, setup):
+    from openpyxl.worksheet.pagebreak import Break
+    from openpyxl.worksheet.page import PageMargins
+
+    ps = ws.page_setup
+    ps.orientation = setup.get("orientation", "portrait")
+    ps.paperSize = {v: k for k, v in _XL_PAPER.items()}.get(setup.get("paper", "A4"), 9)
+    if setup.get("margins"):
+        t, b, lft, rgt, h, f = setup["margins"]
+        ws.page_margins = PageMargins(left=lft, right=rgt, top=t, bottom=b, header=h, footer=f)
+    if setup.get("fit"):
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ps.fitToWidth, ps.fitToHeight = 1, (1 if setup["fit"] == "page" else 0)
+    elif setup.get("scale", 100) != 100:
+        ps.scale = int(setup["scale"])
+    if setup.get("area"):
+        ws.print_area = range_name(*setup["area"])
+    if setup.get("titles"):
+        ws.print_title_rows = f"{setup['titles'][0] + 1}:{setup['titles'][1] + 1}"
+    ws.print_options.gridLines = bool(setup.get("gridlines")) or None
+    ws.print_options.horizontalCentered = bool(setup.get("center_h")) or None
+    ws.print_options.verticalCentered = bool(setup.get("center_v")) or None
+    if setup.get("header"):
+        ws.oddHeader.center.text = setup["header"]
+    if setup.get("footer"):
+        ws.oddFooter.center.text = setup["footer"]
+    for r in setup.get("breaks", []):
+        ws.row_breaks.append(Break(id=r))
+    for c in setup.get("col_breaks", []):
+        ws.col_breaks.append(Break(id=c))
+
+
 def _freeze_from_xlsx(ws):
     view = ws.sheet_view
     pane = view.pane
@@ -3843,6 +3951,7 @@ def _load_xlsx(path):
         sh.freeze = _freeze_from_xlsx(ws)
         sh.validations = _validations_from_xlsx(ws)
         sh.charts = _charts_from_xlsx(ws, sh)
+        sh.page_setup = _page_setup_from_xlsx(ws)
         rules = []
         for cf in ws.conditional_formatting:
             for xl_rule in cf.rules:
@@ -4036,6 +4145,8 @@ def _save_xlsx(wb, path, active=None):
                 ws.add_data_validation(_xl_validation(rule))
         for chart in sh.charts:
             ws.add_chart(_xl_chart(wb, sh.name, ws, chart))
+        if sh.page_setup:
+            _xl_page_setup(ws, sh.page_setup)
         for rule in reversed(sh.cond_formats):  # Excel: the first rule added gets the top priority
             xl_rule = _xl_cf_rule(rule)
             if xl_rule is not None:

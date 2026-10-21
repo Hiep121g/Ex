@@ -10,7 +10,10 @@ import itertools
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import tkinter as tk
 import tkinter.font as tkfont
 import unicodedata
@@ -20,10 +23,13 @@ import charts
 import dialogs
 import formula_engine as fe
 import pivot as pv
+import printing
 import richclip
+import ttf
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
 from function_info import CATEGORIES, FUNCTION_INFO
 from pivot_pane import PivotPane
+from print_preview import PrintPreview
 from ribbon import (RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, MenuIcons, Ribbon, RibbonButton, RibbonStyle, StyleTile,
                     Tooltip, color_popup, gallery_popup, mix)
 
@@ -40,6 +46,7 @@ HEADER_SEL_FG = "#0b5a2f"
 SELECTION_TINT = "#a9cdb5"
 SHEETBAR_BG = "#ececec"
 FREEZE_LINE = "#8a8a8a"
+BREAK_LINE = {False: "#8c8c8c", True: "#4f4f4f"}  # automatic / manual page breaks
 FILTERED_ROW_FG = "#2b579a"  # row numbers inside a filtered range, as in Excel
 NOTE_MARK = "#d13438"
 NOTE_BG = "#ffffe1"
@@ -117,6 +124,7 @@ STYLE_KEYS = ("font", "size", "bold", "italic", "underline", "strike", "fg", "bg
 # picture shown beside a menu entry, by label (without a trailing "..."); see ribbon.ICONS
 MENU_ICONS = {
     "Mới": "file_new", "Mở": "file_open", "Lưu": "save", "Lưu thành": "file_save_as", "Thoát": "file_exit",
+    "In": "print", "Xuất PDF": "pdf", "Thiết lập Trang": "page_setup",
     "Cắt": "cut", "Sao chép": "copy", "Dán": "paste", "Tùy chọn dán": "paste", "Dán công thức": "paste_formulas",
     "Dán giá trị": "paste_values", "Dán định dạng": "paste_formats", "Dán chuyển vị": "paste_transpose",
     "Dán đặc biệt": "paste_special", "Gạch chân": "underline", "Gạch chân kép": "underline_double",
@@ -214,10 +222,23 @@ PHÍM TẮT
   Ctrl+Shift+&        Viền ngoài                   Ctrl+Shift+_      Bỏ viền
   Ctrl+mũi tên        Nhảy tới mép dữ liệu         Ctrl+Home / End   Về A1 / ô cuối
   Ctrl+N / O / S, F12 Mới / Mở / Lưu / Lưu thành   F9                Tính lại
+  Ctrl+P              In / Xem trước khi in
 
 TỆP
   .xlsx mở được bằng Microsoft Excel (giữ công thức, định dạng, ô hợp nhất, định dạng có điều kiện,
   bộ lọc); .pyxl là định dạng riêng (JSON); .csv chỉ lưu giá trị của trang tính đang mở.
+
+IN VÀ XUẤT PDF
+  • Tệp → In... (Ctrl+P): xem trước từng trang; chọn in trang tính hiện hành, cả sổ làm việc hoặc vùng chọn,
+    đổi hướng giấy, khổ giấy, lề, co giãn (vừa 1 trang / vừa chiều rộng) rồi bấm In hoặc Xuất PDF.
+  • Nút In tạo tệp PDF rồi gửi tới máy in mặc định qua chương trình đọc PDF của máy; nếu máy chưa có
+    chương trình in PDF trực tiếp, tệp PDF sẽ được mở để bạn bấm In trong đó.
+  • Tab Bố cục Trang: Lề, Hướng, Khổ giấy, Vùng in (in riêng vùng chọn), Ngắt trang (chèn phía trên / bên
+    trái ô đang chọn), In tiêu đề (hàng lặp lại ở đầu mỗi trang, ví dụ $1:$2), Co giãn, In đường lưới.
+  • Thiết lập Trang có thêm Đầu trang/Chân trang với mã &P số trang, &N tổng số trang, &D ngày, &T giờ,
+    &A tên trang tính, &F tên tệp (ví dụ "Trang &P / &N"). Đường nét đứt trên lưới cho biết chỗ ngắt trang.
+  • PDF dùng phông chữ TrueType có trên máy (nhúng phần cần dùng) nên giữ đúng tiếng Việt; biểu đồ, viền,
+    màu nền, thanh dữ liệu đều được in. Các thiết lập trang được lưu cùng tệp .xlsx / .pyxl.
 
 SAO CHÉP SANG PHẦN MỀM KHÁC (Windows)
   Ctrl+C đưa vùng chọn lên bộ nhớ tạm như Excel: chữ, bảng (HTML, RTF) và hình vẽ (EMF, bitmap).
@@ -269,6 +290,9 @@ class SpreadsheetApp:
         self.cur = self.ext = (0, 0)   # active cell and the moving corner of the selection
         self.views = {}                # sheet -> (top, left, cur, ext)
         self.undo_stack, self.redo_stack = [], []
+        self.edit_serial = 0           # counts changes, for caches of derived data
+        self._font_library, self._layout_cache = None, (None, None)
+        self.breaks_shown = set()      # sheets showing page-break lines (after a print preview)
         self.clip = None
         self.editor = None
         self.edit_var = tk.StringVar(root)
@@ -504,11 +528,14 @@ class SpreadsheetApp:
         self.file_menu = self._make_menu([
             ("Mới", self.new_file, "Ctrl+N"), ("Mở...", self.open_file, "Ctrl+O"), None,
             ("Lưu", self.save_file, "Ctrl+S"), ("Lưu thành...", self.save_as, "F12"), None,
+            ("In...", self.print_preview, "Ctrl+P"), ("Xuất PDF...", self.export_pdf),
+            ("Thiết lập Trang...", self.page_setup_dialog), None,
             ("Thoát", self.quit)])
         rb.add_tab("Tệp", command=lambda label: self.file_menu.tk_popup(
             label.winfo_rootx(), label.winfo_rooty() + label.winfo_height()))
         self._build_home(rb.add_tab("Trang chủ"))
         self._build_insert_tab(rb.add_tab("Chèn"))
+        self._build_page_layout_tab(rb.add_tab("Bố cục Trang"))
         self._build_formulas_tab(rb.add_tab("Công thức"))
         self._build_data_tab(rb.add_tab("Dữ liệu"))
         self._build_review_tab(rb.add_tab("Xem lại"))
@@ -836,6 +863,64 @@ class SpreadsheetApp:
         self.btn_show_notes = self._btn(g, large=True, icon="note", text="Hiện tất cả\nghi chú",
                                         command=self.toggle_show_notes, tooltip="Hiện/ẩn mọi ghi chú trên trang tính")
 
+    def _build_page_layout_tab(self, page):
+        rb = self.ribbon
+
+        def cm(inches):
+            return f"{inches * 2.54:.2f}".replace(".", ",")
+        margins = [(name, lambda m=m: self.update_page_setup({"margins": m}),
+                    f"Trên {cm(m[0])}  Dưới {cm(m[1])}  Trái {cm(m[2])}  Phải {cm(m[3])} cm", "margins")
+                   for name, m in (("Thường", printing.MARGINS["normal"]), ("Rộng", printing.MARGINS["wide"]),
+                                   ("Hẹp", printing.MARGINS["narrow"]))]
+        g = rb.group(page, "Thiết lập Trang", launcher=self.page_setup_dialog, launcher_tip="Thiết lập Trang")
+        self._btn(g, large=True, icon="margins", text="Lề\n", menu=self._make_menu(
+            margins + [None, ("Lề tùy chỉnh...", lambda: self.page_setup_dialog("margins"), "", "page_setup")]),
+            tooltip="Lề\nChọn khoảng cách từ mép giấy tới nội dung")
+        self._btn(g, large=True, icon="page_orient", text="Hướng\n", menu=self._make_menu([
+            ("Dọc", lambda: self.update_page_setup({"orientation": "portrait"}), "", "portrait"),
+            ("Ngang", lambda: self.update_page_setup({"orientation": "landscape"}), "", "landscape")]),
+            tooltip="Hướng\nTrang dọc hay trang ngang")
+        self._btn(g, large=True, icon="paper_size", text="Khổ\ngiấy", menu=self._make_menu(
+            [(label, lambda k=key: self.update_page_setup({"paper": k}), "", "paper_size")
+             for key, label in dialogs.PAPER_LABELS.items()] +
+            [None, ("Khổ giấy khác...", lambda: self.page_setup_dialog("page"), "", "page_setup")]),
+            tooltip="Khổ giấy\nChọn cỡ giấy in")
+        self._btn(g, large=True, icon="print_area", text="Vùng\nin", menu=self._make_menu([
+            ("Đặt vùng in", self.set_print_area, "", "print_area"),
+            ("Xóa vùng in", self.clear_print_area, "", "clear")]),
+            tooltip="Vùng in\nChỉ in vùng đang chọn của trang tính")
+        self._btn(g, large=True, icon="page_break", text="Ngắt\ntrang", menu=self._make_menu([
+            ("Chèn ngắt trang", self.insert_page_break, "", "page_break"),
+            ("Loại bỏ ngắt trang", self.remove_page_break, "", "delete_x"),
+            ("Đặt lại tất cả ngắt trang", self.reset_page_breaks, "", "refresh")]),
+            tooltip="Ngắt trang\nBắt đầu trang mới phía trên / bên trái ô đang chọn")
+        self._btn(g, large=True, icon="print_titles", text="In tiêu\nđề", command=lambda: self.page_setup_dialog("sheet"),
+                  tooltip="In tiêu đề\nChọn các hàng lặp lại ở đầu mỗi trang in")
+        g = rb.group(page, "Co giãn cho vừa", launcher=lambda: self.page_setup_dialog("page"),
+                     launcher_tip="Tùy chọn co giãn")
+        scales = [(f"{n}%", lambda n=n: self.update_page_setup({"fit": None, "scale": n}))
+                  for n in (50, 75, 85, 100, 125, 150)]
+        self._btn(g, large=True, icon="fit_page", text="Co\ngiãn", menu=self._make_menu([
+            ("Không co giãn", lambda: self.update_page_setup({"fit": None, "scale": 100}), "", "zoom100"),
+            ("Vừa tất cả các cột trên một trang", lambda: self.update_page_setup({"fit": "width"}), "", "fit_page"),
+            ("Vừa trang tính trên một trang", lambda: self.update_page_setup({"fit": "page"}), "", "fit_page"),
+            None, ("Tỷ lệ", scales), ("Tùy chọn co giãn...", lambda: self.page_setup_dialog("page"), "", "page_setup")]),
+            tooltip="Co giãn\nThu nhỏ bản in để vừa số trang mong muốn")
+        g = rb.group(page, "Tùy chọn Trang tính")
+        col = g.column()
+        self.print_grid_var = tk.BooleanVar(self.root, value=False)
+        ttk.Checkbutton(col, text="In đường lưới", variable=self.print_grid_var, command=self.toggle_print_gridlines,
+                        style="Ribbon.TCheckbutton").pack(side="top", anchor="w", pady=1)
+        self.commands.append(("In đường lưới", lambda: (self.print_grid_var.set(not self.print_grid_var.get()),
+                                                       self.toggle_print_gridlines())))
+        g = rb.group(page, "In")
+        self._btn(g, large=True, icon="print_preview", text="Xem trước\nkhi in", command=self.print_preview,
+                  tooltip="Xem trước khi in và In (Ctrl+P)")
+        self._btn(g, large=True, icon="print", text="In\n", command=self.print_now,
+                  tooltip="In nhanh\nGửi trang tính tới máy in mặc định")
+        self._btn(g, large=True, icon="pdf", text="Xuất\nPDF", command=self.export_pdf,
+                  tooltip="Xuất PDF\nLưu trang tính thành tệp PDF")
+
     def _build_view_tab(self, page):
         rb = self.ribbon
         g = rb.group(page, "Hiển thị")
@@ -1107,12 +1192,13 @@ class SpreadsheetApp:
         for seq, func in extra.items():
             cv.bind(seq, lambda e, f=func: self._key_action(f))
         global_keys = {"n": self.new_file, "o": self.open_file, "s": self.save_file, "f": self.open_find,
-                       "h": lambda: self.open_find(True), "g": self.focus_name_box}
+                       "h": lambda: self.open_find(True), "g": self.focus_name_box, "p": self.print_preview}
         for key, func in global_keys.items():
             for k in (key, key.upper()):
                 self.root.bind_all(f"<Control-{k}>", lambda e, f=func: self._key_action(f))
         self.root.bind_all("<Control-Key-1>", lambda e: self._key_action(self.format_cells_dialog))
         self.root.bind_all("<F12>", lambda e: self._key_action(self.save_as))
+        self.root.bind_all("<Control-F2>", lambda e: self._key_action(self.print_preview))
         self.root.bind_all("<F1>", lambda e: self._key_action(self.show_help))
         self.root.bind_all("<Shift-F11>", lambda e: self._key_action(self.add_sheet))
 
@@ -1611,6 +1697,8 @@ class SpreadsheetApp:
             if box:
                 cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline="#555555", dash=(4, 3))
         self._draw_charts(cv, W, H)
+        if sh.page_setup or self.sheet in self.breaks_shown:
+            self._draw_page_breaks(cv, col_pos, row_pos, right, bottom)
         px, py = self.pane_origin()
         if fr1 > fr0:
             cv.create_line(hw, py - 1, right, py - 1, fill=FREEZE_LINE)
@@ -1900,6 +1988,7 @@ class SpreadsheetApp:
         self.btn_painter.set_checked(self.painter is not None)
         self.btn_show_formulas.set_checked(self.show_formulas)
         self.btn_filter.set_checked(self.sh.filter is not None)
+        self.print_grid_var.set(bool((self.sh.page_setup or {}).get("gridlines")))
         num = dialogs.canonical_format(fmt.get("num"))
         self.numfmt_box.set(next((label for label, f in NUMBER_FORMATS if dialogs.canonical_format(f) == num),
                                  "Tùy chỉnh"))
@@ -2583,6 +2672,7 @@ class SpreadsheetApp:
         self.undo_stack.append(action)
         del self.undo_stack[:-200]
         self.redo_stack.clear()
+        self.edit_serial += 1
         self.mark_dirty()
 
     def _push_snapshot(self, before, sel):
@@ -2617,6 +2707,7 @@ class SpreadsheetApp:
             self.root.bell()
             return
         action = source.pop()
+        self.edit_serial += 1
         if action[0] == "cells":
             self._apply_changes(action[1], forward)
         else:
@@ -4558,6 +4649,175 @@ class SpreadsheetApp:
                             f"{MAX_ROWS:,} hàng × {MAX_COLS} cột mỗi trang tính, {len(fe.function_names())} hàm,\n"
                             "mở/lưu .xlsx, .pyxl, .csv.", parent=self.root)
 
+    # ------------------------------------------------------------------ printing
+
+    @property
+    def font_library(self):
+        """The TrueType fonts used to lay out and write printed pages (indexed on first use)."""
+        if self._font_library is None:
+            self.root.config(cursor="watch")  # scanning the fonts folder can take a moment the first time
+            self.root.update_idletasks()
+            try:
+                self._font_library = ttf.FontLibrary()
+                self._font_library.index()
+            finally:
+                self.root.config(cursor="")
+        return self._font_library
+
+    def file_label(self):
+        return os.path.basename(self.path) if self.path else ""
+
+    def print_jobs(self, scope):
+        """[(sheet, setup)] to print: the active sheet, every sheet, or the selection of the active sheet."""
+        if scope == "book":
+            return [(name, printing.setup_of(sh)) for name, sh in self.wb.sheets.items()]
+        setup = printing.setup_of(self.sh)
+        if scope == "selection":
+            setup = dict(setup, area=self.sel_rect())
+        return [(self.sheet, setup)]
+
+    def page_layout(self):
+        """printing.Layout of the active sheet, kept until the next change (for the page-break lines)."""
+        key = (id(self.wb), self.sheet, self.edit_serial)
+        if self._layout_cache[0] != key:
+            self._layout_cache = (key, printing.Layout(self.wb, self.sheet, printing.setup_of(self.sh)))
+        return self._layout_cache[1]
+
+    def update_page_setup(self, changes, sheet=None):
+        """Change printing options of a sheet (with undo); only values that differ from the defaults are kept."""
+        sh = self.wb.sheets[sheet or self.sheet]
+        setup = {**printing.setup_of(sh), **changes}
+        kept = {k: v for k, v in setup.items() if v != printing.DEFAULT_SETUP.get(k)} or None
+        if kept != sh.page_setup:
+            self._structural(lambda: setattr(sh, "page_setup", kept))
+
+    def page_setup_dialog(self, tab="page", sheet=None, parent=None):
+        self.commit_edit()
+        sheet = sheet or self.sheet
+        result = dialogs.PageSetupDialog(parent or self.root, printing.setup_of(self.wb.sheets[sheet]), tab).show()
+        if result:
+            self.update_page_setup(result, sheet)
+
+    def print_preview(self, scope="sheet"):
+        """File > Print (Ctrl+P): the preview with print and PDF buttons."""
+        self.commit_edit()
+        self.breaks_shown.add(self.sheet)
+        PrintPreview(self, scope)
+        self.redraw()
+
+    def _write_pdf(self, scope, path):
+        selection = (self.sheet, self.sel_rect()) if scope == "selection" else None
+        sheets = list(self.wb.sheets) if scope == "book" else [self.sheet]
+        return printing.export_pdf(self.wb, sheets, path, self.font_library, self.file_label(), selection)
+
+    def export_pdf(self, scope="sheet", parent=None):
+        """File > Export PDF: write the pages to a PDF file and offer to open it."""
+        self.commit_edit()
+        parent = parent or self.root
+        base = os.path.splitext(self.file_label())[0] or "Bang tinh"
+        path = filedialog.asksaveasfilename(parent=parent, title="Xuất PDF", initialfile=base,
+                                            defaultextension=".pdf", filetypes=[("Tệp PDF", "*.pdf")])
+        if not path:
+            return False
+        try:
+            pages = self._write_pdf(scope, path)
+        except Exception as err:  # e.g. the PDF is open in a viewer that locks it
+            messagebox.showerror(APP_NAME, f"Không xuất được PDF:\n{path}\n\n{err}", parent=parent)
+            return False
+        self.set_mode(f"Đã xuất {pages} trang ra {os.path.basename(path)}")
+        if messagebox.askyesno(APP_NAME, f"Đã xuất {pages} trang ra:\n{path}\n\nMở tệp PDF ngay?", parent=parent):
+            self._open_document(path)
+        return True
+
+    @staticmethod
+    def _open_document(path, verb=None):
+        """Open (or with verb "print", print) a file with the program the system uses for it."""
+        if sys.platform == "win32":
+            os.startfile(path, verb) if verb else os.startfile(path)
+        elif verb == "print" and shutil.which("lp"):
+            subprocess.Popen(["lp", path])
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+
+    def print_now(self, scope="sheet", parent=None):
+        """Print: the pages go to a PDF in the temp folder, which the system's PDF program sends to the
+        default printer; when it cannot print directly the PDF is opened to print from there."""
+        self.commit_edit()
+        parent = parent or self.root
+        base = os.path.splitext(self.file_label())[0] or "Bang tinh"
+        path = os.path.join(tempfile.gettempdir(), f"PyExcel - {base} - {dt.datetime.now():%Y%m%d-%H%M%S}.pdf")
+        try:
+            pages = self._write_pdf(scope, path)
+        except Exception as err:
+            messagebox.showerror(APP_NAME, f"Không tạo được trang in:\n{err}", parent=parent)
+            return False
+        try:
+            self._open_document(path, "print")
+            self.set_mode(f"Đã gửi {pages} trang tới máy in")
+        except OSError:
+            try:
+                self._open_document(path)
+            except OSError as err:
+                messagebox.showerror(APP_NAME, f"Không mở được trình xem PDF để in:\n{err}", parent=parent)
+                return False
+            messagebox.showinfo(APP_NAME, "Máy chưa có chương trình in PDF trực tiếp nên PyExcel đã mở tệp PDF;\n"
+                                          "hãy bấm In (Ctrl+P) trong cửa sổ vừa mở.", parent=parent)
+        return True
+
+    def set_print_area(self):
+        self.update_page_setup({"area": self.sel_rect()})
+
+    def clear_print_area(self):
+        self.update_page_setup({"area": None})
+
+    def insert_page_break(self):
+        """Excel's Insert Page Break: above the active row and left of the active column (not at row/column 1)."""
+        r, c = self.cur
+        setup = printing.setup_of(self.sh)
+        changes = {}
+        if r > 0:
+            changes["breaks"] = sorted(set(setup["breaks"]) | {r})
+        if c > 0:
+            changes["col_breaks"] = sorted(set(setup["col_breaks"]) | {c})
+        self.breaks_shown.add(self.sheet)
+        self.update_page_setup(changes)
+
+    def remove_page_break(self):
+        r, c = self.cur
+        setup = printing.setup_of(self.sh)
+        self.update_page_setup({"breaks": [b for b in setup["breaks"] if b != r],
+                                "col_breaks": [b for b in setup["col_breaks"] if b != c]})
+
+    def reset_page_breaks(self):
+        self.update_page_setup({"breaks": [], "col_breaks": []})
+
+    def toggle_print_gridlines(self):
+        self.update_page_setup({"gridlines": self.print_grid_var.get()})
+
+    def _draw_page_breaks(self, cv, col_pos, row_pos, right, bottom):
+        """Dashed lines where pages end, as Excel shows them once the sheet has been previewed or set up;
+        manual breaks are drawn darker."""
+        layout = self.page_layout()
+        if not layout.pages:
+            return
+        rows, cols = layout.breaks()
+        rows.add(max(r for page, _ in layout.pages for r in page) + 1)
+        cols.add(max(c for _, page in layout.pages for c in page) + 1)
+        manual_rows, manual_cols = set(layout.setup["breaks"]), set(layout.setup["col_breaks"])
+        hw, hh = self.header_w, self.header_h
+        for r in rows:
+            y = row_pos[r][0] if r in row_pos else row_pos[r - 1][1] if r - 1 in row_pos else None
+            if y is not None:
+                manual = r in manual_rows
+                cv.create_line(hw, y - 1, right, y - 1, fill=BREAK_LINE[manual], dash=(6, 3) if manual else (3, 3),
+                               width=2 if manual else 1)
+        for c in cols:
+            x = col_pos[c][0] if c in col_pos else col_pos[c - 1][1] if c - 1 in col_pos else None
+            if x is not None:
+                manual = c in manual_cols
+                cv.create_line(x - 1, hh, x - 1, bottom, fill=BREAK_LINE[manual], dash=(6, 3) if manual else (3, 3),
+                               width=2 if manual else 1)
+
     # ------------------------------------------------------------------ files
 
     def confirm_discard(self):
@@ -4599,6 +4859,7 @@ class SpreadsheetApp:
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.clip = self.painter = None
+        self.breaks_shown.clear()
         self.path = path
         self.dirty = False
         self.refresh_all()

@@ -7,6 +7,7 @@ import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
 import formula_engine as fe
+import printing
 from function_info import CATEGORIES, FUNCTION_INFO
 from ribbon import GROUP_LINE, HOVER_BG, STANDARD_COLORS, TEXT_FG, Popup, color_popup, theme_palette
 
@@ -1630,3 +1631,123 @@ class PivotOptionsDialog(Dialog):
             return None
         return {"name": self.name.get().strip(), "layout": self.layout.get(),
                 **{key: var.get() for key, var in self.flags.items()}}
+
+
+PAPER_LABELS = {"A4": "A4 (21 × 29,7 cm)", "A3": "A3 (29,7 × 42 cm)", "A5": "A5 (14,8 × 21 cm)",
+                "Letter": "Letter (21,59 × 27,94 cm)", "Legal": "Legal (21,59 × 35,56 cm)"}
+HEADER_PRESETS = ["(không có)", "Trang &P", "Trang &P / &N", "Trang &P của &N", "&A", "&F", "&A – Trang &P",
+                  "&D &T"]
+MARGIN_NAMES = ("Trên", "Dưới", "Trái", "Phải", "Đầu trang", "Chân trang")
+
+
+def _cm(inches):
+    return f"{inches * 2.54:.2f}".replace(".", ",")
+
+
+class PageSetupDialog(Dialog):
+    """Page Setup with Excel's four tabs: page (orientation, scaling, paper), margins (cm), header/footer
+    and sheet (print area, rows to repeat, gridlines). collect() returns the whole setup dict."""
+
+    TABS = ("page", "margins", "header", "sheet")
+
+    def __init__(self, master, setup, tab="page"):
+        super().__init__(master, "Thiết lập Trang")
+        self.setup = setup
+        nb = ttk.Notebook(self.body)
+        nb.pack(fill="both", expand=True)
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Trang")
+        ttk.Label(f, text="Hướng giấy").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.orient = tk.StringVar(value=setup["orientation"])
+        row = ttk.Frame(f)
+        row.grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 10))
+        ttk.Radiobutton(row, text="Dọc", value="portrait", variable=self.orient).pack(side="left")
+        ttk.Radiobutton(row, text="Ngang", value="landscape", variable=self.orient).pack(side="left", padx=16)
+        ttk.Label(f, text="Co giãn").grid(row=2, column=0, columnspan=3, sticky="w")
+        self.fit = tk.StringVar(value=setup["fit"] or "scale")
+        self.scale = tk.StringVar(value=str(setup["scale"] or 100))
+        ttk.Radiobutton(f, text="Điều chỉnh theo:", value="scale", variable=self.fit).grid(
+            row=3, column=0, sticky="w", padx=12, pady=2)
+        ttk.Spinbox(f, from_=10, to=400, increment=5, textvariable=self.scale, width=6,
+                    command=lambda: self.fit.set("scale")).grid(row=3, column=1, sticky="w")
+        ttk.Label(f, text="% kích thước thường").grid(row=3, column=2, sticky="w", padx=4)
+        ttk.Radiobutton(f, text="Vừa tất cả các cột trên một trang", value="width", variable=self.fit).grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=12, pady=2)
+        ttk.Radiobutton(f, text="Vừa toàn bộ trang tính trên một trang", value="page", variable=self.fit).grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=12, pady=2)
+        ttk.Label(f, text="Khổ giấy:").grid(row=6, column=0, sticky="w", pady=(12, 0))
+        self.paper = tk.StringVar(value=PAPER_LABELS.get(setup["paper"], PAPER_LABELS["A4"]))
+        ttk.Combobox(f, values=list(PAPER_LABELS.values()), textvariable=self.paper, state="readonly",
+                     width=24).grid(row=6, column=1, columnspan=2, sticky="w", pady=(12, 0))
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Lề")
+        self.margins = []
+        for i, name in enumerate(MARGIN_NAMES):
+            ttk.Label(f, text=name + ":").grid(row=i // 2, column=(i % 2) * 2, sticky="w", pady=3,
+                                               padx=(0 if i % 2 == 0 else 20, 6))
+            var = tk.StringVar(value=_cm(setup["margins"][i]))
+            ttk.Spinbox(f, from_=0, to=10, increment=0.1, textvariable=var, width=7).grid(
+                row=i // 2, column=(i % 2) * 2 + 1, sticky="w")
+            self.margins.append(var)
+        ttk.Label(f, text="(đơn vị: cm)", foreground="#666").grid(row=3, column=0, columnspan=4, sticky="w",
+                                                                 pady=(2, 10))
+        ttk.Label(f, text="Căn giữa trên trang").grid(row=4, column=0, columnspan=4, sticky="w")
+        self.center_h = tk.BooleanVar(value=setup["center_h"])
+        self.center_v = tk.BooleanVar(value=setup["center_v"])
+        ttk.Checkbutton(f, text="Theo chiều ngang", variable=self.center_h).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=12, pady=2)
+        ttk.Checkbutton(f, text="Theo chiều dọc", variable=self.center_v).grid(
+            row=5, column=2, columnspan=2, sticky="w", pady=2)
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Đầu trang/Chân trang")
+        self.header = tk.StringVar(value=setup["header"] or HEADER_PRESETS[0])
+        self.footer = tk.StringVar(value=setup["footer"] or HEADER_PRESETS[0])
+        for i, (label, var) in enumerate((("Đầu trang:", self.header), ("Chân trang:", self.footer))):
+            ttk.Label(f, text=label).grid(row=i, column=0, sticky="w", pady=4)
+            ttk.Combobox(f, values=HEADER_PRESETS, textvariable=var, width=34).grid(row=i, column=1, sticky="w",
+                                                                                   padx=6)
+        ttk.Label(f, text="Có thể gõ chữ tùy ý kèm các mã:\n&P số trang   &N tổng số trang   &D ngày   &T giờ\n"
+                          "&A tên trang tính   &F tên tệp", foreground="#666", justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Trang tính")
+        ttk.Label(f, text="Vùng in:").grid(row=0, column=0, sticky="w", pady=4)
+        self.area = tk.StringVar(value=fe.range_name(*setup["area"]) if setup["area"] else "")
+        ttk.Entry(f, textvariable=self.area, width=20).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="để trống: in phần có dữ liệu", foreground="#666").grid(row=0, column=2, sticky="w")
+        ttk.Label(f, text="Hàng lặp lại ở đầu trang:").grid(row=1, column=0, sticky="w", pady=4)
+        self.titles = tk.StringVar(value=printing.title_rows_text(setup["titles"]))
+        ttk.Entry(f, textvariable=self.titles, width=20).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="ví dụ: $1:$2", foreground="#666").grid(row=1, column=2, sticky="w")
+        self.gridlines = tk.BooleanVar(value=setup["gridlines"])
+        ttk.Checkbutton(f, text="In đường lưới", variable=self.gridlines).grid(row=2, column=0, columnspan=3,
+                                                                             sticky="w", pady=(10, 0))
+        nb.select(self.TABS.index(tab) if tab in self.TABS else 0)
+        self.add_buttons()
+
+    def collect(self):
+        try:
+            scale = int(float(self.scale.get().replace(",", ".")))
+            margins = [m if v.get().strip() == _cm(m) else round(float(v.get().replace(",", ".")) / 2.54, 4)
+                       for v, m in zip(self.margins, self.setup["margins"])]  # untouched: exact inches
+        except ValueError:
+            self.bell()
+            return None
+        area_text = self.area.get().replace("$", "").strip()
+        area = fe.parse_range(area_text) if area_text else None
+        titles = printing.parse_title_rows(self.titles.get())
+        if not 10 <= scale <= 400 or min(margins) < 0 or area_text and area is None or titles is False:
+            self.bell()
+            return None
+        paper = next(k for k, label in PAPER_LABELS.items() if label == self.paper.get())
+        header, footer = (v.get().strip() for v in (self.header, self.footer))
+        return dict(self.setup, orientation=self.orient.get(), paper=paper, scale=scale,
+                    fit=None if self.fit.get() == "scale" else self.fit.get(), margins=margins,
+                    center_h=self.center_h.get(), center_v=self.center_v.get(),
+                    header="" if header == HEADER_PRESETS[0] else header,
+                    footer="" if footer == HEADER_PRESETS[0] else footer,
+                    area=area, titles=titles, gridlines=self.gridlines.get())

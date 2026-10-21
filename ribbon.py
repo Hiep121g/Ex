@@ -791,6 +791,95 @@ def _icon_pivot_fields(cv, P, k, c):
         cv.create_line(*P(7.5, y + 1.5, 13, y + 1.5), fill=DARK, width=max(1, round(k)))
 
 
+def _page(cv, P, x0, y0, x1, y1, fill="#ffffff"):
+    """A sheet of paper with a folded corner."""
+    f = min(x1 - x0, y1 - y0) * 0.28
+    cv.create_polygon(*P(x0, y0, x1 - f, y0, x1, y0 + f, x1, y1, x0, y1), fill=fill, outline=GRAY)
+    cv.create_polygon(*P(x1 - f, y0, x1 - f, y0 + f, x1, y0 + f), fill="#d9d9d9", outline=GRAY)
+
+
+def _icon_margins(cv, P, k, c):
+    _page(cv, P, 2.5, 1, 13.5, 15)
+    cv.create_rectangle(*P(4.5, 3.5, 11.5, 12.5), outline=BLUE, dash=(2, 1))
+    _lines(cv, P, k, [(5.5, 6, 10.5), (5.5, 8, 10.5), (5.5, 10, 9)], GRAY)
+
+
+def _icon_page_orient(cv, P, k, c, kind=None):
+    """Orientation: a portrait and a landscape sheet, or just one of them."""
+    if kind == "portrait":
+        _page(cv, P, 3.5, 1, 12.5, 15)
+        _lines(cv, P, k, [(5.5, 5, 10.5), (5.5, 7, 10.5), (5.5, 9, 9)], GRAY)
+    elif kind == "landscape":
+        _page(cv, P, 1, 3.5, 15, 12.5)
+        _lines(cv, P, k, [(3, 7, 12), (3, 9, 10)], GRAY)
+    else:
+        _page(cv, P, 1.5, 1, 9.5, 12)
+        _page(cv, P, 4.5, 7, 15, 14.5, "#deebf7")
+        _lines(cv, P, k, [(6.5, 10, 12.5), (6.5, 12, 11)], GRAY)
+
+
+def _icon_paper_size(cv, P, k, c):
+    _page(cv, P, 4, 1, 14, 15)
+    cv.create_line(*P(2, 1.5, 2, 14.5), fill=BLUE, width=max(1, round(k)), arrow="both",
+                   arrowshape=(round(2.5 * k), round(3 * k), round(1.4 * k)))
+    _glyph(cv, P, k, 9, 9.5, "A4", 6, BLUE, "bold")
+
+
+def _icon_print_area(cv, P, k, c):
+    _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 4, GRAY, "#ffffff")
+    cv.create_rectangle(*P(1.5, 1.5, 11.25, 11.25), fill="#deebf7", outline=BLUE, width=max(1, round(1.4 * k)),
+                        dash=(3, 2))
+
+
+def _icon_page_break(cv, P, k, c):
+    _page(cv, P, 3, 1, 13, 7)
+    _page(cv, P, 3, 9.5, 13, 15)
+    cv.create_line(*P(0.5, 8.25, 15.5, 8.25), fill=BLUE, width=max(1, round(1.3 * k)), dash=(3, 2))
+
+
+def _icon_print_titles(cv, P, k, c):
+    for x, y in ((1, 1), (5, 4)):
+        _page(cv, P, x, y, x + 10, y + 11)
+        cv.create_rectangle(*P(x + 1.5, y + 1.5, x + 8.5, y + 3.5), fill="#bdd7ee", outline=BLUE)
+    _lines(cv, P, k, [(6.5, 10, 13.5), (6.5, 12, 12)], GRAY)
+
+
+def _icon_fit_page(cv, P, k, c):
+    _page(cv, P, 3, 2.5, 13, 13.5)
+    for x1, y1, x2, y2 in ((1, 1, 4.5, 4.5), (15, 1, 11.5, 4.5), (1, 15, 4.5, 11.5), (15, 15, 11.5, 11.5)):
+        _arrow(cv, P, k, x1, y1, x2, y2, BLUE, 1.2)
+
+
+def _icon_print(cv, P, k, c):
+    cv.create_rectangle(*P(4, 1.5, 12, 6), fill="#ffffff", outline=GRAY)
+    cv.create_rectangle(*P(1.5, 5.5, 14.5, 11.5), fill="#bfbfbf", outline=DARK)
+    cv.create_oval(*P(11.5, 7, 13, 8.5), fill=GREEN, outline="")
+    cv.create_rectangle(*P(4, 9.5, 12, 15), fill="#ffffff", outline=GRAY)
+    _lines(cv, P, k, [(5.5, 11.5, 10.5), (5.5, 13.3, 9.5)], GRAY)
+
+
+def _icon_print_preview(cv, P, k, c):
+    _page(cv, P, 1.5, 1, 11.5, 14)
+    _lines(cv, P, k, [(3.5, 4, 8.5), (3.5, 6, 8.5), (3.5, 8, 7)], GRAY)
+    cv.create_oval(*P(6.5, 7.5, 12.5, 13.5), outline=BLUE, width=max(1, round(1.4 * k)), fill="#ffffff")
+    cv.create_line(*P(12, 13, 15, 16), fill=DARK, width=max(2, round(2 * k)))
+
+
+def _icon_pdf(cv, P, k, c):
+    _page(cv, P, 2.5, 1, 13.5, 15)
+    cv.create_rectangle(*P(0.5, 7, 12, 13), fill=RED, outline="")
+    _glyph(cv, P, k, 6.25, 10, "PDF", 5.5, "#ffffff", "bold")
+
+
+def _icon_page_setup(cv, P, k, c):
+    _page(cv, P, 1.5, 1, 11.5, 15)
+    _lines(cv, P, k, [(3.5, 4.5, 8.5), (3.5, 6.5, 8.5)], GRAY)
+    for i, x in enumerate((7.5, 10.5, 13.5)):
+        cv.create_line(*P(x, 8, x, 15.5), fill=DARK, width=max(1, round(k)))
+        y = (10, 13.5, 11.5)[i]
+        cv.create_rectangle(*P(x - 1.2, y - 1, x + 1.2, y + 1), fill=BLUE, outline="")
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -876,6 +965,11 @@ ICONS.update({
     "delete_x": _icon_delete_x, "chart_edit": _icon_chart_edit,
     "sort_color": lambda *a: _icon_by_color(*a, True), "filter_color": lambda *a: _icon_by_color(*a, False),
     "pivot": _icon_pivot, "refresh": _icon_refresh, "pivot_fields": _icon_pivot_fields,
+    "margins": _icon_margins, "page_orient": _icon_page_orient,
+    "portrait": lambda *a: _icon_page_orient(*a, "portrait"), "landscape": lambda *a: _icon_page_orient(*a, "landscape"),
+    "paper_size": _icon_paper_size, "print_area": _icon_print_area, "page_break": _icon_page_break,
+    "print_titles": _icon_print_titles, "fit_page": _icon_fit_page, "print": _icon_print,
+    "print_preview": _icon_print_preview, "pdf": _icon_pdf, "page_setup": _icon_page_setup,
 })
 
 

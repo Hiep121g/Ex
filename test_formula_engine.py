@@ -1108,5 +1108,92 @@ class LayoutFileTests(unittest.TestCase):
         self.check(self.roundtrip(".xlsx"))
 
 
+class PrintingTests(unittest.TestCase):
+    def build(self, rows=60):
+        wb = make({"A1": "Bảng khối lượng", "A2": "STT", "B2": "Tên"})
+        for i in range(rows):
+            wb.set_raw("Sheet1", i + 2, 0, str(i + 1))
+            wb.set_raw("Sheet1", i + 2, 1, f"Hạng mục {i + 1}")
+        return wb
+
+    def layout(self, wb, **setup):
+        import printing
+        sh = wb.sheets["Sheet1"]
+        sh.page_setup = setup
+        return printing.Layout(wb, "Sheet1", printing.setup_of(sh))
+
+    def test_pages_repeat_title_rows_below_the_top(self):
+        lay = self.layout(self.build(), titles=(1, 1))
+        self.assertEqual(len(lay.pages), 2)
+        (first, _), (second, _) = lay.pages
+        self.assertEqual(first[:3], [0, 1, 2])         # the title row prints once, in place, on page 1
+        self.assertEqual(second[:2], [1, first[-1] + 1])  # and is repeated above the rows of page 2
+        self.assertEqual(lay.leads, [0, 1])
+        self.assertEqual(lay.breaks(), ({first[-1] + 1}, set()))
+
+    def test_manual_breaks_scaling_and_fit(self):
+        wb = self.build()
+        lay = self.layout(wb, breaks=[10], col_breaks=[1])  # 48 rows fit an A4 page; pages go down, then over
+        self.assertEqual([(rows[0], rows[-1], cols) for rows, cols in lay.pages],
+                         [(0, 9, [0]), (10, 57, [0]), (58, 61, [0]), (0, 9, [1]), (10, 57, [1]), (58, 61, [1])])
+        self.assertEqual(len(self.layout(wb, scale=50).pages), 1)
+        lay = self.layout(wb, fit="page")
+        self.assertEqual(len(lay.pages), 1)
+        self.assertLess(lay.scale, 1)
+        self.assertEqual(len(self.layout(wb, area=(0, 0, 4, 1)).pages), 1)
+        wb.sheets["Sheet1"].col_widths[1] = 2000
+        lay = self.layout(wb, fit="width")
+        self.assertEqual(len({tuple(cols) for _, cols in lay.pages}), 1)
+
+    def test_setup_follows_inserted_rows_and_files(self):
+        import printing
+        wb = self.build(5)
+        sh = wb.sheets["Sheet1"]
+        sh.page_setup = {"area": (0, 0, 6, 1), "titles": (1, 1), "breaks": [4], "col_breaks": [1],
+                         "orientation": "landscape", "paper": "A3", "fit": "width", "gridlines": True,
+                         "center_h": True, "header": "&A", "footer": "Trang &P / &N",
+                         "margins": printing.MARGINS["narrow"]}
+        wb.insert_rows("Sheet1", 0)
+        expected = dict(sh.page_setup, area=(1, 0, 7, 1), titles=(2, 2), breaks=[5])
+        self.assertEqual(sh.page_setup, expected)
+        exts = [".pyxl"] + ([".xlsx"] if fe.HAS_XLSX else [])
+        for ext in exts:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "in" + ext)
+                fe.save_workbook(wb, path)
+                got = fe.load_workbook(path).sheets["Sheet1"].page_setup
+            self.assertEqual(printing.setup_of(type("S", (), {"page_setup": got})), printing.setup_of(sh), ext)
+
+    def test_title_rows_text_and_header_codes(self):
+        import printing
+        self.assertEqual(printing.parse_title_rows("$2:$3"), (1, 2))
+        self.assertEqual(printing.parse_title_rows("4"), (3, 3))
+        self.assertIsNone(printing.parse_title_rows(" "))
+        self.assertIs(printing.parse_title_rows("A1"), False)
+        self.assertEqual(printing.title_rows_text((1, 2)), "$2:$3")
+        self.assertEqual(printing.header_text("&A - Trang &P / &N", 2, 5, "Thép", "a.xlsx"), "Thép - Trang 2 / 5")
+
+    def test_pdf_export(self):
+        import printing
+        import ttf
+        library = ttf.FontLibrary()
+        if library.find("Arial") is None:
+            self.skipTest("no TrueType fonts on this machine")
+        wb = self.build()
+        wb.sheets["Sheet1"].page_setup = {"titles": (1, 1), "footer": "Trang &P / &N"}
+        wb.sheets["Sheet1"].charts = [{"type": "column", "range": (1, 0, 6, 0), "title": "Biểu đồ",
+                                       "anchor": (2, 3, 0, 0), "size": (300, 200)}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.pdf")
+            pages = printing.export_pdf(wb, ["Sheet1"], path, library, "out.xlsx")
+            with open(path, "rb") as f:
+                data = f.read()
+        self.assertEqual(pages, 2)
+        self.assertTrue(data.startswith(b"%PDF-") and data.rstrip().endswith(b"%%EOF"))
+        self.assertEqual(data.count(b"/Type /Page\n") + data.count(b"/Type /Page "), 2)
+        self.assertIn(b"/ToUnicode", data)
+        self.assertIn(b"/FontFile2", data)
+
+
 if __name__ == "__main__":
     unittest.main()
