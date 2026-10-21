@@ -158,6 +158,30 @@ def quote_sheet(name):
     return "'" + name.replace("'", "''") + "'"
 
 
+def cells_to_rects(cells):
+    """Cover a set of (row, col) cells with few rectangles: runs along each row, stacked where they match."""
+    runs = {}
+    for r, c in sorted(set(cells)):
+        row = runs.setdefault(r, [])
+        if row and row[-1][1] == c - 1:
+            row[-1][1] = c
+        else:
+            row.append([c, c])
+    rects, open_ = [], {}
+    for r in sorted(runs):
+        spans = {tuple(s) for s in runs[r]}
+        for span in list(open_):
+            if span not in spans or open_[span][2] != r - 1:
+                rects.append(tuple(open_.pop(span)))
+        for span in sorted(spans):
+            if span in open_:
+                open_[span][2] = r
+            else:
+                open_[span] = [r, span[0], r, span[1]]
+    rects += [tuple(v) for v in open_.values()]
+    return sorted(rects)
+
+
 def absolute_ref(sheet, rect):
     """'Sheet1!$A$1:$B$4' (or 'Sheet1!$A$1' for one cell), as names refer to cells."""
     r1, c1, r2, c2 = rect
@@ -2517,7 +2541,7 @@ class Sheet:
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
               "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
               "charts", "pivots", "page_setup", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols",
-              "links")
+              "links", "hidden")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2549,6 +2573,7 @@ class Sheet:
         self.col_levels = {}    # col -> outline level; summary columns sit right of groups
         self.collapsed_rows = set()  # summary rows of collapsed groups (Excel's "collapsed" flag)
         self.collapsed_cols = set()
+        self.hidden = False     # sheet hidden (Format > Hide & Unhide > Hide Sheet)
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -2652,9 +2677,19 @@ class Workbook:
         self._ast.clear()
         self.invalidate()
 
+    def visible_sheets(self):
+        return [name for name, sh in self.sheets.items() if not sh.hidden]
+
+    def hide_sheet(self, name, hidden=True):
+        if hidden and self.visible_sheets() == [name]:
+            raise ValueError("Sổ làm việc phải có ít nhất một trang tính hiển thị.")
+        self.sheets[name].hidden = hidden
+
     def delete_sheet(self, name):
         if len(self.sheets) <= 1:
             raise ValueError("Sổ làm việc phải có ít nhất một trang tính.")
+        if self.visible_sheets() == [name]:
+            raise ValueError("Sổ làm việc phải có ít nhất một trang tính hiển thị.")
         del self.sheets[name]
         self._ast.clear()
         self.invalidate()
@@ -3458,6 +3493,41 @@ class Workbook:
         self.invalidate()
         return r1, c1, last + 1, c2
 
+    def special_cells(self, sheet, rect, kind, types=("number", "text", "logical", "error")):
+        """Home > Find & Select > Go To Special: the cells of `rect` that are notes, constants, formulas
+        (of the value types given), blanks (inside the used area), visible, with conditional formats or
+        with data validation; "last" gives the last used cell."""
+        sh = self.sheets[sheet]
+        r1, c1, r2, c2 = rect
+        rows, cols = self.used_extent(sheet)
+        r2, c2 = min(r2, rows - 1), min(c2, cols - 1)
+
+        def inside(key):
+            return r1 <= key[0] <= r2 and c1 <= key[1] <= c2
+
+        def of_type(r, c):
+            v = self.get_value(sheet, r, c)
+            kind_ = ("error" if isinstance(v, CellError) else "logical" if isinstance(v, bool)
+                     else "number" if is_number(v) else "text")
+            return kind_ in types
+        if kind == "last":
+            return [(rows - 1, cols - 1)] if rows else []
+        if kind == "notes":
+            return sorted(k for k in sh.notes if inside(k))
+        if kind in ("constants", "formulas"):
+            want = kind == "formulas"
+            return sorted(k for k, raw in sh.cells.items() if inside(k) and is_formula(raw) == want and of_type(*k))
+        if kind == "visible":
+            return [(r, c) for r in range(r1, r2 + 1) if not sh.row_hidden(r)
+                    for c in range(c1, c2 + 1) if c not in sh.hidden_cols]
+        rules = {"cf": sh.cond_formats, "validation": sh.validations}.get(kind)
+        if rules is not None:
+            return sorted({(r, c) for rule in rules for r in range(max(r1, rule["range"][0]), min(r2, rule["range"][2]) + 1)
+                           for c in range(max(c1, rule["range"][1]), min(c2, rule["range"][3]) + 1)})
+        if kind == "blanks":
+            return [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) not in sh.cells]
+        raise ValueError(kind)
+
     def snapshot(self):
         return [(s.name, s.copy_state()) for s in self.sheets.values()], copy.deepcopy(self.names)
 
@@ -3558,6 +3628,8 @@ class Workbook:
                 d["validations"] = [dict(rule, range=range_name(*rule["range"])) for rule in s.validations]
             if s.notes:
                 d["notes"] = {cell_name(r, c): text for (r, c), text in sorted(s.notes.items())}
+            if s.hidden:
+                d["hidden"] = True
             if s.links:
                 d["links"] = {cell_name(r, c): link for (r, c), link in sorted(s.links.items())}
             if s.charts:
@@ -3627,6 +3699,7 @@ class Workbook:
                 pos = parse_address(addr)
                 if pos and len(pos) == 2 and text:
                     sh.notes[pos] = str(text)
+            sh.hidden = bool(sd.get("hidden"))
             for addr, link in sd.get("links", {}).items():
                 pos = parse_address(addr)
                 if pos and len(pos) == 2 and isinstance(link, dict) and link.get("target"):
@@ -3659,6 +3732,8 @@ class Workbook:
             wb.add_sheet()
         for name in wb.sheets:  # after every sheet exists, so cross-sheet formulas resolve
             wb.apply_filter(name)
+        if not wb.visible_sheets():
+            next(iter(wb.sheets.values())).hidden = False
         for d in data.get("names", []):
             if isinstance(d, dict) and wb.check_name(str(d.get("name", ""))) is None and d.get("ref"):
                 wb.define_name(d["name"], str(d["ref"]), str(d.get("comment") or ""))
@@ -4382,6 +4457,7 @@ def _load_xlsx(path):
         sh.set_merges((rg.min_row - 1, rg.min_col - 1, rg.max_row - 1, rg.max_col - 1)
                       for rg in ws.merged_cells.ranges if rg.max_row <= MAX_ROWS and rg.max_col <= MAX_COLS)
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
+        sh.hidden = ws.sheet_state in ("hidden", "veryHidden")
         sh.freeze = _freeze_from_xlsx(ws)
         sh.validations = _validations_from_xlsx(ws)
         sh.charts = _charts_from_xlsx(ws, sh) + _pictures_from_xlsx(ws)
@@ -4427,8 +4503,12 @@ def _load_xlsx(path):
                 pass
     titles = [ws.title for ws in book.worksheets if ws is not store]
     names = list(wb.sheets)
+    if not wb.visible_sheets():
+        wb.sheets[names[0]].hidden = False
     if book.active is not None and book.active.title in titles:
         wb.active = names[titles.index(book.active.title)]
+    if wb.active and wb.sheets[wb.active].hidden:
+        wb.active = wb.visible_sheets()[0]
     return wb
 
 
@@ -4583,6 +4663,8 @@ def _save_xlsx(wb, path, active=None):
             ws.merge_cells(start_row=m[0] + 1, start_column=m[1] + 1, end_row=m[2] + 1, end_column=m[3] + 1)
         if sh.tab_color:
             ws.sheet_properties.tabColor = _xl_hex(sh.tab_color)
+        if sh.hidden:
+            ws.sheet_state = "hidden"
         if sh.freeze:
             r0, r1, c0, c1 = sh.freeze
             ws.freeze_panes = cell_name(r1 - r0, c1 - c0)  # sets up the panes as if frozen from A1...
@@ -4616,6 +4698,9 @@ def _save_xlsx(wb, path, active=None):
         store["A1"] = json.dumps(pivots, ensure_ascii=False)
         store.sheet_state = "veryHidden"
     _xl_names(book, wb)
-    if active in wb.sheets:
-        book.active = list(wb.sheets).index(active)
+    if active not in wb.sheets or wb.sheets[active].hidden:
+        active = wb.visible_sheets()[0]
+    book.active = list(wb.sheets).index(active)
+    for ws in book.worksheets:  # Excel opens on the active sheet; others must not look selected
+        ws.sheet_view.tabSelected = ws is book.active
     book.save(path)

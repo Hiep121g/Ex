@@ -1404,5 +1404,35 @@ class LinkAndPictureTests(unittest.TestCase):
         self.assertIn(b"/SMask", data)
 
 
+class SheetExtrasTests(unittest.TestCase):
+    def test_hidden_sheets(self):
+        wb = Workbook(("A", "B"))
+        wb.hide_sheet("B")
+        self.assertEqual(wb.visible_sheets(), ["A"])
+        with self.assertRaises(ValueError):
+            wb.hide_sheet("A")  # the last visible sheet stays
+        with self.assertRaises(ValueError):
+            wb.delete_sheet("A")
+        for ext in [".pyxl"] + ([".xlsx"] if fe.HAS_XLSX else []):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "h" + ext)
+                fe.save_workbook(wb, path, active="B")  # a hidden sheet is never the active one
+                got = fe.load_workbook(path)
+            self.assertEqual((got.visible_sheets(), got.sheets["B"].hidden), (["A"], True), ext)
+            if ext == ".xlsx":
+                self.assertEqual(got.active, "A")
+
+    def test_special_cells(self):
+        wb = make({"A1": "x", "B1": "5", "A2": "=B1*2", "C3": "TRUE", "B3": "=1/0"})
+        everything = (0, 0, fe.MAX_ROWS - 1, fe.MAX_COLS - 1)
+        self.assertEqual(wb.special_cells("Sheet1", everything, "constants"), [(0, 0), (0, 1), (2, 2)])
+        self.assertEqual(wb.special_cells("Sheet1", everything, "constants", ("number",)), [(0, 1)])
+        self.assertEqual(wb.special_cells("Sheet1", everything, "formulas", ("error",)), [(2, 1)])
+        self.assertEqual(wb.special_cells("Sheet1", everything, "blanks"), [(0, 2), (1, 1), (1, 2), (2, 0)])
+        self.assertEqual(wb.special_cells("Sheet1", everything, "last"), [(2, 2)])
+        self.assertEqual(fe.cells_to_rects([(0, 0), (0, 1), (1, 0), (1, 1), (3, 0), (3, 2), (4, 2)]),
+                         [(0, 0, 1, 1), (3, 0, 3, 0), (3, 2, 4, 2)])
+
+
 if __name__ == "__main__":
     unittest.main()

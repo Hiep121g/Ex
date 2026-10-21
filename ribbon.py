@@ -704,6 +704,12 @@ def _icon_sheet_op(cv, P, k, c, op):
         _sheet(cv, P, k, 1, 1, 12, 12)
         cv.create_line(*P(9.5, 9.5, 15.5, 15.5), fill=RED, width=max(2, round(1.8 * k)))
         cv.create_line(*P(15.5, 9.5, 9.5, 15.5), fill=RED, width=max(2, round(1.8 * k)))
+    elif op in ("hide", "unhide"):
+        _sheet(cv, P, k, 1, 1, 12, 12)
+        cv.create_oval(*P(7, 9, 15.5, 14.5), fill="#ffffff", outline=DARK)
+        cv.create_oval(*P(9.7, 10.2, 12.8, 13.3), fill=DARK, outline="")
+        if op == "hide":
+            cv.create_line(*P(7, 15.5, 15.5, 8), fill=RED, width=max(1, round(1.4 * k)))
     elif op == "tab_color":
         cv.create_polygon(*P(1, 4, 15, 4, 13.5, 11, 2.5, 11), fill="#ffffff", outline=GRAY)
         cv.create_rectangle(*P(2.5, 11, 13.5, 13.5), fill=c or "#ed7d31", outline="")
@@ -1025,7 +1031,7 @@ ICONS.update({f"{axis}_{kind}": (lambda axis, auto: lambda *a: _icon_size(*a, ax
 ICONS.update({f"{verb}_{axis}": (lambda axis, show: lambda *a: _icon_hide(*a, axis, show))(axis, verb == "unhide")
               for axis in ("row", "col") for verb in ("hide", "unhide")})
 ICONS.update({f"sheet_{op}": (lambda op: lambda *a: _icon_sheet_op(*a, op))(op)
-              for op in ("copy", "rename", "delete", "tab_color", "left", "right")})
+              for op in ("copy", "rename", "delete", "tab_color", "left", "right", "hide", "unhide")})
 ICONS.update({f"file_{kind}": (lambda kind: lambda *a: _icon_file(*a, kind))(kind)
               for kind in ("new", "open", "save_as", "exit")})
 ICONS.update({

@@ -204,6 +204,8 @@ THANH RIBBON
     có: sắp xếp (cả theo màu), lọc theo màu, Bộ lọc số / văn bản / ngày (lớn hơn, nằm giữa, có chứa, 10 mục
     đầu, trên trung bình, tháng này...), Bộ lọc tùy chỉnh (2 điều kiện Và/Hoặc, dùng * và ?) và danh sách
     giá trị có ô tìm kiếm. Thanh trạng thái cho biết số bản ghi tìm thấy.
+  • Trang chủ → Tìm và Chọn → Đi tới Đặc biệt: chọn ô trống, hằng số, công thức, ô có ghi chú... (ví dụ chọn
+    các ô trống rồi gõ giá trị và nhấn Ctrl+Enter để điền vào tất cả). Chuột phải vào tab để Ẩn / Bỏ ẩn trang tính.
   • Tên vùng: chọn vùng, gõ tên (ví dụ ĐơnGiá) vào ô Tên bên trái thanh công thức rồi Enter; sau đó dùng
     =SUM(ĐơnGiá). Công thức → Trình Quản lý Tên (Ctrl+F3) để sửa/xóa, Tạo từ Vùng chọn (Ctrl+Shift+F3) để đặt
     tên theo hàng tiêu đề. Chọn tên trong danh sách của ô Tên để nhảy tới vùng đó.
@@ -247,6 +249,9 @@ PHÍM TẮT
   Ctrl+mũi tên        Nhảy tới mép dữ liệu         Ctrl+Home / End   Về A1 / ô cuối
   Ctrl+N / O / S, F12 Mới / Mở / Lưu / Lưu thành   F9                Tính lại
   Ctrl+P              In / Xem trước khi in
+  Ctrl+PgUp / PgDn    Trang tính trước / sau       Alt+Enter         Xuống dòng trong ô
+  Ctrl+K              Chèn liên kết                Ctrl+F3           Trình Quản lý Tên
+  Ctrl+nhấp chuột     Chọn thêm vùng rời (định dạng, xóa, Ctrl+Enter cho tất cả các vùng)
 
 TỆP
   .xlsx mở được bằng Microsoft Excel (giữ công thức, định dạng, ô hợp nhất, định dạng có điều kiện,
@@ -312,6 +317,7 @@ class SpreadsheetApp:
         self.dirty = False
         self.top = self.left = 0       # first visible row / column
         self.cur = self.ext = (0, 0)   # active cell and the moving corner of the selection
+        self.areas = []                # more selected blocks (Ctrl+click, Go To Special), besides cur/ext
         self.views = {}                # sheet -> (top, left, cur, ext)
         self.undo_stack, self.redo_stack = [], []
         self.edit_serial = 0           # counts changes, for caches of derived data
@@ -757,7 +763,9 @@ class SpreadsheetApp:
             ("Tự động khớp chiều cao hàng", self.autofit_selected_rows), ("Độ rộng cột...", self.ask_column_width),
             ("Tự động khớp độ rộng cột", self.autofit_selected_columns), None,
             ("HIỂN THỊ", None), ("Ẩn & Bỏ ẩn", [("Ẩn hàng", self.hide_rows, "Ctrl+9"), ("Ẩn cột", self.hide_cols, "Ctrl+0"),
-                                                ("Bỏ ẩn hàng", self.unhide_rows), ("Bỏ ẩn cột", self.unhide_cols)]),
+                                                ("Ẩn trang tính", self.hide_sheet, "", "sheet_hide"), None,
+                                                ("Bỏ ẩn hàng", self.unhide_rows), ("Bỏ ẩn cột", self.unhide_cols),
+                                                ("Bỏ ẩn trang tính...", self.unhide_sheet, "", "sheet_unhide")]),
             None, ("SẮP XẾP TRANG TÍNH", None), ("Đổi tên trang tính", lambda: self.rename_sheet(self.sheet)),
             ("Sao chép trang tính", self.copy_sheet), ("Màu tab", tab_colors), None,
             ("Định dạng ô...", lambda: self.format_cells_dialog(), "Ctrl+1")])
@@ -787,7 +795,8 @@ class SpreadsheetApp:
                   tooltip="Sắp xếp và Lọc")
         self._btn(g, large=True, icon="find", text="Tìm và\nChọn", menu=self._make_menu([
             ("Tìm...", self.open_find, "Ctrl+F"), ("Thay thế...", lambda: self.open_find(True), "Ctrl+H"),
-            ("Đi tới...", self.focus_name_box, "Ctrl+G")]), tooltip="Tìm và Chọn")
+            ("Đi tới...", self.focus_name_box, "Ctrl+G"), ("Đi tới Đặc biệt...", self.go_to_special, "", "goto")]),
+                  tooltip="Tìm và Chọn")
         # labels dropped, level by level, when the window is too narrow for the whole tab
         level2 = [self.btn_wrap, self.btn_merge, self.btn_autosum, self.btn_fill_menu, self.btn_clear_menu]
         level3 = [w for w in self.btn_painter.master.winfo_children() if isinstance(w, RibbonButton)]
@@ -1147,6 +1156,7 @@ class SpreadsheetApp:
         self.fx.bind("<Tab>", lambda e: self._editor_commit(e, (0, 1)))
         self.fx.bind("<Control-Return>", lambda e: self._key_action(lambda: self.commit_edit(fill=True)))
         self.fx.bind("<Escape>", lambda e: self._key_action(self.cancel_edit))
+        self.fx.bind("<Alt-Return>", lambda e: self._key_action(lambda: self.fx.insert("insert", "\n")))
         self.fx.bind("<Key>", self._reset_point, add="+")
         self._formula_assist(self.fx)
         tk.Frame(self.root, bg=HEADER_LINE, height=1).pack(side="top", fill="x")
@@ -1543,6 +1553,7 @@ class SpreadsheetApp:
         vr1, vr2, vc1, vc2 = rows[0][0], rows[-1][0], cols[0][0], cols[-1][0]
         active = self._cell_box(*self.cur)
         multi = (r1, c1, r2, c2) != active
+        areas = [a for a in self.areas if a[0] <= vr2 and a[2] >= vr1 and a[1] <= vc2 and a[3] >= vc1]
 
         cf = {}
         if sh.cond_formats:
@@ -1558,6 +1569,8 @@ class SpreadsheetApp:
             bg = (style or {}).get("bg") or (fmt.get("bg") if fmt else None) or "#ffffff"
             inside = active[0] <= r <= active[2] and active[1] <= c <= active[3]
             if multi and r1 <= r <= r2 and c1 <= c <= c2 and not inside:
+                return self.tint(bg)
+            if areas and not inside and any(a[0] <= r <= a[2] and a[1] <= c <= a[3] for a in areas):
                 return self.tint(bg)
             return bg
 
@@ -1577,6 +1590,10 @@ class SpreadsheetApp:
         # backgrounds: selection tint, filled cells, the active cell left clear, data bars
         if multi:
             box = self._clip_box(self._rect_bbox(r1, c1, r2, c2), W, H)
+            if box:
+                cv.create_rectangle(*box, fill=self.tint("#ffffff"), outline="")
+        for area in areas:
+            box = self._clip_box(self._rect_bbox(*area), W, H)
             if box:
                 cv.create_rectangle(*box, fill=self.tint("#ffffff"), outline="")
         filled = {k for k in visible(formats) if formats[k].get("bg")} | {k for k, s in cf.items() if s.get("bg")}
@@ -1768,6 +1785,10 @@ class SpreadsheetApp:
             if box:
                 cv.create_rectangle(box[0] + 1, box[1] + 1, box[2] - 2, box[3] - 2, outline=ACCENT, dash=(5, 3),
                                     width=line)
+        for area in areas:
+            box = self._clip_box(self._rect_bbox(*area), W, H)
+            if box:
+                cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT)
         sel_box = self._rect_bbox(r1, c1, r2, c2)
         box = self._clip_box(sel_box, W, H)
         if box:
@@ -2215,6 +2236,8 @@ class SpreadsheetApp:
         for widget in self.tab_frame.winfo_children():
             widget.destroy()
         for name, sheet in self.wb.sheets.items():
+            if sheet.hidden:
+                continue
             active = name == self.sheet
             strip = sheet.tab_color or (ACCENT if active else SHEETBAR_BG)
             holder = tk.Frame(self.tab_frame, bg=strip)
@@ -2251,6 +2274,7 @@ class SpreadsheetApp:
         return r, c
 
     def select_to(self, target, extend=False):
+        self.areas = []
         if extend:
             self.ext = target
         else:
@@ -2263,6 +2287,7 @@ class SpreadsheetApp:
 
     def select_all(self):
         self.commit_edit()
+        self.areas = []
         self.cur, self.ext = (0, 0), (MAX_ROWS - 1, MAX_COLS - 1)
         self.refresh()
 
@@ -2306,6 +2331,8 @@ class SpreadsheetApp:
             self.move_active(-1 if shift else 1, 0)
         elif ks == "Tab":
             self.move_active(0, -1 if shift else 1)
+        elif ks in ("Prior", "Next") and ctrl:
+            self.step_sheet(-1 if ks == "Prior" else 1)
         elif ks in ("Prior", "Next"):
             n = self._visible_rows() * (-1 if ks == "Prior" else 1)
             self.top = max(0, min(MAX_ROWS - 1, self.top + n))
@@ -2388,6 +2415,10 @@ class SpreadsheetApp:
             self.drag = {"mode": "fill", "target": None}
             return None
         shift = bool(e.state & SHIFT)
+        if kind == "cell" and e.state & CONTROL and not shift and not self.painter:
+            self.areas.append(self.sel_rect())  # Ctrl+click: keep what is selected and start another block
+        elif not shift:
+            self.areas = []
         if kind == "corner":
             self.cur, self.ext = (0, 0), (MAX_ROWS - 1, MAX_COLS - 1)
             self.drag = None
@@ -2673,6 +2704,7 @@ class SpreadsheetApp:
         e.bind("<Control-Return>", lambda ev: self._key_action(lambda: self.commit_edit(fill=True)))
         e.bind("<Escape>", lambda ev: self._key_action(self.cancel_edit))
         e.bind("<Control-semicolon>", lambda ev: self._key_action(lambda: self.insert_now(False)))
+        e.bind("<Alt-Return>", lambda ev: self._key_action(lambda: e.insert("insert", "\n")))
         for key, d in (("Up", (-1, 0)), ("Down", (1, 0)), ("Left", (0, -1)), ("Right", (0, 1))):
             e.bind(f"<{key}>", lambda ev, d=d: self._editor_arrow(d))
         e.bind("<Key>", self._reset_point, add="+")
@@ -2772,11 +2804,11 @@ class SpreadsheetApp:
                 self.refresh()
                 return
             cs = ChangeSet(self.wb)
-            if fill and sheet == self.sheet:
-                for rr, cc in self._format_targets():
-                    cs.set(sheet, rr, cc, raw=fe.shift_formula(raw, rr - r, cc - c))
-            else:
-                cs.set(sheet, r, c, raw=raw)
+            targets = self._format_targets() if fill and sheet == self.sheet else [(r, c)]
+            for rr, cc in targets:
+                cs.set(sheet, rr, cc, raw=fe.shift_formula(raw, rr - r, cc - c))
+                if "\n" in raw and not fe.is_formula(raw):  # Alt+Enter line breaks turn on Wrap Text, as in Excel
+                    cs.set(sheet, rr, cc, fmt=dict(self.wb.get_format(sheet, rr, cc) or {}, wrap=True))
             self.commit(cs)
         if move:
             self.move_active(*move)
@@ -2924,6 +2956,7 @@ class SpreadsheetApp:
             return
         action = source.pop()
         self.edit_serial += 1
+        self.areas = []
         if action[0] == "cells":
             self._apply_changes(action[1], forward)
         else:
@@ -3034,12 +3067,17 @@ class SpreadsheetApp:
 
     def _format_targets(self):
         """Cells a formatting command applies to (huge selections clipped to the used/visible area)."""
-        r1, c1, r2, c2 = self.sel_rect()
-        if self._is_huge(r1, c1, r2, c2):
-            rows, cols = self.wb.used_extent(self.sheet)
-            r2 = min(r2, max(rows, self.top + self._visible_rows()) - 1)
-            c2 = min(c2, max(cols, self.left + len(self.vis_cols)) - 1)
-        return [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1)]
+        out, seen = [], set()
+        for r1, c1, r2, c2 in [self.sel_rect()] + self.areas:
+            if self._is_huge(r1, c1, r2, c2):
+                rows, cols = self.wb.used_extent(self.sheet)
+                r2 = min(r2, max(rows, self.top + self._visible_rows()) - 1)
+                c2 = min(c2, max(cols, self.left + len(self.vis_cols)) - 1)
+            for key in ((r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1)):
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+        return out
 
     @staticmethod
     def _tsv_field(text):
@@ -3049,6 +3087,10 @@ class SpreadsheetApp:
 
     def copy(self, cut=False):
         self.commit_edit()
+        if self.areas:
+            messagebox.showinfo(APP_NAME, "Không thể sao chép hoặc cắt nhiều vùng chọn rời nhau cùng lúc.",
+                                parent=self.root)
+            return
         r1, c1, r2, c2 = self._copy_rect()
         if r2 < r1 or c2 < c1:
             return
@@ -3606,12 +3648,12 @@ class SpreadsheetApp:
 
     def clear_contents(self):
         self.commit_edit()
-        r1, c1, r2, c2 = self.sel_rect()
-        if self._pivot_guard(r1, c1, r2, c2):
+        rects = [self.sel_rect()] + self.areas
+        if any(self._pivot_guard(*rect) for rect in rects):
             return
         cs = ChangeSet(self.wb)
         for r, c in list(self.sh.cells):
-            if r1 <= r <= r2 and c1 <= c <= c2:
+            if any(r1 <= r <= r2 and c1 <= c <= c2 for r1, c1, r2, c2 in rects):
                 cs.set(self.sheet, r, c, raw=None)
         self.commit(cs)
         self.refresh()
@@ -3906,6 +3948,32 @@ class SpreadsheetApp:
             r1, c1, r2, c2 = out["rect"]
             self.cur, self.ext = (r1, c1), (r2, c2)
             self.refresh()
+
+    def go_to_special(self):
+        """Select the cells of one kind (blanks, constants, formulas...) in the selection or the whole sheet."""
+        self.commit_edit()
+        found = dialogs.GoToSpecialDialog(self.root).show()
+        if not found:
+            return
+        kind, types = found
+        rect = self.sel_rect()
+        single = rect == self._cell_box(*self.cur) and not self.areas
+        if kind == "region":
+            r1, c1, r2, c2 = self.current_region(*self.cur)
+            self.areas, self.cur, self.ext = [], (r1, c1), (r2, c2)
+            self.refresh()
+            return
+        scope = (0, 0, MAX_ROWS - 1, MAX_COLS - 1) if single or kind == "last" else rect
+        cells = self.wb.special_cells(self.sheet, scope, kind, types)
+        if not cells:
+            messagebox.showinfo(APP_NAME, "Không tìm thấy ô nào.", parent=self.root)
+            return
+        rects = fe.cells_to_rects(cells)[:20000]
+        first = rects[0]
+        self.cur, self.ext, self.areas = (first[0], first[1]), (first[2], first[3]), rects[1:]
+        self.ensure_visible(*self.cur)
+        self.refresh()
+        self.set_mode(f"Đã chọn {len(cells)} ô ({len(rects)} vùng)")
 
     # sorting and filtering
     def current_region(self, r, c):
@@ -4826,6 +4894,7 @@ class SpreadsheetApp:
             self.views[self.sheet] = (self.top, self.left, self.cur, self.ext)
         self.sheet = name
         self.chart_sel = None
+        self.areas = []
         self.top, self.left, self.cur, self.ext = self.views.get(name, (0, 0, (0, 0), (0, 0)))
 
     def switch_sheet(self, name):
@@ -4889,6 +4958,34 @@ class SpreadsheetApp:
     def move_sheet(self, name, index):
         self._structural(lambda: self.wb.move_sheet(name, index))
 
+    def hide_sheet(self, name=None):
+        """Hide a sheet (its tab); the next visible sheet becomes active."""
+        name = name or self.sheet
+        visible = self.wb.visible_sheets()
+        if len(visible) <= 1:
+            messagebox.showinfo(APP_NAME, "Sổ làm việc phải có ít nhất một trang tính hiển thị.", parent=self.root)
+            return
+        i = visible.index(name)
+        fallback = visible[i + 1] if i + 1 < len(visible) else visible[i - 1]
+        if self._structural(lambda: self.wb.hide_sheet(name)) and self.sheet == name:
+            self.switch_sheet(fallback)
+
+    def unhide_sheet(self):
+        hidden = [n for n, sh in self.wb.sheets.items() if sh.hidden]
+        if not hidden:
+            self.root.bell()
+            return
+        name = dialogs.ChoiceDialog(self.root, "Bỏ ẩn trang tính", [(n, n) for n in hidden], hidden[0]).show()
+        if name and self._structural(lambda: self.wb.hide_sheet(name, False)):
+            self.switch_sheet(name)
+
+    def step_sheet(self, step):
+        """Ctrl+PgDn / Ctrl+PgUp: the next / previous visible sheet."""
+        visible = self.wb.visible_sheets()
+        i = visible.index(self.sheet) if self.sheet in visible else 0
+        if 0 <= i + step < len(visible):
+            self.switch_sheet(visible[i + step])
+
     def _tab_menu(self, e, name):
         self.switch_sheet(name)
         index = list(self.wb.sheets).index(name)
@@ -4900,6 +4997,10 @@ class SpreadsheetApp:
         menu.add_command(label="Sao chép trang tính", command=self.copy_sheet, **self._menu_image("Sao chép trang tính"))
         menu.add_cascade(label="Màu tab", menu=self._palette_menu(menu, self.set_tab_color, "Không màu"),
                          **self._menu_image("Màu tab"))
+        menu.add_command(label="Ẩn", command=lambda: self.hide_sheet(name), **self._menu_image("", "sheet_hide"),
+                         state="normal" if len(self.wb.visible_sheets()) > 1 else "disabled")
+        menu.add_command(label="Bỏ ẩn...", command=self.unhide_sheet, **self._menu_image("", "sheet_unhide"),
+                         state="normal" if len(self.wb.visible_sheets()) < len(self.wb.sheets) else "disabled")
         menu.add_separator()
         menu.add_command(label="Di chuyển sang trái", command=lambda: self.move_sheet(name, index - 1),
                          state="normal" if index > 0 else "disabled", **self._menu_image("Di chuyển sang trái"))
@@ -5257,7 +5358,7 @@ class SpreadsheetApp:
     def print_jobs(self, scope):
         """[(sheet, setup)] to print: the active sheet, every sheet, or the selection of the active sheet."""
         if scope == "book":
-            return [(name, printing.setup_of(sh)) for name, sh in self.wb.sheets.items()]
+            return [(name, printing.setup_of(sh)) for name, sh in self.wb.sheets.items() if not sh.hidden]
         setup = printing.setup_of(self.sh)
         if scope == "selection":
             setup = dict(setup, area=self.sel_rect())
@@ -5294,7 +5395,7 @@ class SpreadsheetApp:
 
     def _write_pdf(self, scope, path):
         selection = (self.sheet, self.sel_rect()) if scope == "selection" else None
-        sheets = list(self.wb.sheets) if scope == "book" else [self.sheet]
+        sheets = self.wb.visible_sheets() if scope == "book" else [self.sheet]
         return printing.export_pdf(self.wb, sheets, path, self.font_library, self.file_label(), selection)
 
     def export_pdf(self, scope="sheet", parent=None):
@@ -5439,13 +5540,14 @@ class SpreadsheetApp:
     def _load(self, wb, path):
         self._end_edit()
         self.wb = wb
-        self.sheet = wb.active or next(iter(wb.sheets))
+        self.sheet = wb.active if wb.active in wb.visible_sheets() else wb.visible_sheets()[0]
         self.views.clear()
         self.top = self.left = 0
         self.cur = self.ext = (0, 0)
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.clip = self.painter = None
+        self.areas = []
         self.breaks_shown.clear()
         self.path = path
         self.dirty = False

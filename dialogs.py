@@ -2057,3 +2057,44 @@ class HyperlinkDialog(Dialog):
         text = self.text.get().strip() or (target[1:] if target.startswith("#") else
                                            target[7:].split("?")[0] if kind == "mail" else target)
         return {"text": text, "target": target, "tip": self.tip.get().strip()}
+
+
+class GoToSpecialDialog(Dialog):
+    """Go To Special: which kind of cells to select. collect() gives (kind, value types)."""
+
+    KINDS = (("notes", "Ghi chú"), ("constants", "Hằng số"), ("formulas", "Công thức"), ("blanks", "Ô trống"),
+             ("region", "Vùng hiện tại"), ("last", "Ô cuối cùng"), ("visible", "Chỉ các ô hiển thị"),
+             ("cf", "Định dạng có điều kiện"), ("validation", "Xác thực dữ liệu"))
+    TYPES = (("number", "Số"), ("text", "Văn bản"), ("logical", "Lô-gic"), ("error", "Lỗi"))
+
+    def __init__(self, master):
+        super().__init__(master, "Đi tới Đặc biệt")
+        f = self.body
+        ttk.Label(f, text="Chọn:").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.kind = tk.StringVar(value="constants")
+        for i, (key, label) in enumerate(self.KINDS):
+            ttk.Radiobutton(f, text=label, value=key, variable=self.kind, command=self._sync).grid(
+                row=1 + i % 5, column=i // 5 * 2, sticky="w", padx=(0, 18), pady=1)
+        box = ttk.Frame(f)
+        box.grid(row=1, column=1, rowspan=4, sticky="nw", padx=(0, 18))
+        self.types = {}
+        for key, label in self.TYPES:
+            self.types[key] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(box, text=label, variable=self.types[key]).pack(anchor="w")
+        self.type_box = box
+        ttk.Label(f, text="Khi chỉ chọn một ô, PyExcel tìm trong cả trang tính.", foreground="#666").grid(
+            row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.add_buttons()
+        self._sync()
+
+    def _sync(self):
+        state = "normal" if self.kind.get() in ("constants", "formulas") else "disabled"
+        for child in self.type_box.winfo_children():
+            child.configure(state=state)
+
+    def collect(self):
+        types = tuple(k for k, v in self.types.items() if v.get())
+        if self.kind.get() in ("constants", "formulas") and not types:
+            self.bell()
+            return None
+        return self.kind.get(), types

@@ -157,10 +157,12 @@ save
 sheet
 sheet_copy
 sheet_delete
+sheet_hide
 sheet_left
 sheet_rename
 sheet_right
 sheet_tab_color
+sheet_unhide
 show_detail
 show_formulas
 shrink_font
