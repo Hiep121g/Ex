@@ -16,6 +16,7 @@ import tkinter.font as tkfont
 import unicodedata
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
+import charts
 import dialogs
 import formula_engine as fe
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
@@ -131,6 +132,8 @@ THANH RIBBON
   • Dữ liệu → Xác thực dữ liệu: giới hạn giá trị được nhập (số, ngày, độ dài) hoặc tạo danh sách thả xuống
     (nguồn  Có,Không  hoặc  =$A$1:$A$10). Nhấp mũi tên cạnh ô hoặc Alt+↓ để chọn.
   • Xem lại → Ghi chú mới (Shift+F2): ô có ghi chú có tam giác đỏ ở góc, rê chuột vào để xem.
+  • Chèn → Biểu đồ (Cột, Thanh, Đường, Tròn): chọn vùng dữ liệu kèm tiêu đề rồi bấm. Kéo để di chuyển, kéo
+    các nút ở viền để đổi kích thước, nhấp đúp để sửa dữ liệu/tiêu đề, Delete để xóa.
 
 NHẬP DỮ LIỆU
   • Chọn ô rồi gõ; Enter/Tab để xác nhận, Esc để hủy. F2 hoặc nhấp đúp để sửa.
@@ -221,6 +224,8 @@ class SpreadsheetApp:
         self.show_notes = False        # every note shown, not just the one under the pointer
         self.hover_note = None         # (sheet, row, col) of the note shown under the pointer
         self._list_button = None       # canvas box of the active cell's validation-list arrow
+        self.chart_sel = None          # index of the selected chart on this sheet
+        self._chart_boxes = []         # [(index, canvas box)] of the charts drawn
         self.last_fill, self.last_fg = "#ffff00", "#ff0000"
         self.border_style, self.border_color, self.last_border = "thin", "#000000", "bottom"
         self.vis_rows, self.vis_cols = [], []
@@ -680,6 +685,11 @@ class SpreadsheetApp:
         col = g.column()
         self._btn(g, col, side="top", icon="sheet", text="Chèn trang tính", command=self.add_sheet)
         self._btn(g, col, side="top", icon="copy", text="Sao chép trang tính", command=self.copy_sheet)
+        g = rb.group(page, "Biểu đồ")
+        for kind, text in (("column", "Cột"), ("bar", "Thanh"), ("line", "Đường"), ("pie", "Tròn")):
+            self._btn(g, large=True, icon="chart_" + kind, text=f"{text}\n", label=f"Biểu đồ {text.lower()}",
+                      command=lambda k=kind: self.insert_chart(k),
+                      tooltip=f"Chèn biểu đồ {text.lower()}\nVẽ từ vùng dữ liệu đang chọn")
         g = rb.group(page, "Hàm")
         self._btn(g, large=True, icon="function", text="Chèn\nhàm", command=self.insert_function_dialog,
                   tooltip="Chèn hàm (Shift+F3)")
@@ -968,6 +978,10 @@ class SpreadsheetApp:
                          ("Sắp xếp từ Z đến A", lambda: self.sort_selection(True)),
                          ("Sắp xếp tùy chỉnh...", self.custom_sort)]), None,
             ("Định dạng ô...", lambda: self.format_cells_dialog(), "Ctrl+1")])
+        self.chart_menu = self._make_menu([
+            ("Đổi kiểu biểu đồ", [(f"Biểu đồ {label.lower()}", lambda k=kind: self.set_chart_type(k))
+                                  for kind, label in dialogs.CHART_KINDS]),
+            ("Dữ liệu và tiêu đề biểu đồ...", self.edit_chart), None, ("Xóa biểu đồ", self.delete_chart)])
         common = [("Cắt", self.cut), ("Sao chép", self.copy), ("Dán", self.paste), None]
         self.row_menu = self._make_menu(common + [
             ("Chèn", self.insert_rows), ("Xóa", self.delete_rows), ("Xóa nội dung", self.clear_contents), None,
@@ -1505,6 +1519,7 @@ class SpreadsheetApp:
             box = self._clip_box(self._rect_bbox(*self.drag["target"]), W, H)
             if box:
                 cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline="#555555", dash=(4, 3))
+        self._draw_charts(cv, W, H)
         px, py = self.pane_origin()
         if fr1 > fr0:
             cv.create_line(hw, py - 1, right, py - 1, fill=FREEZE_LINE)
@@ -1513,6 +1528,104 @@ class SpreadsheetApp:
         self._draw_headers(cv, W, H, (r1, c1, r2, c2), sel_box)
         self._draw_cell_extras(cv, W, H, col_pos, row_pos)
         self._place_editor()
+
+    def _sheet_x(self, c):
+        """Canvas x of column c's left edge, also when scrolled out of view (col_x clamps those)."""
+        c0, c1 = self.frozen()[2:]
+        if c0 <= c < c1:
+            return self.col_x(c)
+        x = self.pane_origin()[0]
+        if c >= self.left:
+            return x + sum(self.col_w(k) for k in range(self.left, c))
+        return x - sum(self.col_w(k) for k in range(c, self.left))
+
+    def _sheet_y(self, r):
+        """Canvas y of row r's top edge, like _sheet_x (rows far off screen are estimated)."""
+        r0, r1 = self.frozen()[:2]
+        if r0 <= r < r1:
+            return self.row_y(r)
+        y, far = self.pane_origin()[1], self.canvas.winfo_height() + 4000
+        step, rows = (1, range(self.top, r)) if r >= self.top else (-1, range(self.top - 1, r - 1, -1))
+        for n, k in enumerate(rows):
+            y += step * self.row_h(k)
+            if abs(y) > far:
+                return y + step * (len(rows) - n - 1) * self.default_row_px
+        return y
+
+    def _chart_box(self, chart):
+        r, c, dx, dy = chart["anchor"]
+        x, y = self._sheet_x(c) + dx * self.px, self._sheet_y(r) + dy * self.px
+        return x, y, x + chart["size"][0] * self.px, y + chart["size"][1] * self.px
+
+    def _draw_charts(self, cv, W, H):
+        self._chart_boxes = []
+        if self.chart_sel is not None and self.chart_sel >= len(self.sh.charts):
+            self.chart_sel = None
+        for i, chart in enumerate(self.sh.charts):
+            box = self._chart_box(chart)
+            if box[2] < self.header_w or box[0] > W or box[3] < self.header_h or box[1] > H:
+                continue
+            labels, series = self.wb.chart_data(self.sheet, chart)
+            charts.draw_chart(cv, box, chart["type"], chart.get("title"), labels, series,
+                              self.font_for({"size": 14}), self.font_for({"size": 9}), self.px)
+            self._chart_boxes.append((i, box))
+            if i == self.chart_sel:
+                x0, y0, x1, y1 = box
+                cv.create_rectangle(x0, y0, x1, y1, outline="#7a7a7a", width=max(1, round(self.px)))
+                s = max(3, round(4 * self.px))
+                for hx, hy in self._chart_handles(box).values():
+                    cv.create_rectangle(hx - s, hy - s, hx + s, hy + s, fill="#ffffff", outline="#5f5f5f")
+
+    @staticmethod
+    def _chart_handles(box):
+        """Resize handles of a chart box: {edges moved ("l", "rb", ...): (x, y)}."""
+        x0, y0, x1, y1 = box
+        xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+        return {"lt": (x0, y0), "t": (xm, y0), "rt": (x1, y0), "r": (x1, ym), "rb": (x1, y1), "b": (xm, y1),
+                "lb": (x0, y1), "l": (x0, ym)}
+
+    def _chart_at(self, x, y):
+        """(index, box, handle or None) of the topmost chart under a canvas point, or None."""
+        tolerance = max(4, 6 * self.px)
+        for i, box in reversed(self._chart_boxes):
+            if i == self.chart_sel:
+                for edges, (hx, hy) in self._chart_handles(box).items():
+                    if abs(x - hx) <= tolerance and abs(y - hy) <= tolerance:
+                        return i, box, edges
+            if self._inside(box, x, y):
+                return i, box, None
+        return None
+
+    def _place_chart(self, index, box):
+        """Re-anchor chart `index` so that it covers canvas box (x0, y0, x1, y1)."""
+        x0, y0, x1, y1 = box
+        r, c = self.row_at(y0), self.col_at(x0)
+        self.sh.charts[index] = dict(self.sh.charts[index], anchor=(
+            r, c, max(0, round((x0 - self._sheet_x(c)) / self.px)), max(0, round((y0 - self._sheet_y(r)) / self.px))),
+            size=(round((x1 - x0) / self.px), round((y1 - y0) / self.px)))
+
+    def _drag_chart(self, x, y):
+        d = self.drag
+        dx, dy = x - d["start"][0], y - d["start"][1]
+        x0, y0, x1, y1 = d["box"]
+        least = 60 * self.px
+        if d["edges"] is None:
+            x0, x1 = x0 + dx, x1 + dx
+            y0, y1 = y0 + dy, y1 + dy
+            push = max(0, self.header_w - x0), max(0, self.header_h - y0)  # keep it off the headers
+            x0, x1, y0, y1 = x0 + push[0], x1 + push[0], y0 + push[1], y1 + push[1]
+        else:
+            edges = d["edges"]
+            if "l" in edges:
+                x0 = max(self.header_w, min(x0 + dx, x1 - least))
+            if "r" in edges:
+                x1 = max(x1 + dx, x0 + least)
+            if "t" in edges:
+                y0 = max(self.header_h, min(y0 + dy, y1 - least))
+            if "b" in edges:
+                y1 = max(y1 + dy, y0 + least)
+        self._place_chart(d["index"], (x0, y0, x1, y1))
+        self.redraw()
 
     def _draw_cell_extras(self, cv, W, H, col_pos, row_pos):
         """The validation-list arrow and input message of the active cell, and note callouts."""
@@ -1811,6 +1924,14 @@ class SpreadsheetApp:
 
     def on_key(self, e):
         ks = e.keysym
+        if self.chart_sel is not None and ks not in MODIFIER_KEYS:
+            if ks in ("Delete", "BackSpace"):
+                self.delete_chart()
+                return "break"
+            self.chart_sel = None  # any other key goes back to the cells
+            self.redraw()
+            if ks == "Escape":
+                return "break"
         shift, ctrl = bool(e.state & SHIFT), bool(e.state & CONTROL)
         arrows = {"Up": (-1, 0), "Down": (1, 0), "Left": (0, -1), "Right": (0, 1)}
         base = self.ext if shift else self.cur
@@ -1862,6 +1983,19 @@ class SpreadsheetApp:
         if self._list_button and self._inside(self._list_button, e.x, e.y):
             self.open_validation_list()
             return "break"
+        hit = self._chart_at(e.x, e.y)
+        if hit is not None and not self._point_mode_ok():
+            self.commit_edit()
+            self.canvas.focus_set()
+            index, box, edges = hit
+            self.chart_sel = index
+            self.drag = {"mode": "chart", "index": index, "box": box, "edges": edges, "start": (e.x, e.y),
+                         "before": self.wb.snapshot(), "sel": self._sel_state()}
+            self.redraw()
+            return "break"
+        if self.chart_sel is not None:
+            self.chart_sel = None
+            self.redraw()
         for bx0, by0, bx1, by1, col in self._filter_buttons:
             if bx0 <= e.x <= bx1 and by0 <= e.y <= by1:
                 self.commit_edit()
@@ -1911,12 +2045,15 @@ class SpreadsheetApp:
         self._drag_to(e.x, e.y)
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
         outside = e.x < self.header_w or e.y < self.header_h or e.x > W or e.y > H
-        if outside and self._autoscroll_job is None and not self.drag["mode"].startswith("resize"):
+        if outside and self._autoscroll_job is None and not self.drag["mode"].startswith(("resize", "chart")):
             self._autoscroll_job = self.root.after(50, self._autoscroll)
 
     def _drag_to(self, x, y):
         d = self.drag
         mode = d["mode"]
+        if mode == "chart":
+            self._drag_chart(x, y)
+            return
         if mode.startswith("resize"):
             pos = x if mode == "resize_col" else y
             size = max(0, round((d["size"] + pos - d["start"]) / self.px))
@@ -1976,11 +2113,18 @@ class SpreadsheetApp:
             if d["mode"] == "resize_col":
                 self.autofit_wrapped_rows(d["index"])
             self._push_snapshot(d["before"], d["sel"])
+        elif d["mode"] == "chart":
+            self._push_snapshot(d["before"], d["sel"])
+            self.redraw()
+            return
         elif d["mode"] in ("select", "colsel", "rowsel") and self.painter:
             self._apply_painter()
         self.refresh()
 
     def on_double(self, e):
+        if self._chart_at(e.x, e.y) is not None:
+            self.edit_chart()
+            return "break"
         border = self._border_hit(e.x, e.y)
         if border is not None:
             if border[0] == "col":
@@ -2008,9 +2152,14 @@ class SpreadsheetApp:
             return
         kind, r, c = self.hit(e.x, e.y)
         anchor = self._anchor((r, c)) if kind == "cell" else None
-        self._set_hover_note((self.sheet, *anchor) if anchor in self.sh.notes else None)
+        chart = self._chart_at(e.x, e.y)
+        self._set_hover_note((self.sheet, *anchor) if anchor in self.sh.notes and not chart else None)
         border = self._border_hit(e.x, e.y)
-        if border is not None:
+        if chart is not None:
+            cursor = {None: "fleur", "l": "sb_h_double_arrow", "r": "sb_h_double_arrow", "t": "sb_v_double_arrow",
+                      "b": "sb_v_double_arrow", "lt": "top_left_corner", "rb": "bottom_right_corner",
+                      "rt": "top_right_corner", "lb": "bottom_left_corner"}[chart[2]]
+        elif border is not None:
             cursor = "sb_h_double_arrow" if border[0] == "col" else "sb_v_double_arrow"
         elif any(b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3] for b in self._filter_buttons) or (
                 self._list_button and self._inside(self._list_button, e.x, e.y)):
@@ -2059,6 +2208,16 @@ class SpreadsheetApp:
     def on_context(self, e):
         self.commit_edit()
         self.canvas.focus_set()
+        hit = self._chart_at(e.x, e.y)
+        if hit is not None:
+            self.chart_sel = hit[0]
+            self.redraw()
+            try:
+                self.chart_menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                self.chart_menu.grab_release()
+            return
+        self.chart_sel = None
         kind, r, c = self.hit(e.x, e.y)
         r1, c1, r2, c2 = self.sel_rect()
         menu = self.cell_menu
@@ -3374,6 +3533,54 @@ class SpreadsheetApp:
 
     # ------------------------------------------------------------------ rows, columns, cells, sheets
 
+    # ------------------------------------------------------------------ charts
+
+    def insert_chart(self, kind):
+        """Chart of the selected cells (or the data around the active cell), placed right of the data."""
+        self.commit_edit()
+        rect = self.sel_rect()
+        if rect == self._cell_box(*self.cur):
+            rect = self.current_region(*self.cur) if self.cur in self.sh.cells else None
+        elif self._is_huge(*rect):
+            rows, cols = self.wb.used_extent(self.sheet)
+            rect = (rect[0], rect[1], min(rect[2], rows - 1), min(rect[3], cols - 1))
+        if rect is None or rect[2] < rect[0] or rect[3] < rect[1] or not self.wb.chart_data(
+                self.sheet, {"range": rect})[1]:
+            messagebox.showinfo(APP_NAME, "Hãy chọn vùng dữ liệu (có thể kèm hàng/cột tiêu đề) để vẽ biểu đồ.",
+                                parent=self.root)
+            return
+        chart = {"type": kind, "range": rect, "title": "", "anchor": (rect[0], min(rect[3] + 2, MAX_COLS - 1), 0, 0),
+                 "size": fe.CHART_SIZE}
+        if self._structural(lambda: self.sh.charts.append(chart)):
+            self.chart_sel = len(self.sh.charts) - 1
+            r, c = chart["anchor"][:2]
+            self.ensure_visible(r, c)
+            self.refresh_view()
+
+    def _update_chart(self, **changes):
+        index = self.chart_sel
+
+        def change():
+            self.sh.charts[index] = dict(self.sh.charts[index], **changes)
+        self._structural(change)
+        self.chart_sel = index
+        self.redraw()
+
+    def edit_chart(self):
+        if self.chart_sel is not None:
+            result = dialogs.ChartDialog(self.root, self.sh.charts[self.chart_sel]).show()
+            if result:
+                self._update_chart(**result)
+
+    def set_chart_type(self, kind):
+        if self.chart_sel is not None:
+            self._update_chart(type=kind)
+
+    def delete_chart(self):
+        if self.chart_sel is not None:
+            index, self.chart_sel = self.chart_sel, None
+            self._structural(lambda: self.sh.charts.pop(index))
+
     # ------------------------------------------------------------------ data validation and notes
 
     def _validation_target(self):
@@ -3607,6 +3814,7 @@ class SpreadsheetApp:
         if self.sheet in self.wb.sheets:
             self.views[self.sheet] = (self.top, self.left, self.cur, self.ext)
         self.sheet = name
+        self.chart_sel = None
         self.top, self.left, self.cur, self.ext = self.views.get(name, (0, 0, (0, 0), (0, 0)))
 
     def switch_sheet(self, name):

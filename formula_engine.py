@@ -2319,16 +2319,21 @@ def _f_minifs(min_rng, *pairs):
 
 # ------------------------------------------------------------------ workbook
 
+CHART_TYPES = ("column", "bar", "line", "pie")
+CHART_SIZE = (480, 288)  # Excel's default 5 x 3 inches
 VALIDATION_TYPES = ("any", "whole", "decimal", "list", "date", "length", "custom")
 VALIDATION_OPS = ("between", "notbetween", "=", "<>", ">", "<", ">=", "<=")
 
 
-def _shift_freeze(freeze, axis, move_span):
-    """Frozen panes after rows (axis 0) or columns (axis 1) were inserted or deleted."""
+def _shift_freeze(freeze, axis, at, move_span):
+    """Frozen panes after rows (axis 0) or columns (axis 1) were inserted or deleted at `at`."""
     a0, a1 = freeze[0:2] if axis == 0 else freeze[2:4]
     if a1 > a0:
         span = move_span(a0, a1 - 1)
-        a0, a1 = (span[0], span[1] + 1) if span else (0, 0)
+        if span is None:
+            a0 = a1 = 0
+        else:  # lines inserted right at the top of the frozen block join it, as in Excel
+            a0, a1 = (a0 if at == a0 < span[0] else span[0]), span[1] + 1
     elif a0:
         span = move_span(a0, a0)
         a0 = a1 = span[0] if span else 0
@@ -2340,7 +2345,8 @@ class Sheet:
     """One worksheet. Format dicts are never mutated in place, only replaced."""
 
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
-              "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes")
+              "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
+              "charts")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2361,6 +2367,8 @@ class Sheet:
         self.freeze = None      # (r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 stay put when scrolling
         self.validations = []   # [{"range": (r1, c1, r2, c2), "type": ..., ...}] - later rules win, see VALIDATION_TYPES
         self.notes = {}         # (row, col) -> note text
+        self.charts = []        # [{"type": CHART_TYPES[i], "range": (r1, c1, r2, c2), "title": str,
+                                #   "anchor": (row, col, dx, dy), "size": (w, h)}] - offsets and size in pixels at 96 DPI
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -2828,6 +2836,49 @@ class Workbook:
             return (min(a, b) <= x <= max(a, b)) == (op == "between")
         return _CMP_OPS[op](x, a)
 
+    # charts
+    def chart_layout(self, sheet, chart):
+        """How a chart reads its range, like Excel: series run down the columns of a block at least as
+        tall as it is wide (else along its rows); a first row/column holding text gives the series names /
+        category labels. Returns (rect clipped to the data, by_cols, has_names, has_categories)."""
+        r1, c1, r2, c2 = chart["range"]
+        rows, cols = self.used_extent(sheet)
+        r2, c2 = min(r2, max(r1, rows - 1)), min(c2, max(c1, cols - 1))
+        by_cols = r2 - r1 >= c2 - c1
+        along, across = (r2 - r1 + 1, c2 - c1 + 1) if by_cols else (c2 - c1 + 1, r2 - r1 + 1)
+
+        def value(i, j):
+            return self.get_value(sheet, *((r1 + i, c1 + j) if by_cols else (r1 + j, c1 + i)))
+
+        def is_text(v):
+            return isinstance(v, str) and v != ""
+
+        names = along > 1 and any(is_text(value(0, j)) for j in range(across))
+        first = 1 if names else 0
+        cats = across > 1 and (any(is_text(value(i, 0)) for i in range(first, along))
+                               or (names and value(0, 0) in (None, "")))
+        return (r1, c1, r2, c2), by_cols, names, cats
+
+    def chart_data(self, sheet, chart):
+        """(category labels, [(series name, [number or None])]) plotted by a chart."""
+        (r1, c1, r2, c2), by_cols, names, cats = self.chart_layout(sheet, chart)
+        along, across = (r2 - r1 + 1, c2 - c1 + 1) if by_cols else (c2 - c1 + 1, r2 - r1 + 1)
+        along, across = min(along, 1000), min(across, 50)
+
+        def pos(i, j):
+            return (r1 + i, c1 + j) if by_cols else (r1 + j, c1 + i)
+
+        first = 1 if names else 0
+        labels = ([self.display_text(sheet, *pos(i, 0)) for i in range(first, along)] if cats
+                  else [str(k + 1) for k in range(along - first)])
+        series = []
+        for j in range(1 if cats else 0, across):
+            name = self.display_text(sheet, *pos(0, j)) if names else f"Chuỗi {len(series) + 1}"
+            values = [self.get_value(sheet, *pos(i, j)) for i in range(first, along)]
+            series.append((name, [float(v) if is_number(v) else None for v in values]))
+        numeric = [item for item in series if any(v is not None for v in item[1])]
+        return labels, numeric or series  # a text column in the middle of the data is not a series
+
     # filtering
     def filter_values(self, sheet, col):
         """Distinct display texts in a filter column (data rows only), sorted like Excel."""
@@ -2941,6 +2992,18 @@ class Workbook:
                            if (rect := move_rect(rule["range"])) is not None]
         sh.validations = [dict(rule, range=rect) for rule in sh.validations
                           if (rect := move_rect(rule["range"])) is not None]
+        charts = []
+        for chart in sh.charts:
+            rect = move_rect(chart["range"])
+            if rect is None:  # its data is gone
+                continue
+            r, c, dx, dy = chart["anchor"]
+            if band is None:  # charts sit on whole rows/columns: they move when those do
+                n = move(r if axis == 0 else c)
+                n = min(at, limit - 1) if n is None else n
+                r, c = (n, c) if axis == 0 else (r, n)
+            charts.append(dict(chart, range=rect, anchor=(r, c, dx, dy)))
+        sh.charts = charts
         if sh.filter:
             rect = move_rect(sh.filter["range"])
             if rect is None:
@@ -2953,7 +3016,7 @@ class Workbook:
                     sh.filter["criteria"] = {n: v for c, v in sh.filter["criteria"].items()
                                              if (n := move(c)) is not None}
         if band is None and sh.freeze:
-            sh.freeze = _shift_freeze(sh.freeze, axis, move_span)
+            sh.freeze = _shift_freeze(sh.freeze, axis, at, move_span)
         if band is None and axis == 0:
             sh.row_heights = {n: h for r, h in sh.row_heights.items() if (n := move(r)) is not None}
             sh.custom_rows, sh.hidden_rows = move_set(sh.custom_rows), move_set(sh.hidden_rows)
@@ -2993,6 +3056,9 @@ class Workbook:
                 d["validations"] = [dict(rule, range=range_name(*rule["range"])) for rule in s.validations]
             if s.notes:
                 d["notes"] = {cell_name(r, c): text for (r, c), text in sorted(s.notes.items())}
+            if s.charts:
+                d["charts"] = [dict(ch, range=range_name(*ch["range"]), anchor=list(ch["anchor"]),
+                                    size=list(ch["size"])) for ch in s.charts]
             if s.filter:
                 d["filter"] = {"range": range_name(*s.filter["range"]),
                                "criteria": {col_name(c): sorted(v) for c, v in s.filter["criteria"].items()}}
@@ -3035,6 +3101,11 @@ class Workbook:
                 pos = parse_address(addr)
                 if pos and len(pos) == 2 and text:
                     sh.notes[pos] = str(text)
+            for ch in sd.get("charts", []):
+                rect = parse_range(ch.get("range", ""))
+                if rect and ch.get("type") in CHART_TYPES:
+                    sh.charts.append(dict(ch, range=rect, anchor=tuple(ch.get("anchor", (0, 0, 0, 0))),
+                                          size=tuple(ch.get("size", CHART_SIZE))))
             f = sd.get("filter")
             if f and parse_range(f.get("range", "")):
                 sh.filter = {"range": parse_range(f["range"]), "hidden": set(),
@@ -3328,6 +3399,89 @@ def _xl_validation(rule):
     return dv
 
 
+_EMU_PER_PX = 9525
+
+
+def _charts_from_xlsx(ws, sh):
+    """Charts whose series all come from their own sheet, each as one block of cells (approximately
+    the bounding box of its series names, values and categories)."""
+    charts = []
+    for xl in getattr(ws, "_charts", []):
+        kind = {"BarChart": "bar" if getattr(xl, "barDir", "col") == "bar" else "column", "LineChart": "line",
+                "PieChart": "pie"}.get(type(xl).__name__)
+        refs = []
+        for ser in xl.series:
+            for holder in (ser.tx, ser.val, ser.cat):
+                ref = holder and (getattr(holder, "strRef", None) or getattr(holder, "numRef", None))
+                if ref is not None and ref.f:
+                    refs.append(ref.f)
+        rects = []
+        for f in refs:
+            sheet_part, _, addr = f.rpartition("!")
+            sheet_name = sheet_part[1:-1].replace("''", "'") if sheet_part.startswith("'") else sheet_part
+            rect = parse_range(addr.replace("$", ""))
+            if rect is None or (sheet_name and sheet_name != ws.title):
+                rects = []
+                break
+            rects.append(rect)
+        if kind is None or not rects:
+            continue
+        anchor = xl.anchor
+        start = getattr(anchor, "_from", None)
+        if start is None:
+            continue
+        ext, end = getattr(anchor, "ext", None), getattr(anchor, "to", None)
+        if ext is not None and ext.width:
+            size = (round(ext.width / _EMU_PER_PX), round(ext.height / _EMU_PER_PX))
+        elif end is not None:
+            size = (sum(sh.col_widths.get(c, DEFAULT_COL_WIDTH) for c in range(start.col, end.col))
+                    + round((end.colOff - start.colOff) / _EMU_PER_PX),
+                    sum(sh.row_heights.get(r, DEFAULT_ROW_HEIGHT) for r in range(start.row, end.row))
+                    + round((end.rowOff - start.rowOff) / _EMU_PER_PX))
+        else:
+            size = CHART_SIZE
+        title = ""
+        rich = xl.title and xl.title.tx and xl.title.tx.rich
+        if rich:
+            title = "\n".join("".join(run.t or "" for run in (p.r or [])) for p in rich.p).strip()
+        charts.append({"type": kind, "title": title,
+                       "range": (min(r[0] for r in rects), min(r[1] for r in rects),
+                                 max(r[2] for r in rects), max(r[3] for r in rects)),
+                       "anchor": (start.row, start.col, round(start.colOff / _EMU_PER_PX),
+                                  round(start.rowOff / _EMU_PER_PX)),
+                       "size": (max(60, size[0]), max(40, size[1]))})
+    return charts
+
+
+def _xl_chart(wb, sheet, ws, chart):
+    from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+    from openpyxl.drawing.xdr import XDRPositiveSize2D
+
+    (r1, c1, r2, c2), by_cols, names, cats = wb.chart_layout(sheet, chart)
+    names, cats = int(names), int(cats)  # how many header lines to skip
+    kind = chart["type"]
+    xl = PieChart() if kind == "pie" else LineChart() if kind == "line" else BarChart()
+    if kind in ("column", "bar"):
+        xl.type = "col" if kind == "column" else "bar"
+    if by_cols:
+        data = Reference(ws, min_col=c1 + 1 + cats, min_row=r1 + 1, max_col=c2 + 1, max_row=r2 + 1)
+        labels = Reference(ws, min_col=c1 + 1, min_row=r1 + 1 + names, max_row=r2 + 1) if cats else None
+    else:
+        data = Reference(ws, min_col=c1 + 1, min_row=r1 + 1 + cats, max_col=c2 + 1, max_row=r2 + 1)
+        labels = Reference(ws, min_col=c1 + 1 + names, max_col=c2 + 1, min_row=r1 + 1) if cats else None
+    xl.add_data(data, titles_from_data=bool(names), from_rows=not by_cols)
+    if labels is not None:
+        xl.set_categories(labels)
+    if chart.get("title"):
+        xl.title = chart["title"]
+    r, c, dx, dy = chart["anchor"]
+    w, h = chart["size"]
+    xl.anchor = OneCellAnchor(_from=AnchorMarker(col=c, colOff=dx * _EMU_PER_PX, row=r, rowOff=dy * _EMU_PER_PX),
+                              ext=XDRPositiveSize2D(w * _EMU_PER_PX, h * _EMU_PER_PX))
+    return xl
+
+
 def _freeze_from_xlsx(ws):
     view = ws.sheet_view
     pane = view.pane
@@ -3386,6 +3540,7 @@ def _load_xlsx(path):
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
         sh.freeze = _freeze_from_xlsx(ws)
         sh.validations = _validations_from_xlsx(ws)
+        sh.charts = _charts_from_xlsx(ws, sh)
         rules = []
         for cf in ws.conditional_formatting:
             for xl_rule in cf.rules:
@@ -3572,6 +3727,8 @@ def _save_xlsx(wb, path, active=None):
         for rule in sh.validations:
             if rule.get("type", "any") != "any":
                 ws.add_data_validation(_xl_validation(rule))
+        for chart in sh.charts:
+            ws.add_chart(_xl_chart(wb, sh.name, ws, chart))
         for rule in reversed(sh.cond_formats):  # Excel: the first rule added gets the top priority
             xl_rule = _xl_cf_rule(rule)
             if xl_rule is not None:

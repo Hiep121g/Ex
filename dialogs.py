@@ -1172,3 +1172,39 @@ class ListPopup:
         self.pop.close()
         if sel:
             self.on_pick(self.items[sel[0]])
+
+
+CHART_KINDS = [("column", "Cột"), ("bar", "Thanh"), ("line", "Đường"), ("pie", "Tròn")]
+
+
+class ChartDialog(Dialog):
+    """Type, data range and title of a chart; collect() returns them as a dict."""
+
+    def __init__(self, master, chart):
+        super().__init__(master, "Biểu đồ")
+        f = self.body
+        ttk.Label(f, text="Kiểu biểu đồ:").grid(row=0, column=0, sticky="w", pady=3)
+        self.kind = tk.StringVar(value=dict(CHART_KINDS)[chart["type"]])
+        ttk.Combobox(f, values=[label for _, label in CHART_KINDS], textvariable=self.kind, state="readonly",
+                     width=12).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Vùng dữ liệu:").grid(row=1, column=0, sticky="w", pady=3)
+        self.range_var = tk.StringVar(value=fe.range_name(*chart["range"]))
+        self.range_entry = ttk.Entry(f, textvariable=self.range_var, width=30)
+        self.range_entry.grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Tiêu đề:").grid(row=2, column=0, sticky="w", pady=3)
+        self.title_var = tk.StringVar(value=chart.get("title", ""))
+        ttk.Entry(f, textvariable=self.title_var, width=30).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Để trống tiêu đề: biểu đồ một chuỗi lấy tên chuỗi làm tiêu đề.",
+                  foreground="#666").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.range_entry)
+
+    def collect(self):
+        rect = fe.parse_range(self.range_var.get().replace("$", "").strip())
+        if rect is None:
+            self.bell()
+            return None
+        return {"type": next(k for k, label in CHART_KINDS if label == self.kind.get()), "range": rect,
+                "title": self.title_var.get().strip()}

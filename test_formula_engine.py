@@ -487,6 +487,10 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(sh.freeze, (0, 3, 0, 1))
         wb.insert_rows("Sheet1", 5)        # below them: no change
         self.assertEqual(sh.freeze, (0, 3, 0, 1))
+        wb.insert_rows("Sheet1", 0)        # at the very top: the new row is frozen too
+        self.assertEqual(sh.freeze, (0, 4, 0, 1))
+        wb.delete_rows("Sheet1", 0)
+        self.assertEqual(sh.freeze, (0, 3, 0, 1))
         wb.delete_cols("Sheet1", 0)        # the only frozen column is gone
         self.assertEqual(sh.freeze, (0, 3, 0, 0))
         wb.delete_rows("Sheet1", 0, 3)
@@ -654,6 +658,65 @@ class ValidationTests(unittest.TestCase):
     @unittest.skipUnless(fe.HAS_XLSX, "openpyxl not installed")
     def test_xlsx_roundtrip(self):
         self.roundtrip(".xlsx")
+
+
+class ChartTests(unittest.TestCase):
+    def setUp(self):
+        self.wb = make({"A1": "Tháng", "B1": "Doanh thu", "C1": "Chi phí",
+                        "A2": "T1", "B2": "10", "C2": "7", "A3": "T2", "B3": "14", "C3": "x", "A4": "T3", "B4": "9"})
+        self.chart = {"type": "column", "range": (0, 0, 3, 2), "title": "Kết quả", "anchor": (1, 4, 5, 3),
+                      "size": (400, 250)}
+
+    def test_series_in_columns_with_names_and_categories(self):
+        labels, series = self.wb.chart_data("Sheet1", self.chart)
+        self.assertEqual(labels, ["T1", "T2", "T3"])
+        self.assertEqual(series, [("Doanh thu", [10, 14, 9]), ("Chi phí", [7, None, None])])
+
+    def test_series_in_rows_and_plain_numbers(self):
+        wb = make({"A1": "", "B1": "2024", "C1": "2025", "D1": "2026", "A2": "Bắc", "B2": "1", "C2": "2", "D2": "3"})
+        labels, series = wb.chart_data("Sheet1", {"range": (0, 0, 1, 3)})
+        self.assertEqual((labels, series), (["2024", "2025", "2026"], [("Bắc", [1, 2, 3])]))
+        wb = make({"A1": "Tên", "B1": "Nhóm", "C1": "Điểm", "A2": "An", "B2": "x", "C2": "7",
+                   "A3": "Bình", "B3": "y", "C3": "9"})
+        self.assertEqual(wb.chart_data("Sheet1", {"range": (0, 0, 2, 2)}), (["An", "Bình"], [("Điểm", [7, 9])]))
+        wb = make({"A1": "5", "A2": "6", "B1": "7", "B2": "8", "B3": "9"})
+        labels, series = wb.chart_data("Sheet1", {"range": (0, 0, 2, 1)})
+        self.assertEqual((labels, series), (["1", "2", "3"], [("Chuỗi 1", [5, 6, None]), ("Chuỗi 2", [7, 8, 9])]))
+
+    def test_charts_follow_rows_and_columns(self):
+        sh = self.wb.sheets["Sheet1"]
+        sh.charts = [self.chart]
+        self.wb.insert_rows("Sheet1", 0, 2)
+        self.assertEqual((sh.charts[0]["range"], sh.charts[0]["anchor"]), ((2, 0, 5, 2), (3, 4, 5, 3)))
+        self.wb.delete_cols("Sheet1", 3, 2)  # the anchor column goes: the chart moves to where it was
+        self.assertEqual(sh.charts[0]["anchor"], (3, 3, 5, 3))
+        self.wb.delete_rows("Sheet1", 2, 4)  # all its data goes: so does the chart
+        self.assertEqual(sh.charts, [])
+
+    def test_axis_ticks(self):
+        import charts
+        self.assertEqual(charts.nice_ticks(9, 14), [0, 5, 10, 15])
+        self.assertEqual(charts.nice_ticks(-20, 210), [-50, 0, 50, 100, 150, 200, 250])
+        self.assertEqual(charts.nice_ticks(0, 0), [0, 0.2, 0.4, 0.6, 0.8, 1])
+        self.assertEqual(charts.tick_label(12500, 2500), "12,500")
+        self.assertEqual(charts.tick_label(2.5, 2.5), "2.5")
+
+    def roundtrip(self, ext):
+        sh = self.wb.sheets["Sheet1"]
+        sh.charts = [self.chart, {"type": "pie", "range": (0, 0, 3, 1), "title": "", "anchor": (20, 1, 0, 0),
+                                  "size": (300, 200)}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "chart" + ext)
+            fe.save_workbook(self.wb, path)
+            return fe.load_workbook(path).sheets["Sheet1"].charts
+
+    def test_json_roundtrip(self):
+        self.assertEqual(self.roundtrip(".pyxl"), self.wb.sheets["Sheet1"].charts)
+
+    @unittest.skipUnless(fe.HAS_XLSX, "openpyxl not installed")
+    def test_xlsx_roundtrip(self):
+        charts = self.roundtrip(".xlsx")
+        self.assertEqual(charts, self.wb.sheets["Sheet1"].charts)
 
 
 class LayoutFileTests(unittest.TestCase):
