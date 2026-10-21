@@ -157,6 +157,23 @@ def quote_sheet(name):
     return "'" + name.replace("'", "''") + "'"
 
 
+def absolute_ref(sheet, rect):
+    """'Sheet1!$A$1:$B$4' (or 'Sheet1!$A$1' for one cell), as names refer to cells."""
+    r1, c1, r2, c2 = rect
+    first = f"${col_name(c1)}${r1 + 1}"
+    return f"{quote_sheet(sheet)}!{first}" + ("" if (r1, c1) == (r2, c2) else f":${col_name(c2)}${r2 + 1}")
+
+
+def name_from_label(text):
+    """A defined name made from a heading, as Formulas > Create from Selection does ('Đơn giá' -> 'Đơn_giá')."""
+    name = re.sub(r"[^\w.]", "", re.sub(r"\s+", "_", str(text).strip()))
+    if name and not (name[0].isalpha() or name[0] == "_"):
+        name = "_" + name
+    if _REF_LIKE_RE.match(name) or name.upper() in ("TRUE", "FALSE"):
+        name += "_"
+    return name
+
+
 # ------------------------------------------------------------------ values
 
 def is_number(v):
@@ -590,7 +607,7 @@ _TOKEN_RE = re.compile(rf"""
   | (?P<error>\#(?:DIV/0!|REF!|NAME\?|VALUE!|N/A|NUM!|CIRC!|ERROR!))
   | (?P<ref>(?:(?P<sheet>{_SHEET_PAT})!)?(?P<cabs>\$?)(?P<col>[A-Za-z]{{1,3}})(?P<rabs>\$?)(?P<row>\d+)(?![\w(]))
   | (?P<number>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)
-  | (?P<ident>[A-Za-z_][\w.]*)
+  | (?P<ident>[^\W\d][\w.]*)
   | (?P<op><>|<=|>=|[-+*/^&=<>%:(),;])
 """, re.VERBOSE)
 _TOKEN_KINDS = ("ws", "string", "error", "ref", "number", "ident", "op")
@@ -733,7 +750,7 @@ class _Parser:
                 return ("func", name, self._args())
             if name in ("TRUE", "FALSE"):
                 return ("bool", name == "TRUE")
-            return ("err", NAME)
+            return ("name", name)  # a defined name, looked up when evaluated
         if t.kind == "op" and t.text == "(":
             node = self.comparison()
             self._expect(")")
@@ -764,8 +781,9 @@ def parse_formula(raw):
 
 # ------------------------------------------------------------------ formula text rewriting
 
-def normalize_formula(raw):
-    """Upper-case names and references, use ',' separators and close open parentheses."""
+def normalize_formula(raw, names=None):
+    """Upper-case functions and references, write defined names as they were defined (`names`: the
+    workbook's names), use ',' separators and close open parentheses."""
     if not is_formula(raw):
         return raw
     try:
@@ -773,9 +791,15 @@ def normalize_formula(raw):
     except CellError:
         return raw
     out, depth = [], 0
-    for t in tokens:
+    for i, t in enumerate(tokens):
         if t.kind == "ident":
-            out.append(t.text.upper())
+            after = next((n for n in tokens[i + 1:] if n.kind != "ws"), None)
+            called = after is not None and after.kind == "op" and after.text == "("
+            upper = t.text.upper()
+            if not called and names and upper in names:
+                out.append(names[upper]["name"])
+            else:
+                out.append(upper if called or upper in ("TRUE", "FALSE") or not names else t.text)
         elif t.kind == "ref":
             out.append(_format_ref(t.ref))
         elif t.kind == "op" and t.text == ";":
@@ -2446,6 +2470,8 @@ def _shift_freeze(freeze, axis, at, move_span):
 
 
 MAX_OUTLINE = 7  # outline levels Excel allows
+_DEFINED_NAME_RE = re.compile(r"[^\W\d][\w.]*\Z")
+_REF_LIKE_RE = re.compile(r"(?:[A-Za-z]{1,3}\d+|[RrCc]\d*|[Rr]\d+[Cc]\d+)\Z")
 # SUBTOTAL function numbers -> (label after each group's value, label of the grand total row)
 SUBTOTAL_NAMES = {9: ("Tổng", "Tổng Cuối"), 3: ("Đếm", "Đếm chung"), 1: ("Trung bình", "Trung bình chung"),
                   4: ("Lớn nhất", "Lớn nhất chung"), 5: ("Nhỏ nhất", "Nhỏ nhất chung"), 6: ("Tích", "Tích chung"),
@@ -2550,6 +2576,8 @@ class Workbook:
         self._cf_stats = {}    # (sheet, rule index, name) -> statistics of a rule's range
         self._evaluating = set()
         self._stack = []
+        self.names = {}        # NAME (upper case) -> {"name": as typed, "ref": "=Sheet1!$A$1:$B$4", "comment": ""}
+        self._names_ast = {}
         for name in sheet_names:
             self.add_sheet(name)
 
@@ -2596,6 +2624,9 @@ class Workbook:
             for key, raw in list(sh.cells.items()):
                 if is_formula(raw):
                     sh.cells[key] = _rename_in_formula(raw, old, new)
+        for d in self.names.values():
+            d["ref"] = _rename_in_formula(d["ref"], old, new)
+        self._names_ast.clear()
         self.sheets = {(new if n == old else n): s for n, s in self.sheets.items()}
         self.sheets[new].name = new
         for sh in self.sheets.values():
@@ -2747,11 +2778,20 @@ class Workbook:
             return to_number(scalar(self._eval(node[1], sheet))) / 100
         if kind == "func":
             return self._call(node[1], node[2], sheet)
+        if kind == "name":
+            return self._eval(self._name_ast(node[1]), sheet)
         if kind == "err":
             raise CellError(node[1])
         if kind == "empty":
             return None
         raise CellError(SYNTAX)
+
+    def _name_ast(self, name):
+        ast = self._names_ast.get(name)
+        if ast is None:
+            d = self.names.get(name)
+            ast = self._names_ast[name] = parse_formula(d["ref"]) if d else ("err", NAME)
+        return ast
 
     def _call(self, name, nodes, sheet):
         lazy = _LAZY_FUNCS.get(name)
@@ -3163,6 +3203,9 @@ class Workbook:
             for key, raw in list(sh.cells.items()):
                 if is_formula(raw):
                     sh.cells[key] = _rewrite_axis(raw, sh.name, target, axis, move, move_span, band)
+        for d in self.names.values():
+            d["ref"] = _rewrite_axis(d["ref"], sheet, target, axis, move, move_span, band)
+        self._names_ast.clear()
 
         def remap(d):
             out = {}
@@ -3381,12 +3424,77 @@ class Workbook:
         return r1, c1, last + 1, c2
 
     def snapshot(self):
-        return [(s.name, s.copy_state()) for s in self.sheets.values()]
+        return [(s.name, s.copy_state()) for s in self.sheets.values()], copy.deepcopy(self.names)
 
     def restore(self, snap):
-        self.sheets = {name: Sheet.from_state(name, state) for name, state in snap}
+        sheets, names = snap
+        self.sheets = {name: Sheet.from_state(name, state) for name, state in sheets}
+        self.names = copy.deepcopy(names)
+        self._names_ast.clear()
         self._ast.clear()
         self.invalidate()
+
+    # defined names (Formulas > Name Manager)
+    def check_name(self, name, ignore=None):
+        """Error message (shown in the UI) when `name` can't be a defined name, else None."""
+        if not name:
+            return "Tên không được để trống."
+        if len(name) > 255 or not _DEFINED_NAME_RE.match(name):
+            return ("Tên phải bắt đầu bằng chữ cái hoặc dấu gạch dưới và chỉ gồm chữ, số, dấu chấm, gạch dưới "
+                    "(không có khoảng trắng).")
+        if _REF_LIKE_RE.match(name) or name.upper() in ("TRUE", "FALSE"):
+            return "Tên không được giống địa chỉ ô (như A1, R1C1) hay TRUE/FALSE."
+        if name.upper() in self.names and name.upper() != (ignore or "").upper():
+            return "Đã có tên này trong sổ làm việc."
+        return None
+
+    def define_name(self, name, ref, comment="", old=None):
+        """Add a name, or replace `old`; ref is a formula such as '=Sheet1!$A$1:$A$9' or '=0.1'."""
+        err = self.check_name(name, ignore=old)
+        if err:
+            raise ValueError(err)
+        if old:
+            self.names.pop(old.upper(), None)
+        ref = ref.strip()
+        self.names[name.upper()] = {"name": name, "ref": normalize_formula(ref if ref.startswith("=") else "=" + ref),
+                                    "comment": comment}
+        self._names_ast.clear()
+        self.invalidate()
+
+    def sorted_names(self):
+        """The defined names' entries in natural Vietnamese alphabetical order."""
+        return sorted(self.names.values(), key=lambda d: natural_key(d["name"]))
+
+    def delete_name(self, name):
+        self.names.pop(name.upper(), None)
+        self._names_ast.clear()
+        self.invalidate()
+
+    def name_target(self, name):
+        """(sheet, (r1, c1, r2, c2)) when a name refers to a block of cells, else None."""
+        d = self.names.get(name.upper())
+        ast = parse_formula(d["ref"]) if d else None
+        if not ast or ast[0] not in ("ref", "range") or ast[1] is None:
+            return None
+        sheet = self.resolve_sheet(ast[1])
+        if sheet is None:
+            return None
+        return (sheet, ast[2:4] * 2) if ast[0] == "ref" else (sheet, ast[2:6])
+
+    def name_value(self, name):
+        """Short text of what a name gives now, for the Name Manager."""
+        try:
+            value = self._eval(self._name_ast(name.upper()), next(iter(self.sheets)))
+        except CellError as err:
+            return err.code
+        except RecursionError:
+            return REF
+        if isinstance(value, RangeRef):
+            if value.nrows * value.ncols == 1:
+                return format_value(value.value(0, 0), None)
+            values = [format_value(v, None) for _, v in zip(range(7), value.values())]
+            return "{" + "; ".join(values[:6]) + ("; ..." if len(values) > 6 else "") + "}"
+        return format_value(value, None)
 
     # serialisation
     def to_dict(self, active=None):
@@ -3435,8 +3543,11 @@ class Workbook:
                                "criteria": {col_name(c): v if isinstance(v, dict) else sorted(v)
                                             for c, v in s.filter["criteria"].items()}}
             return d
-        return {"format": FILE_TAG, "version": 2, "active": active,
-                "sheets": [sheet_dict(s) for s in self.sheets.values()]}
+        out = {"format": FILE_TAG, "version": 2, "active": active,
+               "sheets": [sheet_dict(s) for s in self.sheets.values()]}
+        if self.names:
+            out["names"] = [dict(d) for _, d in sorted(self.names.items())]
+        return out
 
     @classmethod
     def from_dict(cls, data):
@@ -3501,6 +3612,9 @@ class Workbook:
             wb.add_sheet()
         for name in wb.sheets:  # after every sheet exists, so cross-sheet formulas resolve
             wb.apply_filter(name)
+        for d in data.get("names", []):
+            if isinstance(d, dict) and wb.check_name(str(d.get("name", ""))) is None and d.get("ref"):
+                wb.define_name(d["name"], str(d["ref"]), str(d.get("comment") or ""))
         wb.active = data.get("active") if data.get("active") in wb.sheets else None
         return wb
 
@@ -4072,6 +4186,32 @@ def _freeze_from_xlsx(ws):
     return (r0, r0 + ys, c0, c0 + xs)
 
 
+def _names_from_xlsx(book):
+    """[(name, refers-to without '=', comment)] of the workbook's defined names (not Excel's own _xlnm ones)."""
+    try:
+        items = list(book.defined_names.values())  # openpyxl 3.1
+    except AttributeError:
+        items = list(getattr(book.defined_names, "definedName", []))
+    for ws in book.worksheets:  # names scoped to a sheet are used book-wide here
+        try:
+            items += list(ws.defined_names.values())
+        except AttributeError:
+            pass
+    return [(d.name, d.attr_text, d.comment or "") for d in items
+            if d.name and not d.name.startswith("_xlnm") and d.attr_text and not d.hidden]
+
+
+def _xl_names(book, wb):
+    from openpyxl.workbook.defined_name import DefinedName
+
+    for d in wb.names.values():
+        item = DefinedName(d["name"], attr_text=d["ref"][1:], comment=d.get("comment") or None)
+        try:
+            book.defined_names[d["name"]] = item  # openpyxl 3.1
+        except TypeError:
+            book.defined_names.append(item)
+
+
 def _load_xlsx(path):
     import openpyxl
 
@@ -4163,6 +4303,12 @@ def _load_xlsx(path):
         for title, pivots in saved.items():
             if title in wb.sheets:
                 wb.sheets[title].pivots = [p for p in map(_pivot_from_dict, pivots) if p]
+    for name, ref, comment in _names_from_xlsx(book):
+        if wb.check_name(name) is None:
+            try:
+                wb.define_name(name, "=" + ref, comment)
+            except ValueError:
+                pass
     titles = [ws.title for ws in book.worksheets if ws is not store]
     names = list(wb.sheets)
     if book.active is not None and book.active.title in titles:
@@ -4346,6 +4492,7 @@ def _save_xlsx(wb, path, active=None):
         store = book.create_sheet(PIVOT_STORE)
         store["A1"] = json.dumps(pivots, ensure_ascii=False)
         store.sheet_state = "veryHidden"
+    _xl_names(book, wb)
     if active in wb.sheets:
         book.active = list(wb.sheets).index(active)
     book.save(path)

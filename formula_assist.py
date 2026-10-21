@@ -51,7 +51,7 @@ def completion_prefix(text, pos):
 
 def matching_functions(prefix, names):
     prefix = prefix.upper()
-    return [n for n in names if n.startswith(prefix)]
+    return [n for n in names if n.upper().startswith(prefix)]
 
 
 def call_context(text, pos):
@@ -149,7 +149,8 @@ def toggle_reference(text, pos):
 class FormulaAssist:
     """AutoComplete list, argument tip and F4 for one entry widget.
 
-    names() gives the function names to offer and info(name) its (syntax, description) or None.
+    names() gives the function and defined names to offer and info(name) its (syntax, description) or None;
+    a third item False in the info marks a defined name, inserted without "(".
     The assist puts its own bind tag in front of the entry's, so while the list is open Up/Down/Tab/
     Escape work on the list before the entry's own bindings see them."""
 
@@ -186,7 +187,7 @@ class FormulaAssist:
         text, pos = self.entry.get(), self._cursor()
         found = completion_prefix(text, pos)
         matches = matching_functions(found[1], self.names()) if found else []
-        if matches and not (len(matches) == 1 and matches[0] == found[1].upper()):
+        if matches and not (len(matches) == 1 and matches[0].upper() == found[1].upper()):
             self.span = (found[0], pos)
             self._show_list(matches)
             self._hide_tip()
@@ -282,11 +283,13 @@ class FormulaAssist:
             return None
         sel = self.listbox.curselection()
         name = self.matches[sel[0] if sel else 0]
+        info = self.info(name)
+        text = name if info and len(info) > 2 and not info[2] else name + "("  # defined names take no "("
         start, end = self.span
         e = self.entry
         e.delete(start, end)
-        e.insert(start, name + "(")
-        e.icursor(start + len(name) + 1)
+        e.insert(start, text)
+        e.icursor(start + len(text))
         e.focus_set()
         self.on_change()
         self._hide_list()

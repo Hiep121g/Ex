@@ -128,6 +128,7 @@ MENU_ICONS = {
     "Mới": "file_new", "Mở": "file_open", "Lưu": "save", "Lưu thành": "file_save_as", "Thoát": "file_exit",
     "In": "print", "Xuất PDF": "pdf", "Thiết lập Trang": "page_setup",
     "Nhóm": "group", "Bỏ nhóm": "ungroup", "Tổng phụ": "subtotal", "Xóa dàn bài": "clear",
+    "Trình Quản lý Tên": "name_manager",
     "Cắt": "cut", "Sao chép": "copy", "Dán": "paste", "Tùy chọn dán": "paste", "Dán công thức": "paste_formulas",
     "Dán giá trị": "paste_values", "Dán định dạng": "paste_formats", "Dán chuyển vị": "paste_transpose",
     "Dán đặc biệt": "paste_special", "Gạch chân": "underline", "Gạch chân kép": "underline_double",
@@ -198,6 +199,9 @@ THANH RIBBON
     có: sắp xếp (cả theo màu), lọc theo màu, Bộ lọc số / văn bản / ngày (lớn hơn, nằm giữa, có chứa, 10 mục
     đầu, trên trung bình, tháng này...), Bộ lọc tùy chỉnh (2 điều kiện Và/Hoặc, dùng * và ?) và danh sách
     giá trị có ô tìm kiếm. Thanh trạng thái cho biết số bản ghi tìm thấy.
+  • Tên vùng: chọn vùng, gõ tên (ví dụ ĐơnGiá) vào ô Tên bên trái thanh công thức rồi Enter; sau đó dùng
+    =SUM(ĐơnGiá). Công thức → Trình Quản lý Tên (Ctrl+F3) để sửa/xóa, Tạo từ Vùng chọn (Ctrl+Shift+F3) để đặt
+    tên theo hàng tiêu đề. Chọn tên trong danh sách của ô Tên để nhảy tới vùng đó.
   • Dữ liệu → Nhóm (Alt+Shift+→): gom các hàng/cột đang chọn; nút −/+ ở lề trái (hoặc trên) thu gọn / mở
     rộng nhóm, các nút 1 2 3 ở góc hiện theo mức. Bỏ nhóm (Alt+Shift+←), Xóa dàn bài, Hiện/Ẩn chi tiết.
   • Dữ liệu → Tổng phụ: với bảng đã sắp xếp theo một cột (ví dụ Khu vực), thêm hàng "Bắc Tổng", "Nam Tổng"...
@@ -841,6 +845,17 @@ class SpreadsheetApp:
             for n in names:
                 menu.add_command(label=n, command=lambda n=n: self.insert_function(n))
             self._btn(g, large=True, icon="book", text=labels[cat], menu=menu, tooltip=cat)
+        g = rb.group(page, "Tên đã Xác định")
+        self._btn(g, large=True, icon="name_manager", text="Trình Quản\nlý Tên", command=self.name_manager,
+                  tooltip="Trình Quản lý Tên (Ctrl+F3)\nTạo, sửa, xóa các tên dùng trong công thức")
+        col = g.column()
+        self._btn(g, col, side="top", icon="name_define", text="Xác định Tên", command=self.define_name_dialog,
+                  tooltip="Đặt tên cho vùng đang chọn")
+        use_menu = tk.Menu(self.root, tearoff=0)
+        use_menu.configure(postcommand=lambda: self._names_menu(use_menu))
+        self._btn(g, col, side="top", icon="name_use", text="Dùng trong Công thức", menu=use_menu)
+        self._btn(g, col, side="top", icon="name_create", text="Tạo từ Vùng chọn",
+                  command=self.create_names_from_selection, tooltip="Tạo tên từ tiêu đề (Ctrl+Shift+F3)")
         g = rb.group(page, "Kiểm tra công thức")
         self.btn_show_formulas = self._btn(g, large=True, icon="show_formulas", text="Hiện\ncông thức",
                                            command=self.toggle_show_formulas, tooltip="Hiện công thức (Ctrl+`)")
@@ -1082,12 +1097,16 @@ class SpreadsheetApp:
         bar.pack(side="top", fill="x")
         inner = tk.Frame(bar, bg="#ffffff")
         inner.pack(fill="x", padx=6, pady=4)
-        self.name_box = ttk.Entry(inner, width=12, justify="left", font=self.ui.font)
+        self.name_box = ttk.Combobox(inner, width=12, justify="left", font=self.ui.font,
+                                     postcommand=lambda: self.name_box.configure(
+                                         values=[d["name"] for d in self.wb.sorted_names()]))
         self.name_box.pack(side="left")
         self.name_box.bind("<Return>", self._on_name_box)
+        self.name_box.bind("<<ComboboxSelected>>", self._on_name_box)
         self.name_box.bind("<Escape>", lambda e: self._leave_name_box())
         self.name_box.bind("<FocusIn>", lambda e: self.name_box.select_range(0, "end"))
-        Tooltip(self.name_box, "Hộp tên: gõ địa chỉ (ví dụ B5, A1:C9, Sheet2!A1) rồi Enter", self.ui.small_font)
+        Tooltip(self.name_box, "Hộp tên: gõ địa chỉ (B5, A1:C9, Sheet2!A1) hoặc tên vùng rồi Enter.\n"
+                               "Gõ một tên mới để đặt tên cho vùng đang chọn.", self.ui.small_font)
         tk.Label(inner, text="⋮", bg="#ffffff", fg="#a0a0a0", font=self.ui.font).pack(side="left", padx=(6, 2))
         self.btn_x = tk.Label(inner, text="✕", bg="#ffffff", fg="#c0c0c0", font=self.ui.font, padx=5, cursor="hand2")
         self.btn_ok = tk.Label(inner, text="✓", bg="#ffffff", fg="#c0c0c0", font=self.ui.font, padx=5, cursor="hand2")
@@ -1236,6 +1255,8 @@ class SpreadsheetApp:
         self.root.bind_all("<Control-Key-1>", lambda e: self._key_action(self.format_cells_dialog))
         self.root.bind_all("<F12>", lambda e: self._key_action(self.save_as))
         self.root.bind_all("<Control-F2>", lambda e: self._key_action(self.print_preview))
+        self.root.bind_all("<Control-F3>", lambda e: self._key_action(self.name_manager))
+        self.root.bind_all("<Control-Shift-F3>", lambda e: self._key_action(self.create_names_from_selection))
         self.root.bind_all("<F1>", lambda e: self._key_action(self.show_help))
         self.root.bind_all("<Shift-F11>", lambda e: self._key_action(self.add_sheet))
 
@@ -2061,6 +2082,9 @@ class SpreadsheetApp:
             text = f"{r2 - r1 + 1}H x {c2 - c1 + 1}C"
         else:
             text = cell_name(*self.cur)
+            if self.wb.names:  # a block that has a name shows the name, as in Excel
+                text = next((d["name"] for d in self.wb.sorted_names()
+                             if self.wb.name_target(d["name"]) == (self.sheet, (r1, c1, r2, c2))), text)
         self.name_box.delete(0, "end")
         self.name_box.insert(0, text)
 
@@ -2632,17 +2656,25 @@ class SpreadsheetApp:
         self.update_formula_bar()
 
     def _formula_assist(self, entry):
-        """Function list while typing a name, argument tip inside a call, and F4 for $ references."""
-        names = fe.function_names()
+        """Function (and defined name) list while typing, argument tip inside a call, F4 for $ references."""
+        functions = fe.function_names()
+
+        def names():
+            return sorted(functions + [d["name"] for d in self.wb.names.values()], key=str.upper)
 
         def info(name):
-            item = FUNCTION_INFO.get(name)
-            return item[1:] if item else None
+            item = FUNCTION_INFO.get(name)  # function names are upper case; defined names keep their case
+            if item:
+                return item[1:]
+            d = self.wb.names.get(name.upper())
+            if d:
+                return d["name"], f"Tên: {d['ref'][1:]}" + (f" — {d['comment']}" if d.get("comment") else ""), False
+            return None
 
         def changed():
             self.point = None
             self.set_mode("Nhập" if self.edit_mode == "enter" else "Sửa")
-        return FormulaAssist(entry, self.ui.font, self.ui.small_font, lambda: names, info, changed)
+        return FormulaAssist(entry, self.ui.font, self.ui.small_font, names, info, changed)
 
     def _editor_commit(self, e, move):
         if e.state & SHIFT:
@@ -2670,7 +2702,7 @@ class SpreadsheetApp:
         sheet, r, c = self.edit_cell
         self._end_edit()
         if sheet in self.wb.sheets:
-            raw = fe.normalize_formula(text)
+            raw = fe.normalize_formula(text, self.wb.names)
             if not self._entry_allowed(sheet, r, c, raw, text):
                 self.refresh()
                 return
@@ -4736,6 +4768,17 @@ class SpreadsheetApp:
 
     def _on_name_box(self, e):
         text = self.name_box.get().strip()
+        if text.upper() in self.wb.names:
+            if not self.go_to_name(text):
+                self.root.bell()
+            return "break"
+        if "!" not in text and fe.parse_address(text) is None and self.wb.check_name(text) is None:
+            rect = self.sel_rect()  # a new name for the selection, as typing a name in Excel's Name Box does
+            if self._structural(lambda: self.wb.define_name(text, "=" + fe.absolute_ref(self.sheet, rect))):
+                self.set_mode(f"Đã đặt tên {text} cho {range_name(*rect)}")
+            self.canvas.focus_set()
+            self.update_name_box()
+            return "break"
         sheet = self.sheet
         if "!" in text:
             sheet_part, text = text.rsplit("!", 1)
@@ -4859,6 +4902,111 @@ class SpreadsheetApp:
         messagebox.showinfo(APP_NAME, "PyExcel — bảng tính kiểu Excel viết bằng Python + tkinter.\n\n"
                             f"{MAX_ROWS:,} hàng × {MAX_COLS} cột mỗi trang tính, {len(fe.function_names())} hàm,\n"
                             "mở/lưu .xlsx, .pyxl, .csv.", parent=self.root)
+
+    # ------------------------------------------------------------------ defined names
+
+    def go_to_name(self, name):
+        """Select the block a name refers to; False when it is not a block of cells."""
+        target = self.wb.name_target(name)
+        if target is None:
+            return False
+        sheet, (r1, c1, r2, c2) = target
+        self.commit_edit()
+        self.switch_sheet(sheet)
+        self.cur, self.ext = (r1, c1), (r2, c2)
+        self.ensure_visible(r1, c1)
+        self.canvas.focus_set()
+        self.refresh()
+        return True
+
+    def _edit_name(self, parent, name=None):
+        """New / Edit Name dialog; returns the name kept (for the Name Manager to select)."""
+        if name:
+            d = self.wb.names[name.upper()]
+            values = dict(name=d["name"], ref=d["ref"], comment=d.get("comment", ""), old=d["name"])
+        else:
+            r1, c1, r2, c2 = self.sel_rect()
+            label = self.wb.display_text(self.sheet, r1, c1) if (r1, c1) != (r2, c2) else ""
+            guess = fe.name_from_label(label) if label else ""
+            values = dict(name=guess if guess and self.wb.check_name(guess) is None else "",
+                          ref="=" + fe.absolute_ref(self.sheet, (r1, c1, r2, c2)))
+        result = dialogs.DefineNameDialog(parent, self.wb, **values).show()
+        if not result:
+            return name
+        new, ref, comment = result
+        self._structural(lambda: self.wb.define_name(new, ref, comment, old=values.get("old")))
+        return new
+
+    def define_name_dialog(self):
+        self.commit_edit()
+        self._edit_name(self.root)
+
+    def name_manager(self):
+        """Formulas > Name Manager (Ctrl+F3)."""
+        self.commit_edit()
+
+        def delete(name):
+            self._structural(lambda: self.wb.delete_name(name))
+        dialogs.NameManagerDialog(self.root, self.wb, lambda parent: self._edit_name(parent),
+                                  lambda parent, name: self._edit_name(parent, name), delete, self.go_to_name).show()
+
+    def create_names_from_selection(self):
+        """Formulas > Create from Selection (Ctrl+Shift+F3): names from the labels along the block's edges."""
+        self.commit_edit()
+        r1, c1, r2, c2 = self.sel_rect()
+        if (r1, c1) == (r2, c2) or r2 - r1 > 10000 or c2 - c1 > 1000:
+            messagebox.showinfo(APP_NAME, "Hãy chọn vùng gồm tiêu đề và dữ liệu (ví dụ cả bảng có hàng tiêu đề).",
+                                parent=self.root)
+            return
+        text = lambda r, c: self.wb.display_text(self.sheet, r, c)  # noqa: E731
+        numeric = lambda r, c: fe.is_number(self.wb.get_value(self.sheet, r, c))  # noqa: E731
+        top = r2 > r1 and all(text(r1, c) and not numeric(r1, c) for c in range(c1 + 1, c2 + 1) or [c1])
+        left = c2 > c1 and all(text(r, c1) and not numeric(r, c1) for r in range(r1 + 1, r2 + 1))
+        picked = dialogs.CreateNamesDialog(self.root, top or not left, left).show()
+        if not picked:
+            return
+        rows = (r1 + ("top" in picked), r2 - ("bottom" in picked))
+        cols = (c1 + ("left" in picked), c2 - ("right" in picked))
+        items = []
+        for edge in ("top", "bottom"):
+            if edge in picked:
+                label_row = r1 if edge == "top" else r2
+                items += [(text(label_row, c), (rows[0], c, rows[1], c)) for c in range(cols[0], cols[1] + 1)]
+        for edge in ("left", "right"):
+            if edge in picked:
+                label_col = c1 if edge == "left" else c2
+                items += [(text(r, label_col), (r, cols[0], r, cols[1])) for r in range(rows[0], rows[1] + 1)]
+        items = [(fe.name_from_label(label), rect) for label, rect in items
+                 if label and rect[0] <= rect[2] and rect[1] <= rect[3]]
+        items = [(name, rect) for name, rect in items if name]
+        if not items:
+            self.root.bell()
+            return
+
+        def change():
+            for name, rect in items:
+                old = name if name.upper() in self.wb.names else None
+                if self.wb.check_name(name, ignore=old) is None:
+                    self.wb.define_name(name, "=" + fe.absolute_ref(self.sheet, rect), old=old)
+        if self._structural(change):
+            self.set_mode(f"Đã tạo {len(items)} tên: " + ", ".join(n for n, _ in items[:6]) + ("..." if len(items) > 6 else ""))
+
+    def _names_menu(self, menu):
+        """Use in Formula: the names, inserted where a formula is being typed (or starting one)."""
+        menu.delete(0, "end")
+        if not self.wb.names:
+            menu.add_command(label="(Chưa có tên nào)", state="disabled")
+        for d in self.wb.sorted_names():
+            menu.add_command(label=d["name"], command=lambda n=d["name"]: self.insert_name(n))
+        menu.add_separator()
+        menu.add_command(label="Trình Quản lý Tên...", command=self.name_manager, accelerator="Ctrl+F3")
+
+    def insert_name(self, name):
+        if not self.is_editing():
+            self.start_edit(initial="=")
+        w = self._edit_widget()
+        w.insert("insert", name)
+        w.focus_set()
 
     # ------------------------------------------------------------------ printing
 

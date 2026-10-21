@@ -110,6 +110,10 @@ merge
 merge_across
 merge_cells
 merge_unmerge
+name_create
+name_define
+name_manager
+name_use
 note
 note_delete
 note_next

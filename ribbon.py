@@ -914,6 +914,29 @@ def _icon_detail(cv, P, k, c, show):
     _outline_box(cv, P, k, 2.5, 12.3, "+" if show else "-")
 
 
+def _tag(cv, P, k, x, y, s=1.0, fill="#ffd65c"):
+    """A name tag: a label with a punched hole."""
+    cv.create_polygon(*P(x, y + 2.5 * s, x + 2.5 * s, y, x + 9 * s, y, x + 9 * s, y + 5 * s, x + 2.5 * s, y + 5 * s),
+                      fill=fill, outline="#b38f00")
+    cv.create_oval(*P(x + 2 * s, y + 2 * s, x + 3.2 * s, y + 3.2 * s), fill="#ffffff", outline="#b38f00")
+
+
+def _icon_name(cv, P, k, c, kind):
+    if kind == "manager":
+        _grid(cv, P, k, 1.5, 4.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+        _tag(cv, P, k, 1, 0.5, 1.1)
+    elif kind == "define":
+        _tag(cv, P, k, 0.5, 4, 1.6)
+        _pencil(cv, P, k, 7, 6, 0.55)
+    elif kind == "use":
+        _glyph(cv, P, k, 4.5, 10.5, "fx", 8, BLUE, "bold", "italic", "Times New Roman")
+        _tag(cv, P, k, 6, 1.5, 1.0)
+    else:  # create from selection
+        _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+        cv.create_rectangle(*P(1.5, 1.5, 14.5, 5.83), fill="#bdd7ee", outline=GRAY)
+        _tag(cv, P, k, 6, 8.5, 0.95)
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -1007,6 +1030,8 @@ ICONS.update({
     "group": _icon_group, "ungroup": lambda *a: _icon_group(*a, ungroup=True), "subtotal": _icon_subtotal,
     "show_detail": lambda *a: _icon_detail(*a, True), "hide_detail": lambda *a: _icon_detail(*a, False),
 })
+ICONS.update({f"name_{kind}": (lambda kind: lambda *a: _icon_name(*a, kind))(kind)
+              for kind in ("manager", "define", "use", "create")})
 
 
 def draw_icon(cv, name, x, y, size, color=None):

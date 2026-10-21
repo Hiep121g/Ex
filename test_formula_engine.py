@@ -1280,5 +1280,53 @@ class OutlineTests(unittest.TestCase):
                              (sh.row_levels, sh.col_levels, sh.collapsed_rows, sh.hidden_rows), ext)
 
 
+class DefinedNameTests(unittest.TestCase):
+    def build(self):
+        wb = make({"B1": "10", "B2": "20", "B3": "30", "B4": "40", "B5": "50"})
+        wb.define_name("ĐơnGiá", "=Sheet1!$B$1:$B$5", "giá")
+        wb.define_name("VAT", "=0.1")
+        wb.set_raw("Sheet1", 0, 3, fe.normalize_formula("=sum(đơngiá)*(1+vat)", wb.names))
+        return wb
+
+    def test_names_in_formulas(self):
+        wb = self.build()
+        self.assertEqual(wb.get_raw("Sheet1", 0, 3), "=SUM(ĐơnGiá)*(1+VAT)")  # written as defined
+        self.assertAlmostEqual(val(wb, "D1"), 165)
+        wb.set_raw("Sheet1", 1, 3, "=KhongCo+1")
+        self.assertEqual(val(wb, "D2"), CellError("#NAME?"))
+        self.assertEqual(wb.name_target("đơngiá"), ("Sheet1", (0, 1, 4, 1)))
+        self.assertEqual(wb.name_value("VAT"), "0.1")
+        self.assertEqual(wb.name_value("ĐơnGiá"), "{10; 20; 30; 40; 50}")
+        wb.delete_name("VAT")
+        self.assertEqual(val(wb, "D1"), CellError("#NAME?"))
+
+    def test_checks_and_labels(self):
+        wb = self.build()
+        for bad in ("", "A1", "kl12", "R1C1", "ab c", "1abc", "vat", "TRUE"):
+            self.assertIsNotNone(wb.check_name(bad), bad)
+        self.assertIsNone(wb.check_name("Tổng_KL"))
+        self.assertEqual(fe.name_from_label("Đơn giá (đ)"), "Đơn_giá_đ")
+        self.assertEqual(fe.name_from_label("2024"), "_2024")
+        self.assertEqual(fe.absolute_ref("Bảng 1", (0, 1, 4, 2)), "'Bảng 1'!$B$1:$C$5")
+
+    def test_names_follow_rows_sheets_undo_and_files(self):
+        wb = self.build()
+        wb.insert_rows("Sheet1", 0, 2)
+        self.assertEqual(wb.names["ĐƠNGIÁ"]["ref"], "=Sheet1!$B$3:$B$7")
+        wb.rename_sheet("Sheet1", "Dữ liệu")
+        self.assertEqual(wb.names["ĐƠNGIÁ"]["ref"], "='Dữ liệu'!$B$3:$B$7")
+        snap = wb.snapshot()
+        wb.delete_name("ĐơnGiá")
+        wb.restore(snap)
+        self.assertAlmostEqual(wb.get_value("Dữ liệu", 2, 3), 165)
+        for ext in [".pyxl"] + ([".xlsx"] if fe.HAS_XLSX else []):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "n" + ext)
+                fe.save_workbook(wb, path)
+                got = fe.load_workbook(path)
+            self.assertEqual(got.names, wb.names, ext)
+            self.assertAlmostEqual(got.get_value("Dữ liệu", 2, 3), 165)
+
+
 if __name__ == "__main__":
     unittest.main()

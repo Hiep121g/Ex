@@ -1807,3 +1807,140 @@ class SubtotalDialog(Dialog):
             return None
         return {"by": self.columns[self.by.current()][0], "func": SUBTOTAL_FUNCS[self.func.current()][0],
                 "columns": picked, "replace": self.replace.get()}
+
+
+class DefineNameDialog(Dialog):
+    """New Name / Edit Name: name, comment and what it refers to. collect() gives (name, ref, comment)."""
+
+    def __init__(self, master, wb, name="", ref="", comment="", old=None):
+        super().__init__(master, "Sửa Tên" if old else "Tên Mới")
+        self.wb, self.old = wb, old
+        f = self.body
+        ttk.Label(f, text="Tên:").grid(row=0, column=0, sticky="w", pady=3)
+        self.name = tk.StringVar(value=name)
+        self.name_entry = ttk.Entry(f, textvariable=self.name, width=36)
+        self.name_entry.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Phạm vi:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(f, text="Sổ làm việc").grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Ghi chú:").grid(row=2, column=0, sticky="nw", pady=3)
+        self.comment = tk.Text(f, width=36, height=3, wrap="word", font=tkfont.nametofont("TkDefaultFont"))
+        self.comment.insert("1.0", comment)
+        self.comment.grid(row=2, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(f, text="Tham chiếu tới:").grid(row=3, column=0, sticky="w", pady=3)
+        self.ref = tk.StringVar(value=ref)
+        ttk.Entry(f, textvariable=self.ref, width=36).grid(row=3, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Ví dụ: =Sheet1!$B$2:$B$20 hoặc một hằng số như =0,1", foreground="#666").grid(
+            row=4, column=1, sticky="w", padx=6)
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.name_entry)
+
+    def collect(self):
+        name, ref = self.name.get().strip(), self.ref.get().strip()
+        err = self.wb.check_name(name, ignore=self.old)
+        if err is None and not ref.lstrip("="):
+            err = "Hãy nhập vùng hoặc giá trị mà tên tham chiếu tới."
+        if err is None and fe.parse_formula(ref if ref.startswith("=") else "=" + ref)[1] == fe.SYNTAX:
+            err = "Tham chiếu không hợp lệ."
+        if err:
+            from tkinter import messagebox
+            messagebox.showerror("Tên", err, parent=self)
+            return None
+        return name, ref, self.comment.get("1.0", "end").strip()
+
+
+class NameManagerDialog(Dialog):
+    """Name Manager: the workbook's names with value, reference and comment; New / Edit / Delete call
+    back into the app (which keeps undo) and the list is read again afterwards."""
+
+    def __init__(self, master, wb, on_new, on_edit, on_delete, on_go):
+        super().__init__(master, "Trình Quản lý Tên")
+        self.resizable(True, True)
+        self.wb, self.on_new, self.on_edit, self.on_delete, self.on_go = wb, on_new, on_edit, on_delete, on_go
+        f = self.body
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="Mới...", command=self._new).pack(side="left")
+        self.edit_btn = ttk.Button(bar, text="Sửa...", command=self._edit)
+        self.edit_btn.pack(side="left", padx=6)
+        self.del_btn = ttk.Button(bar, text="Xóa", command=self._delete)
+        self.del_btn.pack(side="left")
+        cols = ("value", "ref", "comment")
+        self.tree = ttk.Treeview(f, columns=cols, height=10, selectmode="browse")
+        for col, text, width in (("#0", "Tên", 150), ("value", "Giá trị", 170), ("ref", "Tham chiếu tới", 210),
+                                 ("comment", "Ghi chú", 150)):
+            self.tree.heading(col, text=text, anchor="w")
+            self.tree.column(col, width=width, anchor="w")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._sync())
+        self.tree.bind("<Double-1>", lambda e: self._edit())
+        self.tree.bind("<Delete>", lambda e: self._delete())
+        ttk.Label(f, text="Nhấp đúp để sửa. Tên dùng được trong công thức, ví dụ =SUM(ĐơnGiá).",
+                  foreground="#666").pack(anchor="w", pady=(6, 0))
+        bar = ttk.Frame(self, padding=(12, 0, 12, 12))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Đóng", command=self.cancel, width=10).pack(side="right")
+        ttk.Button(bar, text="Chọn vùng", command=self._go).pack(side="right", padx=6)
+        self.reload()
+
+    def reload(self, select=None):
+        self.tree.delete(*self.tree.get_children())
+        for d in self.wb.sorted_names():
+            key = d["name"].upper()
+            self.tree.insert("", "end", iid=key, text=d["name"],
+                             values=(self.wb.name_value(key), d["ref"], d.get("comment", "")))
+        if select and select.upper() in self.wb.names:
+            self.tree.selection_set(select.upper())
+            self.tree.see(select.upper())
+        self._sync()
+
+    def _current(self):
+        sel = self.tree.selection()
+        return self.wb.names[sel[0]]["name"] if sel and sel[0] in self.wb.names else None
+
+    def _sync(self):
+        state = "normal" if self._current() else "disabled"
+        self.edit_btn.configure(state=state)
+        self.del_btn.configure(state=state)
+
+    def _new(self):
+        self.reload(self.on_new(self))
+
+    def _edit(self):
+        name = self._current()
+        if name:
+            self.reload(self.on_edit(self, name))
+
+    def _delete(self):
+        from tkinter import messagebox
+        name = self._current()
+        if name and messagebox.askyesno("Trình Quản lý Tên", f"Xóa tên {name}?", parent=self):
+            self.on_delete(name)
+            self.reload()
+
+    def _go(self):
+        name = self._current()
+        if name and self.on_go(name):
+            self.cancel()
+
+
+class CreateNamesDialog(Dialog):
+    """Create Names from Selection: which edge of the block holds the labels."""
+
+    def __init__(self, master, top=True, left=False):
+        super().__init__(master, "Tạo Tên từ Vùng chọn")
+        ttk.Label(self.body, text="Tạo tên từ giá trị ở:").pack(anchor="w", pady=(0, 4))
+        self.vars = {}
+        for key, text, on in (("top", "Hàng trên cùng", top), ("left", "Cột bên trái", left),
+                              ("bottom", "Hàng dưới cùng", False), ("right", "Cột bên phải", False)):
+            self.vars[key] = tk.BooleanVar(value=on)
+            ttk.Checkbutton(self.body, text=text, variable=self.vars[key]).pack(anchor="w", padx=8, pady=1)
+        self.add_buttons()
+
+    def collect(self):
+        picked = {k for k, v in self.vars.items() if v.get()}
+        if not picked:
+            self.bell()
+            return None
+        return picked
