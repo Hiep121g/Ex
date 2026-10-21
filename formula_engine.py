@@ -158,6 +158,85 @@ def quote_sheet(name):
     return "'" + name.replace("'", "''") + "'"
 
 
+# what a protected sheet may still allow (Review > Protect Sheet)
+PROTECT_OPTIONS = (("format_cells", "Định dạng ô"), ("format_rows_cols", "Định dạng, ẩn hàng và cột"),
+                   ("outline", "Thu gọn / mở rộng nhóm (dàn bài)"), ("filter", "Dùng Bộ lọc"),
+                   ("objects", "Sửa biểu đồ và ảnh"))
+
+
+def password_hash(password):
+    """Excel's legacy sheet-protection password hash (hex), as .xlsx files store it."""
+    if not password:
+        return ""
+    value = 0
+    for i, ch in enumerate(password, 1):
+        v = ord(ch) << i
+        value ^= (v & 0x7FFF) | (v >> 15)
+    value ^= len(password) ^ 0xCE4B
+    return f"{value:04X}"
+
+
+def cell_locked(fmt):
+    return not (fmt or {}).get("unlocked")
+
+
+def protection_problem(before, after, allow=()):
+    """Why a change to a protected sheet is not allowed, or None. before/after: Sheet.copy_state()."""
+    for key in set(before["cells"]) | set(after["cells"]):
+        if before["cells"].get(key) != after["cells"].get(key) and (
+                cell_locked(before["formats"].get(key)) or cell_locked(after["formats"].get(key))):
+            return "cells"
+    if before["formats"] != after["formats"] and "format_cells" not in allow:
+        return "format"
+    for key in ("merges", "cond_formats", "validations", "notes", "links", "pivots", "row_levels", "col_levels"):
+        if before[key] != after[key]:
+            return "cells"
+    if ((before["row_heights"], before["col_widths"]) != (after["row_heights"], after["col_widths"])
+            and "format_rows_cols" not in allow):
+        return "rows"
+    for hidden, levels, marks in (("hidden_rows", "row_levels", "collapsed_rows"),
+                                  ("hidden_cols", "col_levels", "collapsed_cols")):
+        changed = before[hidden] ^ after[hidden]
+        if changed and "format_rows_cols" not in allow and not (
+                "outline" in allow and changed <= set(after[levels])):
+            return "rows"
+        if before[marks] != after[marks] and "outline" not in allow and "format_rows_cols" not in allow:
+            return "rows"
+    if before["charts"] != after["charts"] and "objects" not in allow:
+        return "objects"
+    if before["filter"] != after["filter"] and "filter" not in allow:
+        return "filter"
+    return None
+
+
+def split_text(text, delimiters="", merge=False, breaks=None, quote='"'):
+    """Data > Text to Columns: the parts of a cell's text, split at any of the delimiter characters
+    (text in quotes kept whole; runs of delimiters as one with `merge`) or at the character positions
+    `breaks` (fixed width)."""
+    if breaks is not None:
+        cuts = [0] + sorted(b for b in set(breaks) if 0 < b < len(text)) + [len(text)]
+        return [text[a:b].strip() for a, b in zip(cuts, cuts[1:])]
+    parts, cur, quoted, i = [], [], False, 0
+    while i < len(text):
+        ch = text[i]
+        if quote and ch == quote:
+            if quoted and text[i + 1:i + 2] == quote:
+                cur.append(quote)
+                i += 1
+            else:
+                quoted = not quoted
+        elif ch in delimiters and not quoted:
+            parts.append("".join(cur))
+            cur = []
+            while merge and i + 1 < len(text) and text[i + 1] in delimiters:
+                i += 1
+        else:
+            cur.append(ch)
+        i += 1
+    parts.append("".join(cur))
+    return parts
+
+
 def cells_to_rects(cells):
     """Cover a set of (row, col) cells with few rectangles: runs along each row, stacked where they match."""
     runs = {}
@@ -2541,7 +2620,7 @@ class Sheet:
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
               "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
               "charts", "pivots", "page_setup", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols",
-              "links", "hidden")
+              "links", "hidden", "protection")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2574,6 +2653,8 @@ class Sheet:
         self.collapsed_rows = set()  # summary rows of collapsed groups (Excel's "collapsed" flag)
         self.collapsed_cols = set()
         self.hidden = False     # sheet hidden (Format > Hide & Unhide > Hide Sheet)
+        self.protection = None  # Review > Protect Sheet: {"hash": Excel password hash or "", "allow": [option]};
+                                # cells are locked unless their format has "unlocked"
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -3630,6 +3711,8 @@ class Workbook:
                 d["notes"] = {cell_name(r, c): text for (r, c), text in sorted(s.notes.items())}
             if s.hidden:
                 d["hidden"] = True
+            if s.protection:
+                d["protection"] = {"hash": s.protection.get("hash", ""), "allow": list(s.protection.get("allow", []))}
             if s.links:
                 d["links"] = {cell_name(r, c): link for (r, c), link in sorted(s.links.items())}
             if s.charts:
@@ -3700,6 +3783,9 @@ class Workbook:
                 if pos and len(pos) == 2 and text:
                     sh.notes[pos] = str(text)
             sh.hidden = bool(sd.get("hidden"))
+            prot = sd.get("protection")
+            if isinstance(prot, dict):
+                sh.protection = {"hash": str(prot.get("hash") or ""), "allow": [str(a) for a in prot.get("allow", [])]}
             for addr, link in sd.get("links", {}).items():
                 pos = parse_address(addr)
                 if pos and len(pos) == 2 and isinstance(link, dict) and link.get("target"):
@@ -3926,6 +4012,12 @@ def _format_from_xlsx(cell):
     numfmt = _numfmt_from_xlsx(cell)
     if numfmt:
         fmt["num"] = numfmt
+    prot = cell.protection
+    if prot is not None:
+        if prot.locked is False:
+            fmt["unlocked"] = True
+        if prot.hidden:
+            fmt["hide_formula"] = True
     return fmt
 
 
@@ -4052,6 +4144,26 @@ def _xl_validation(rule):
 
 
 _EMU_PER_PX = 9525
+
+
+_XL_PROTECT = {"format_cells": ("formatCells",), "format_rows_cols": ("formatRows", "formatColumns"),
+               "filter": ("autoFilter",), "objects": ("objects",)}
+
+
+def _protection_from_xlsx(prot):
+    if not prot.sheet:
+        return None
+    allow = [key for key, attrs in _XL_PROTECT.items() if all(getattr(prot, a) is False for a in attrs)]
+    return {"hash": prot.password or "", "allow": allow}
+
+
+def _xl_protection(prot, protection):
+    prot.sheet = True
+    if protection.get("hash"):
+        prot.set_password(protection["hash"], already_hashed=True)
+    for key, attrs in _XL_PROTECT.items():
+        for attr in attrs:  # in the file "formatCells=0" means formatting is allowed
+            setattr(prot, attr, key not in protection.get("allow", ()))
 
 
 def _link_from_xlsx(hl):
@@ -4458,6 +4570,7 @@ def _load_xlsx(path):
                       for rg in ws.merged_cells.ranges if rg.max_row <= MAX_ROWS and rg.max_col <= MAX_COLS)
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
         sh.hidden = ws.sheet_state in ("hidden", "veryHidden")
+        sh.protection = _protection_from_xlsx(ws.protection)
         sh.freeze = _freeze_from_xlsx(ws)
         sh.validations = _validations_from_xlsx(ws)
         sh.charts = _charts_from_xlsx(ws, sh) + _pictures_from_xlsx(ws)
@@ -4590,7 +4703,7 @@ def _xl_cf_rule(rule):
 
 def _save_xlsx(wb, path, active=None):
     import openpyxl
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 
     book = openpyxl.Workbook()
     book.remove(book.active)
@@ -4639,6 +4752,8 @@ def _save_xlsx(wb, path, active=None):
             if any(fmt.get(k) for k in BORDER_KEYS):
                 sides = [Side(style=v[0], color=_xl_hex(v[1])) if v else Side() for v in map(fmt.get, BORDER_KEYS)]
                 cell.border = Border(top=sides[0], bottom=sides[1], left=sides[2], right=sides[3])
+            if fmt.get("unlocked") or fmt.get("hide_formula"):
+                cell.protection = Protection(locked=not fmt.get("unlocked"), hidden=bool(fmt.get("hide_formula")))
         for c, width in sh.col_widths.items():
             ws.column_dimensions[col_name(c)].width = max(1.0, (width - 5) / 7)
         for c in sh.hidden_cols:
@@ -4665,6 +4780,8 @@ def _save_xlsx(wb, path, active=None):
             ws.sheet_properties.tabColor = _xl_hex(sh.tab_color)
         if sh.hidden:
             ws.sheet_state = "hidden"
+        if sh.protection:
+            _xl_protection(ws.protection, sh.protection)
         if sh.freeze:
             r0, r1, c0, c1 = sh.freeze
             ws.freeze_panes = cell_name(r1 - r0, c1 - c0)  # sets up the panes as if frozen from A1...

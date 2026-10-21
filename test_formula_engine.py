@@ -1434,5 +1434,49 @@ class SheetExtrasTests(unittest.TestCase):
                          [(0, 0, 1, 1), (3, 0, 3, 0), (3, 2, 4, 2)])
 
 
+class ProtectionAndSplitTests(unittest.TestCase):
+    def test_split_text(self):
+        self.assertEqual(fe.split_text('An, 0912, "Hà Nội, VN"', ","), ["An", " 0912", " Hà Nội, VN"])
+        self.assertEqual(fe.split_text("a  b   c", " ", merge=True), ["a", "b", "c"])
+        self.assertEqual(fe.split_text("a;;b", ";"), ["a", "", "b"])
+        self.assertEqual(fe.split_text("THEP001  Cột 12", breaks=[7, 9]), ["THEP001", "", "Cột 12"])
+
+    def test_password_hash_matches_excel(self):
+        self.assertEqual(fe.password_hash("abc"), "CC1A")
+        self.assertEqual(fe.password_hash(""), "")
+
+    def test_protection_rules(self):
+        wb = make({"A1": "5", "B1": "x"})
+        wb.set_format("Sheet1", 0, 1, {"unlocked": True})
+        sh = wb.sheets["Sheet1"]
+        before = sh.copy_state()
+        sh.cells[(0, 1)] = "y"
+        self.assertIsNone(fe.protection_problem(before, sh.copy_state()))  # unlocked cell
+        sh.cells[(0, 0)] = "6"
+        self.assertEqual(fe.protection_problem(before, sh.copy_state()), "cells")
+        sh.cells[(0, 0)] = "5"
+        sh.formats[(0, 0)] = {"bold": True}
+        self.assertEqual(fe.protection_problem(before, sh.copy_state()), "format")
+        self.assertIsNone(fe.protection_problem(before, sh.copy_state(), ["format_cells"]))
+        del sh.formats[(0, 0)]
+        sh.row_levels = {3: 1}
+        before = sh.copy_state()
+        sh.hidden_rows.add(3)
+        self.assertEqual(fe.protection_problem(before, sh.copy_state()), "rows")
+        self.assertIsNone(fe.protection_problem(before, sh.copy_state(), ["outline"]))
+
+    def test_protection_files(self):
+        wb = make({"A1": "5"})
+        wb.set_format("Sheet1", 1, 0, {"unlocked": True, "hide_formula": True})
+        wb.sheets["Sheet1"].protection = {"hash": fe.password_hash("abc"), "allow": ["format_cells"]}
+        for ext in [".pyxl"] + ([".xlsx"] if fe.HAS_XLSX else []):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "p" + ext)
+                fe.save_workbook(wb, path)
+                got = fe.load_workbook(path).sheets["Sheet1"]
+            self.assertEqual(got.protection, {"hash": "CC1A", "allow": ["format_cells"]}, ext)
+            self.assertEqual(got.formats[(1, 0)], {"unlocked": True, "hide_formula": True}, ext)
+
+
 if __name__ == "__main__":
     unittest.main()

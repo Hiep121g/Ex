@@ -53,6 +53,8 @@ FREEZE_LINE = "#8a8a8a"
 BREAK_LINE = {False: "#8c8c8c", True: "#4f4f4f"}  # automatic / manual page breaks
 OUTLINE_BG, OUTLINE_FG = "#fbfbfb", "#7a7a7a"
 HYPERLINK_FG = "#0563c1"  # Excel's Hyperlink cell style: this colour, underlined
+PROTECTED_MSG = ("Ô hoặc đối tượng bạn muốn thay đổi nằm trên trang tính đang được bảo vệ.\n"
+                 "Để thay đổi, hãy bỏ bảo vệ: Xem lại → Bỏ bảo vệ Trang tính.")
 FILTERED_ROW_FG = "#2b579a"  # row numbers inside a filtered range, as in Excel
 NOTE_MARK = "#d13438"
 NOTE_BG = "#ffffe1"
@@ -133,7 +135,7 @@ MENU_ICONS = {
     "In": "print", "Xuất PDF": "pdf", "Thiết lập Trang": "page_setup",
     "Nhóm": "group", "Bỏ nhóm": "ungroup", "Tổng phụ": "subtotal", "Xóa dàn bài": "clear",
     "Trình Quản lý Tên": "name_manager", "Liên kết": "link", "Mở liên kết": "link", "Loại bỏ liên kết": "delete_x",
-    "Thay ảnh": "picture",
+    "Thay ảnh": "picture", "Bảo vệ Trang tính": "protect", "Khóa ô": "lock_cell",
     "Cắt": "cut", "Sao chép": "copy", "Dán": "paste", "Tùy chọn dán": "paste", "Dán công thức": "paste_formulas",
     "Dán giá trị": "paste_values", "Dán định dạng": "paste_formats", "Dán chuyển vị": "paste_transpose",
     "Dán đặc biệt": "paste_special", "Gạch chân": "underline", "Gạch chân kép": "underline_double",
@@ -206,6 +208,11 @@ THANH RIBBON
     giá trị có ô tìm kiếm. Thanh trạng thái cho biết số bản ghi tìm thấy.
   • Trang chủ → Tìm và Chọn → Đi tới Đặc biệt: chọn ô trống, hằng số, công thức, ô có ghi chú... (ví dụ chọn
     các ô trống rồi gõ giá trị và nhấn Ctrl+Enter để điền vào tất cả). Chuột phải vào tab để Ẩn / Bỏ ẩn trang tính.
+  • Xem lại → Bảo vệ Trang tính: không cho sửa các ô bị khóa (mặc định mọi ô đều khóa). Trước khi bảo vệ, chọn
+    các ô cần cho nhập rồi bấm Khóa ô (hoặc Định dạng ô → Bảo vệ, bỏ chọn Khóa); "Ẩn công thức" giấu công thức
+    trên thanh công thức. Có thể đặt mật khẩu (kiểu Excel, chỉ chống sửa nhầm).
+  • Dữ liệu → Văn bản thành Cột: tách một cột (ví dụ "Họ tên, SĐT, Địa chỉ") thành nhiều cột theo dấu phẩy,
+    dấu chấm phẩy, dấu cách... hoặc theo độ rộng cố định; có thể giữ số 0 ở đầu số điện thoại.
   • Tên vùng: chọn vùng, gõ tên (ví dụ ĐơnGiá) vào ô Tên bên trái thanh công thức rồi Enter; sau đó dùng
     =SUM(ĐơnGiá). Công thức → Trình Quản lý Tên (Ctrl+F3) để sửa/xóa, Tạo từ Vùng chọn (Ctrl+Shift+F3) để đặt
     tên theo hàng tiêu đề. Chọn tên trong danh sách của ô Tên để nhảy tới vùng đó.
@@ -768,6 +775,7 @@ class SpreadsheetApp:
                                                 ("Bỏ ẩn trang tính...", self.unhide_sheet, "", "sheet_unhide")]),
             None, ("SẮP XẾP TRANG TÍNH", None), ("Đổi tên trang tính", lambda: self.rename_sheet(self.sheet)),
             ("Sao chép trang tính", self.copy_sheet), ("Màu tab", tab_colors), None,
+            ("BẢO VỆ", None), ("Bảo vệ Trang tính...", self.toggle_protection), ("Khóa ô", self.toggle_lock_cells),
             ("Định dạng ô...", lambda: self.format_cells_dialog(), "Ctrl+1")])
         self._btn(g, large=True, icon="insert_cells", text="Chèn", command=self.insert_smart, menu=insert_menu,
                   split=True, tooltip="Chèn ô, hàng, cột hoặc trang tính")
@@ -922,6 +930,8 @@ class SpreadsheetApp:
         self._btn(g, col, side="top", icon="show_detail", text="Hiện chi tiết", command=lambda: self.outline_detail(True))
         self._btn(g, col, side="top", icon="hide_detail", text="Ẩn chi tiết", command=lambda: self.outline_detail(False))
         g = rb.group(page, "Công cụ dữ liệu")
+        self._btn(g, large=True, icon="text_columns", text="Văn bản\nthành Cột", command=self.text_to_columns,
+                  tooltip="Văn bản thành Cột\nTách nội dung một cột thành nhiều cột theo dấu phẩy, dấu cách...")
         self._btn(g, large=True, icon="remove_dup", text="Loại bỏ\ntrùng lặp", command=self.remove_duplicates)
         self._btn(g, large=True, icon="validation", text="Xác thực\ndữ liệu", command=self.data_validation_dialog,
                   menu=self._make_menu([("Xác thực dữ liệu...", self.data_validation_dialog),
@@ -939,6 +949,13 @@ class SpreadsheetApp:
         self._btn(g, col, side="top", icon="note_next", text="Ghi chú tiếp", command=lambda: self.goto_note(1))
         self.btn_show_notes = self._btn(g, large=True, icon="note", text="Hiện tất cả\nghi chú",
                                         command=self.toggle_show_notes, tooltip="Hiện/ẩn mọi ghi chú trên trang tính")
+        g = rb.group(page, "Bảo vệ")
+        self.btn_protect = self._btn(g, large=True, icon="protect", text="Bảo vệ\nTrang tính", label="Bảo vệ Trang tính",
+                                     command=self.toggle_protection,
+                                     tooltip="Bảo vệ Trang tính\nKhông cho sửa các ô bị khóa (có thể đặt mật khẩu).\n"
+                                             "Bỏ khóa ô trước bằng Định dạng ô → Bảo vệ.")
+        self._btn(g, large=True, icon="lock_cell", text="Khóa\nô", command=self.toggle_lock_cells,
+                  tooltip="Khóa ô\nBật/tắt khóa các ô đang chọn (có tác dụng khi trang tính được bảo vệ)")
 
     def _build_page_layout_tab(self, page):
         rb = self.ribbon
@@ -2134,7 +2151,10 @@ class SpreadsheetApp:
 
     def update_formula_bar(self):
         if not self.is_editing():
-            self.fx_var.set(self.wb.get_raw(self.sheet, *self.cur))
+            raw = self.wb.get_raw(self.sheet, *self.cur)
+            if self.sh.protection and (self.sh.formats.get(self.cur) or {}).get("hide_formula"):
+                raw = ""  # Format Cells > Protection > Hidden: the formula is not shown while protected
+            self.fx_var.set(raw)
         editing = self.is_editing()
         self.btn_x.config(fg="#c42b1c" if editing else "#c0c0c0")
         self.btn_ok.config(fg="#107c41" if editing else "#c0c0c0")
@@ -2175,6 +2195,7 @@ class SpreadsheetApp:
         self.btn_painter.set_checked(self.painter is not None)
         self.btn_show_formulas.set_checked(self.show_formulas)
         self.btn_filter.set_checked(self.sh.filter is not None)
+        self.btn_protect.set_checked(self.sh.protection is not None)
         self.print_grid_var.set(bool((self.sh.page_setup or {}).get("gridlines")))
         num = dialogs.canonical_format(fmt.get("num"))
         self.numfmt_box.set(next((label for label, f in NUMBER_FORMATS if dialogs.canonical_format(f) == num),
@@ -2374,6 +2395,9 @@ class SpreadsheetApp:
             self.open_validation_list()
             return "break"
         hit = self._chart_at(e.x, e.y)
+        prot = self.sh.protection
+        if hit is not None and prot and "objects" not in prot.get("allow", ()):
+            hit = None  # objects on a protected sheet can't be selected
         if hit is not None and not self._point_mode_ok():
             self.commit_edit()
             self.canvas.focus_set()
@@ -2405,6 +2429,8 @@ class SpreadsheetApp:
         self.commit_edit()
         self.canvas.focus_set()
         border = self._border_hit(e.x, e.y)
+        if border is not None and prot and "format_rows_cols" not in prot.get("allow", ()):
+            border = None
         if border is not None:
             axis, index = border
             size = self.col_w(index) if axis == "col" else self.row_h(index)
@@ -2683,6 +2709,8 @@ class SpreadsheetApp:
             return
         if self._pivot_guard(*self._cell_box(*self._anchor(self.cur))):
             return
+        if self._locked(cells=[self._anchor(self.cur)]):
+            return
         if self.painter:
             self.stop_painter()
         r, c = self.cur = self._anchor(self.cur)
@@ -2751,6 +2779,46 @@ class SpreadsheetApp:
             self.edit_cell, self.edit_mode = (self.sheet, *self.cur), "edit"
         self.set_mode("Sửa")
         self.update_formula_bar()
+
+    def toggle_protection(self):
+        """Review > Protect Sheet / Unprotect Sheet."""
+        self.commit_edit()
+        sh = self.sh
+        if sh.protection:
+            if sh.protection.get("hash"):
+                pw = simpledialog.askstring("Bỏ bảo vệ Trang tính", "Mật khẩu:", show="*", parent=self.root)
+                if pw is None:
+                    return
+                if fe.password_hash(pw) != sh.protection["hash"]:
+                    messagebox.showerror(APP_NAME, "Mật khẩu không đúng.", parent=self.root)
+                    return
+            self._structural(lambda: setattr(sh, "protection", None))
+            self.set_mode("Đã bỏ bảo vệ trang tính")
+            return
+        result = dialogs.ProtectSheetDialog(self.root).show()
+        if result is not None:
+            password, allow = result
+            self._structural(lambda: setattr(sh, "protection", {"hash": fe.password_hash(password), "allow": allow}))
+            self.set_mode("Trang tính đang được bảo vệ")
+
+    def toggle_lock_cells(self):
+        """Format > Lock Cell: lock or unlock the selected cells (what protection then keeps from changes)."""
+        self.commit_edit()
+        if self.sh.protection:
+            messagebox.showinfo(APP_NAME, PROTECTED_MSG, parent=self.root)
+            return
+        targets = self._format_targets()
+        unlock = any(fe.cell_locked(self.sh.formats.get(k)) for k in targets)
+        cs = ChangeSet(self.wb)
+        for r, c in targets:
+            fmt = dict(self.sh.formats.get((r, c)) or {})
+            if unlock:
+                fmt["unlocked"] = True
+            else:
+                fmt.pop("unlocked", None)
+            cs.set(self.sheet, r, c, fmt=fmt)
+        self.commit(cs)
+        self.set_mode("Đã bỏ khóa ô" if unlock else "Đã khóa ô")
 
     def _formula_assist(self, entry):
         """Function (and defined name) list while typing, argument tip inside a call, F4 for $ references."""
@@ -2903,6 +2971,13 @@ class SpreadsheetApp:
         changes = cs.changes()
         if not changes:
             return False
+        for (sheet, r, c), raw0, raw1, fmt0, fmt1 in changes:  # protected sheets: locked cells keep their content
+            prot = self.wb.sheets[sheet].protection
+            if prot and ((raw0 != raw1 and (fe.cell_locked(fmt0) or fe.cell_locked(fmt1)))
+                         or (fmt0 != fmt1 and "format_cells" not in prot.get("allow", ()))):
+                messagebox.showinfo(APP_NAME, PROTECTED_MSG, parent=self.root)
+                self.refresh()
+                return False
         self._apply_changes(changes, forward=True)
         self._push_undo(("cells", changes, self._sel_state()))
         return True
@@ -2938,10 +3013,38 @@ class SpreadsheetApp:
             messagebox.showerror(APP_NAME, str(err), parent=self.root)
             self.wb.restore(before)
             return False
+        if self._protection_broken(before):
+            self.wb.restore(before)
+            self.refresh_all()
+            return False
         self.wb.invalidate()
         self._push_snapshot(before, sel)
         self.refresh_all()
         return True
+
+    def _protection_broken(self, before):
+        """After a change: True (having told the user) when it altered a protected sheet in a way its
+        protection does not allow; sheets protected or unprotected by the change itself are not checked."""
+        old = dict(before[0])
+        for name, sh in self.wb.sheets.items():
+            state = old.get(name)
+            if sh.protection and state and state.get("protection"):
+                if fe.protection_problem(state, sh.copy_state(), sh.protection.get("allow", ())):
+                    messagebox.showinfo(APP_NAME, PROTECTED_MSG, parent=self.root)
+                    return True
+        return False
+
+    def _locked(self, sheet=None, cells=None, need=None):
+        """True (after telling the user) when the sheet is protected and the cells are locked, or `need`
+        (a protection option) is not allowed."""
+        sh = self.wb.sheets[sheet or self.sheet]
+        prot = sh.protection
+        if not prot:
+            return False
+        if (need and need not in prot.get("allow", ())) or any(fe.cell_locked(sh.formats.get(k)) for k in cells or ()):
+            messagebox.showinfo(APP_NAME, PROTECTED_MSG, parent=self.root)
+            return True
+        return False
 
     def undo(self):
         self._undo_redo(self.undo_stack, self.redo_stack, forward=False)
@@ -3948,6 +4051,45 @@ class SpreadsheetApp:
             r1, c1, r2, c2 = out["rect"]
             self.cur, self.ext = (r1, c1), (r2, c2)
             self.refresh()
+
+    def text_to_columns(self):
+        """Data > Text to Columns: split the text of one column into the columns to its right."""
+        self.commit_edit()
+        r1, c1, r2, c2 = self.sel_rect()
+        if c1 != c2:
+            messagebox.showinfo(APP_NAME, "Hãy chọn các ô trong một cột để tách.", parent=self.root)
+            return
+        if self._is_huge(r1, c1, r2, c2):
+            r2 = min(r2, self.wb.used_extent(self.sheet)[0] - 1)
+        rows = [r for r in range(r1, r2 + 1) if (r, c1) in self.sh.cells and not fe.is_formula(self.sh.cells[(r, c1)])]
+        if not rows:
+            self.root.bell()
+            return
+        texts = {r: self.wb.display_text(self.sheet, r, c1) for r in rows}
+        opts = dialogs.TextToColumnsDialog(self.root, [texts[r] for r in rows]).show()
+        if not opts:
+            return
+        parts = {r: [p.strip() for p in fe.split_text(texts[r], opts["delimiters"], opts["merge"], opts["breaks"])]
+                 for r in rows}
+        width = max(len(p) for p in parts.values())
+        if c1 + width > MAX_COLS:
+            self.root.bell()
+            return
+        if any((r, c) in self.sh.cells for r in rows for c in range(c1 + 1, c1 + width)) and not messagebox.askyesno(
+                APP_NAME, "Ở các cột bên phải đã có dữ liệu. Bạn có muốn thay thế không?", parent=self.root):
+            return
+        if self._pivot_guard(r1, c1, r2, c1 + width - 1):
+            return
+        cs = ChangeSet(self.wb)
+        for r, values in parts.items():
+            for k in range(width):
+                value = values[k] if k < len(values) else ""
+                if opts["as_text"] and value and fe.parse_literal(value)[0] != value:
+                    value = "'" + value  # kept as typed: phone numbers keep their leading 0
+                cs.set(self.sheet, r, c1 + k, raw=value or None)
+        self.commit(cs)
+        self.cur, self.ext = (r1, c1), (r2, c1 + width - 1)
+        self.refresh()
 
     def go_to_special(self):
         """Select the cells of one kind (blanks, constants, formulas...) in the selection or the whole sheet."""

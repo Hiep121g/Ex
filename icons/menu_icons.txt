@@ -106,6 +106,7 @@ line_medium
 line_thick
 line_thin
 link
+lock_cell
 margins
 merge
 merge_across
@@ -141,6 +142,7 @@ print
 print_area
 print_preview
 print_titles
+protect
 rank_above
 rank_below
 rank_bottom
@@ -177,6 +179,7 @@ stat_max
 stat_min
 strike
 subtotal
+text_columns
 underline
 underline_double
 undo

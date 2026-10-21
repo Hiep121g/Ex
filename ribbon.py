@@ -958,6 +958,37 @@ def _icon_link(cv, P, k, c):
     cv.create_line(*P(6, 10, 10, 6), fill=BLUE, width=w)
 
 
+def _icon_text_columns(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 2, 6.5, 14), fill="#ffffff", outline=GRAY)
+    _lines(cv, P, k, [(2.5, 5, 5.5), (2.5, 8, 5.5), (2.5, 11, 5.5)], DARK)
+    _arrow(cv, P, k, 7, 8, 10, 8, BLUE, 1.2)
+    for x in (10.5, 13):
+        cv.create_rectangle(*P(x, 2, x + 2.5, 14), fill="#ddebf7", outline=GRAY)
+
+
+def _padlock(cv, P, k, x, y, s=1.0, open_=False):
+    w = max(1, round(1.6 * k * s))
+    if open_:
+        cv.create_arc(*P(x + 3 * s, y - 4 * s, x + 9 * s, y + 4 * s), start=0, extent=180, style="arc",
+                      outline=GRAY, width=w)
+    else:
+        cv.create_arc(*P(x + 1.5 * s, y - 4 * s, x + 7.5 * s, y + 4 * s), start=0, extent=180, style="arc",
+                      outline=GRAY, width=w)
+    cv.create_rectangle(*P(x, y, x + 9 * s, y + 7 * s), fill="#ffc000", outline="#b38f00")
+    cv.create_oval(*P(x + 3.7 * s, y + 2.2 * s, x + 5.3 * s, y + 3.8 * s), fill=DARK, outline="")
+
+
+def _icon_protect(cv, P, k, c):
+    _sheet(cv, P, k, 1, 1, 12, 12)
+    _padlock(cv, P, k, 6.5, 8.5, 1.0)
+
+
+def _icon_lock_cell(cv, P, k, c):
+    _grid(cv, P, k, 1.5, 1.5, 12.5, 12.5, 2, GRAY, "#ffffff")
+    cv.create_rectangle(*P(1.5, 1.5, 7, 7), fill="#ddebf7", outline=BLUE)
+    _padlock(cv, P, k, 7, 9, 0.9)
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -1051,7 +1082,8 @@ ICONS.update({
     "group": _icon_group, "ungroup": lambda *a: _icon_group(*a, ungroup=True), "subtotal": _icon_subtotal,
     "show_detail": lambda *a: _icon_detail(*a, True), "hide_detail": lambda *a: _icon_detail(*a, False),
 })
-ICONS.update({"picture": _icon_picture, "link": _icon_link})
+ICONS.update({"picture": _icon_picture, "link": _icon_link, "text_columns": _icon_text_columns,
+              "protect": _icon_protect, "lock_cell": _icon_lock_cell})
 ICONS.update({f"name_{kind}": (lambda kind: lambda *a: _icon_name(*a, kind))(kind)
               for kind in ("manager", "define", "use", "create")})
 

@@ -166,7 +166,7 @@ class ColorButton(tk.Frame):
 class FormatCellsDialog(Dialog):
     """Excel's Format Cells (Ctrl+1). collect() returns only what the user changed."""
 
-    TABS = ("number", "align", "font", "border", "fill")
+    TABS = ("number", "align", "font", "border", "fill", "protection")
 
     def __init__(self, master, ui, fmt, sample, families, default_family, tab="number", merged=False,
                  multi_rows=False, multi_cols=False):
@@ -181,6 +181,7 @@ class FormatCellsDialog(Dialog):
         self._font_tab()
         self._border_tab()
         self._fill_tab()
+        self._protection_tab()
         self.nb.select(self.TABS.index(tab) if tab in self.TABS else 0)
         self.add_buttons()
 
@@ -547,6 +548,18 @@ class FormatCellsDialog(Dialog):
         self.fill_preview.pack(anchor="w")
         self._set_fill(self.fill_color)
 
+    # protection
+    def _protection_tab(self):
+        page = ttk.Frame(self.nb, padding=10)
+        self.nb.add(page, text="Bảo vệ")
+        self.locked_var = tk.BooleanVar(value=not self.fmt.get("unlocked"))
+        self.hidden_var = tk.BooleanVar(value=bool(self.fmt.get("hide_formula")))
+        ttk.Checkbutton(page, text="Khóa", variable=self.locked_var).pack(anchor="w")
+        ttk.Checkbutton(page, text="Ẩn công thức", variable=self.hidden_var).pack(anchor="w", pady=(4, 0))
+        ttk.Label(page, text="Khóa ô hoặc ẩn công thức chỉ có tác dụng khi trang tính được bảo vệ\n"
+                             "(Xem lại → Bảo vệ Trang tính).", foreground="#666", justify="left").pack(anchor="w",
+                                                                                                    pady=(12, 0))
+
     def _set_fill(self, color):
         self.fill_color = color
         self.fill_preview.config(bg=color or "#ffffff", text="" if color else "Không màu")
@@ -589,6 +602,10 @@ class FormatCellsDialog(Dialog):
         if self.border_touched:
             line = self._line()
             out["borders"] = {k: (line if v.get() else None) for k, v in self.edge_vars.items()}
+        if (not self.locked_var.get()) != bool(self.fmt.get("unlocked")):
+            out["unlocked"] = True if not self.locked_var.get() else None
+        if self.hidden_var.get() != bool(self.fmt.get("hide_formula")):
+            out["hide_formula"] = True if self.hidden_var.get() else None
         return out
 
 
@@ -2098,3 +2115,119 @@ class GoToSpecialDialog(Dialog):
             self.bell()
             return None
         return self.kind.get(), types
+
+
+class TextToColumnsDialog(Dialog):
+    """Data > Text to Columns: delimiters or fixed widths, with a preview of the first rows.
+    collect() gives {"delimiters", "merge", "breaks" (None when delimited), "as_text"}."""
+
+    DELIMS = (("\t", "Tab"), (";", "Dấu chấm phẩy ;"), (",", "Dấu phẩy ,"), (" ", "Dấu cách"))
+
+    def __init__(self, master, samples):
+        super().__init__(master, "Chuyển Văn bản thành Cột")
+        self.samples = samples
+        f = self.body
+        self.mode = tk.StringVar(value="delimited")
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        ttk.Radiobutton(top, text="Phân tách bằng ký tự", value="delimited", variable=self.mode,
+                        command=self.update).pack(side="left")
+        ttk.Radiobutton(top, text="Độ rộng cố định", value="fixed", variable=self.mode,
+                        command=self.update).pack(side="left", padx=16)
+        box = ttk.LabelFrame(f, text="Dấu phân tách", padding=6)
+        box.pack(fill="x", pady=6)
+        # Tab, semicolon or comma found in every row is the likely separator; spaces only when nothing else
+        guess = next((d for d in ("\t", ";", ",") if samples and all(d in s for s in samples)), " ")
+        self.delims = {}
+        for i, (d, label) in enumerate(self.DELIMS):
+            self.delims[d] = tk.BooleanVar(value=d == guess and any(d in s for s in samples))
+            ttk.Checkbutton(box, text=label, variable=self.delims[d], command=self.update).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 18))
+        ttk.Label(box, text="Khác:").grid(row=2, column=0, sticky="w")
+        self.other = tk.StringVar()
+        entry = ttk.Entry(box, textvariable=self.other, width=4)
+        entry.grid(row=2, column=0, sticky="e", padx=(0, 18))
+        self.other.trace_add("write", lambda *a: self.update())
+        self.merge = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Coi các dấu liên tiếp là một", variable=self.merge, command=self.update).grid(
+            row=2, column=1, sticky="w")
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        ttk.Label(row, text="Vị trí ngắt (độ rộng cố định), ví dụ 5, 12:").pack(side="left")
+        self.breaks = tk.StringVar()
+        ttk.Entry(row, textvariable=self.breaks, width=16).pack(side="left", padx=6)
+        self.breaks.trace_add("write", lambda *a: self.update())
+        self.as_text = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Giữ dạng văn bản (không đổi 0912... thành số)", variable=self.as_text).pack(
+            anchor="w", pady=(6, 0))
+        ttk.Label(f, text="Xem trước:").pack(anchor="w", pady=(8, 2))
+        self.preview = ttk.Treeview(f, show="headings", height=6)
+        self.preview.pack(fill="both", expand=True)
+        self.add_buttons()
+        self.update()
+
+    def options(self):
+        if self.mode.get() == "fixed":
+            try:
+                breaks = sorted({int(x) for x in self.breaks.get().replace(";", ",").split(",") if x.strip()})
+            except ValueError:
+                breaks = []
+            return {"delimiters": "", "merge": False, "breaks": breaks, "as_text": self.as_text.get()}
+        delims = "".join(d for d, var in self.delims.items() if var.get()) + self.other.get()[:1]
+        return {"delimiters": delims, "merge": self.merge.get(), "breaks": None, "as_text": self.as_text.get()}
+
+    def update(self):
+        opts = self.options()
+        rows = [fe.split_text(s, opts["delimiters"], opts["merge"], opts["breaks"]) for s in self.samples[:8]]
+        width = max((len(r) for r in rows), default=1)
+        cols = [f"c{i}" for i in range(width)]
+        self.preview.configure(columns=cols)
+        for i, col in enumerate(cols):
+            self.preview.heading(col, text=f"Cột {i + 1}")
+            self.preview.column(col, width=110, anchor="w")
+        self.preview.delete(*self.preview.get_children())
+        for r in rows:
+            self.preview.insert("", "end", values=[p.strip() for p in r])
+
+    def collect(self):
+        opts = self.options()
+        if self.mode.get() == "fixed" and not opts["breaks"] or self.mode.get() == "delimited" and not opts["delimiters"]:
+            self.bell()
+            return None
+        return opts
+
+
+class ProtectSheetDialog(Dialog):
+    """Protect Sheet: an optional password and what users may still do. collect() gives (password, allow)."""
+
+    def __init__(self, master):
+        super().__init__(master, "Bảo vệ Trang tính")
+        f = self.body
+        ttk.Label(f, text="Mật khẩu để bỏ bảo vệ (không bắt buộc):").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.pw = tk.StringVar()
+        self.pw_entry = ttk.Entry(f, textvariable=self.pw, show="*", width=30)
+        self.pw_entry.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 6))
+        ttk.Label(f, text="Nhập lại mật khẩu:").grid(row=2, column=0, columnspan=2, sticky="w")
+        self.pw2 = tk.StringVar()
+        ttk.Entry(f, textvariable=self.pw2, show="*", width=30).grid(row=3, column=0, columnspan=2, sticky="w",
+                                                                     pady=(2, 10))
+        ttk.Label(f, text="Cho phép người dùng:").grid(row=4, column=0, columnspan=2, sticky="w")
+        self.allow = {}
+        for i, (key, label) in enumerate(fe.PROTECT_OPTIONS):
+            self.allow[key] = tk.BooleanVar(value=key == "outline")
+            ttk.Checkbutton(f, text=label, variable=self.allow[key]).grid(row=5 + i, column=0, columnspan=2,
+                                                                         sticky="w", padx=8)
+        ttk.Label(f, text="Chỉ các ô đã bỏ khóa (Định dạng ô → Bảo vệ) mới sửa được nội dung.\n"
+                          "Lưu ý: mật khẩu kiểu Excel chỉ chống sửa nhầm, không phải mã hóa.",
+                  foreground="#666", justify="left").grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.pw_entry)
+
+    def collect(self):
+        if self.pw.get() != self.pw2.get():
+            from tkinter import messagebox
+            messagebox.showerror("Bảo vệ Trang tính", "Hai lần nhập mật khẩu không khớp.", parent=self)
+            return None
+        return self.pw.get(), [k for k, v in self.allow.items() if v.get()]
