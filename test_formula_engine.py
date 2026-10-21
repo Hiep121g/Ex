@@ -1328,5 +1328,81 @@ class DefinedNameTests(unittest.TestCase):
             self.assertAlmostEqual(got.get_value("Dữ liệu", 2, 3), 165)
 
 
+def _png(width, height, rows):
+    """A tiny RGBA PNG; rows are (filter type, filtered bytes)."""
+    import struct
+    import zlib
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    raw = b"".join(bytes([f]) + bytes(data) for f, data in rows)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+class LinkAndPictureTests(unittest.TestCase):
+    PIXELS = [[10, 20, 30, 255, 15, 25, 35, 128], [12, 22, 32, 255, 20, 30, 40, 0]]
+
+    def picture_png(self):
+        a, b = self.PIXELS
+        sub = a[:4] + [(a[i] - a[i - 4]) % 256 for i in range(4, 8)]  # filter 1 (Sub)
+        up = [(b[i] - a[i]) % 256 for i in range(8)]                  # filter 2 (Up)
+        return _png(2, 2, [(1, sub), (2, up)])
+
+    def test_png_decoding_and_pdf_data(self):
+        import images
+        data = self.picture_png()
+        self.assertEqual(images.image_info(data), ("png", 2, 2))
+        w, h, rgb, alpha = images.decode_png(data)
+        a, b = self.PIXELS
+        self.assertEqual((w, h), (2, 2))
+        self.assertEqual(list(rgb), a[0:3] + a[4:7] + b[0:3] + b[4:7])
+        self.assertEqual(list(alpha), [255, 128, 255, 0])
+        info = images.pdf_image(data, "png")
+        self.assertEqual((info["w"], info["h"], info["space"]), (2, 2, "DeviceRGB"))
+        self.assertIsNotNone(info["alpha"])
+
+    def test_links_pictures_follow_rows_and_files(self):
+        import base64
+        wb = make({"A1": "Google", "A2": '=HYPERLINK("https://x.vn","Trang X")'})
+        sh = wb.sheets["Sheet1"]
+        sh.links[(0, 0)] = {"target": "https://www.google.com", "tip": "Tìm"}
+        self.assertEqual(wb.display_text("Sheet1", 1, 0), "Trang X")
+        self.assertEqual(wb.hyperlink_at("Sheet1", 1, 0)["target"], "https://x.vn")
+        picture = {"type": fe.PICTURE, "image": base64.b64encode(self.picture_png()).decode(), "format": "png",
+                   "id": "p1", "name": "ảnh", "anchor": (3, 1, 2, 2), "size": (40, 40)}
+        sh.charts.append(picture)
+        wb.insert_rows("Sheet1", 0)
+        self.assertEqual((list(sh.links), sh.charts[0]["anchor"]), ([(1, 0)], (4, 1, 2, 2)))
+        for ext in [".pyxl"] + ([".xlsx"] if fe.HAS_XLSX else []):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "l" + ext)
+                fe.save_workbook(wb, path)
+                got = fe.load_workbook(path).sheets["Sheet1"]
+            self.assertEqual(got.links, sh.links, ext)
+            if ext == ".xlsx" and importlib.util.find_spec("PIL") is None:
+                continue  # openpyxl reads pictures back only with Pillow
+            self.assertEqual([(c["type"], c["anchor"], c["size"], c["image"]) for c in got.charts],
+                             [(fe.PICTURE, (4, 1, 2, 2), (40, 40), picture["image"])], ext)
+
+    def test_pictures_in_pdf(self):
+        import base64
+        import printing
+        import ttf
+        library = ttf.FontLibrary()
+        if library.find("Arial") is None:
+            self.skipTest("no TrueType fonts on this machine")
+        wb = make({"A1": "x"})
+        wb.sheets["Sheet1"].charts.append({"type": fe.PICTURE, "image": base64.b64encode(self.picture_png()).decode(),
+                                           "format": "png", "id": "p1", "anchor": (1, 1, 0, 0), "size": (60, 60)})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.pdf")
+            printing.export_pdf(wb, ["Sheet1"], path, library)
+            with open(path, "rb") as f:
+                data = f.read()
+        self.assertIn(b"/Subtype /Image", data)
+        self.assertIn(b"/SMask", data)
+
+
 if __name__ == "__main__":
     unittest.main()

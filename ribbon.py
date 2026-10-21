@@ -937,6 +937,21 @@ def _icon_name(cv, P, k, c, kind):
         _tag(cv, P, k, 6, 8.5, 0.95)
 
 
+def _icon_picture(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 2.5, 14.5, 13.5), fill="#ffffff", outline=GRAY)
+    cv.create_rectangle(*P(3, 4, 13, 12), fill="#ddebf7", outline="")
+    cv.create_polygon(*P(3, 12, 6.5, 7, 9, 10, 10.5, 8.5, 13, 12), fill="#70ad47", outline="")
+    cv.create_oval(*P(9.5, 4.8, 11.9, 7.2), fill="#ffc000", outline="")
+
+
+def _icon_link(cv, P, k, c):
+    w = max(2, round(1.7 * k))
+    for x, y in ((2.5, 7.5), (7.5, 3.5)):
+        cv.create_polygon(*P(x + 1.5, y + 5, x, y + 3.5, x + 4, y - 0.5, x + 5.5, y + 1), fill="", outline=BLUE,
+                          width=w)
+    cv.create_line(*P(6, 10, 10, 6), fill=BLUE, width=w)
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -1030,6 +1045,7 @@ ICONS.update({
     "group": _icon_group, "ungroup": lambda *a: _icon_group(*a, ungroup=True), "subtotal": _icon_subtotal,
     "show_detail": lambda *a: _icon_detail(*a, True), "hide_detail": lambda *a: _icon_detail(*a, False),
 })
+ICONS.update({"picture": _icon_picture, "link": _icon_link})
 ICONS.update({f"name_{kind}": (lambda kind: lambda *a: _icon_name(*a, kind))(kind)
               for kind in ("manager", "define", "use", "create")})
 

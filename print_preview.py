@@ -8,6 +8,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
 
+import images
 import pdf
 import printing
 from dialogs import PAPER_LABELS
@@ -50,11 +51,13 @@ class CanvasSurface:
     def __init__(self, canvas, library):
         self.cv, self.library = canvas, library
         self.doc = pdf.PdfDocument(library)  # only for measuring
+        self.pictures, self._parts = None, []  # _parts: cropped pictures, kept while shown
         self.z, self.ox, self.oy = 1.0, 0.0, 0.0
         self._ttf, self._tk, self._box = {}, {}, None
 
     def place(self, zoom, ox, oy):
         self.z, self.ox, self.oy = zoom, ox, oy
+        self._parts = []
 
     def _xy(self, *coords):
         return [self.ox + v * self.z if i % 2 == 0 else self.oy + v * self.z for i, v in enumerate(coords)]
@@ -166,6 +169,29 @@ class CanvasSurface:
         if style != "arc":
             opts["fill"] = fill or ""
         self.cv.create_arc(*self._xy(x0, y0, x1, y1), **opts)
+
+    def picture(self, x0, y0, x1, y1, picture):
+        if self.pictures is None:
+            self.pictures = images.PictureCache(self.cv)
+        px0, py0, px1, py1 = self._xy(x0, y0, x1, y1)
+        photo = self.pictures.photo(picture["id"], picture["image"], picture.get("format", "png"), px1 - px0, py1 - py0)
+        box = self._xy(*self._box) if self._box else (px0, py0, px1, py1)
+        if photo is None:
+            self.cv.create_rectangle(max(px0, box[0]), max(py0, box[1]), min(px1, box[2]), min(py1, box[3]),
+                                     fill="#f2f2f2", outline="#a6a6a6")
+            return
+        w, h = photo.width(), photo.height()
+        left, top = (px0 + px1 - w) / 2, (py0 + py1 - h) / 2
+        cut = (max(0, round(box[0] - left)), max(0, round(box[1] - top)),
+               min(w, round(box[2] - left)), min(h, round(box[3] - top)))
+        if cut[2] <= cut[0] or cut[3] <= cut[1]:
+            return
+        if cut != (0, 0, w, h):  # the canvas can't clip: draw only the part inside the clip box
+            part = tk.PhotoImage(master=self.cv)
+            part.tk.call(part.name, "copy", str(photo), "-from", *cut)
+            self._parts.append(part)
+            photo = part
+        self.cv.create_image(left + cut[0], top + cut[1], image=photo, anchor="nw")
 
     def clip(self, x0, y0, x1, y1):
         self._box = (x0, y0, x1, y1)

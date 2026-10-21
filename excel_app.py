@@ -3,6 +3,7 @@
 Run:  python excel_app.py [file.xlsx | file.pyxl | file.csv]
 """
 
+import base64
 import csv
 import datetime as dt
 import io
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import webbrowser
 import tkinter as tk
 import tkinter.font as tkfont
 import unicodedata
@@ -22,6 +24,7 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 import charts
 import dialogs
 import formula_engine as fe
+import images
 import pivot as pv
 import printing
 import richclip
@@ -49,6 +52,7 @@ SHEETBAR_BG = "#ececec"
 FREEZE_LINE = "#8a8a8a"
 BREAK_LINE = {False: "#8c8c8c", True: "#4f4f4f"}  # automatic / manual page breaks
 OUTLINE_BG, OUTLINE_FG = "#fbfbfb", "#7a7a7a"
+HYPERLINK_FG = "#0563c1"  # Excel's Hyperlink cell style: this colour, underlined
 FILTERED_ROW_FG = "#2b579a"  # row numbers inside a filtered range, as in Excel
 NOTE_MARK = "#d13438"
 NOTE_BG = "#ffffe1"
@@ -128,7 +132,8 @@ MENU_ICONS = {
     "Mới": "file_new", "Mở": "file_open", "Lưu": "save", "Lưu thành": "file_save_as", "Thoát": "file_exit",
     "In": "print", "Xuất PDF": "pdf", "Thiết lập Trang": "page_setup",
     "Nhóm": "group", "Bỏ nhóm": "ungroup", "Tổng phụ": "subtotal", "Xóa dàn bài": "clear",
-    "Trình Quản lý Tên": "name_manager",
+    "Trình Quản lý Tên": "name_manager", "Liên kết": "link", "Mở liên kết": "link", "Loại bỏ liên kết": "delete_x",
+    "Thay ảnh": "picture",
     "Cắt": "cut", "Sao chép": "copy", "Dán": "paste", "Tùy chọn dán": "paste", "Dán công thức": "paste_formulas",
     "Dán giá trị": "paste_values", "Dán định dạng": "paste_formats", "Dán chuyển vị": "paste_transpose",
     "Dán đặc biệt": "paste_special", "Gạch chân": "underline", "Gạch chân kép": "underline_double",
@@ -202,6 +207,11 @@ THANH RIBBON
   • Tên vùng: chọn vùng, gõ tên (ví dụ ĐơnGiá) vào ô Tên bên trái thanh công thức rồi Enter; sau đó dùng
     =SUM(ĐơnGiá). Công thức → Trình Quản lý Tên (Ctrl+F3) để sửa/xóa, Tạo từ Vùng chọn (Ctrl+Shift+F3) để đặt
     tên theo hàng tiêu đề. Chọn tên trong danh sách của ô Tên để nhảy tới vùng đó.
+  • Chèn → Liên kết (Ctrl+K): ô dẫn tới trang web, tệp, một ô/tên trong sổ làm việc hoặc email. Nhấp vào ô để mở
+    liên kết; nhấp và giữ để chọn ô. Hàm =HYPERLINK("https://...", "Tên") cũng tạo liên kết.
+  • Chèn → Ảnh: ảnh PNG, GIF, JPEG đặt nổi trên trang tính; kéo để di chuyển, kéo góc để đổi cỡ (giữ tỉ lệ),
+    chuột phải để thay ảnh / đặt lại kích thước / xóa. Ảnh được in và lưu cùng tệp. Cài Pillow (pip install
+    pillow) để ảnh co giãn mịn hơn và xem được ảnh JPEG trên màn hình.
   • Dữ liệu → Nhóm (Alt+Shift+→): gom các hàng/cột đang chọn; nút −/+ ở lề trái (hoặc trên) thu gọn / mở
     rộng nhóm, các nút 1 2 3 ở góc hiện theo mức. Bỏ nhóm (Alt+Shift+←), Xóa dàn bài, Hiện/Ẩn chi tiết.
   • Dữ liệu → Tổng phụ: với bảng đã sắp xếp theo một cột (ví dụ Khu vực), thêm hàng "Bắc Tổng", "Nam Tổng"...
@@ -349,6 +359,8 @@ class SpreadsheetApp:
         self.ui_family = "Segoe UI" if "Segoe UI" in families else "Arial"
         self._init_metrics()
         self.menu_icons = MenuIcons(root, self.scale, os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons"))
+        self.pictures = images.PictureCache(root)
+        self._link_click = self._link_tip = self._link_tip_job = self._link_hover = None
         self._build_styles()
         self._build_ribbon()
         self._build_formula_bar()
@@ -819,6 +831,12 @@ class SpreadsheetApp:
             self._btn(g, large=True, icon="chart_" + kind, text=f"{text}\n", label=f"Biểu đồ {text.lower()}",
                       command=lambda k=kind: self.insert_chart(k),
                       tooltip=f"Chèn biểu đồ {text.lower()}\nVẽ từ vùng dữ liệu đang chọn")
+        g = rb.group(page, "Minh họa")
+        self._btn(g, large=True, icon="picture", text="Ảnh\n", command=self.insert_picture,
+                  tooltip="Chèn ảnh\nẢnh PNG, GIF, JPEG từ máy tính, đặt nổi trên các ô")
+        g = rb.group(page, "Liên kết")
+        self._btn(g, large=True, icon="link", text="Liên\nkết", command=self.insert_hyperlink,
+                  tooltip="Chèn liên kết (Ctrl+K)\nTới trang web, tệp, một ô trong sổ làm việc hoặc email")
         g = rb.group(page, "Hàm")
         self._btn(g, large=True, icon="function", text="Chèn\nhàm", command=self.insert_function_dialog,
                   tooltip="Chèn hàm (Shift+F3)")
@@ -1184,7 +1202,7 @@ class SpreadsheetApp:
         cv.bind("<Double-Button-1>", self.on_double)
         cv.bind("<Button-3>", self.on_context)
         cv.bind("<Motion>", self.on_motion)
-        cv.bind("<Leave>", lambda e: self._set_hover_note(None))
+        cv.bind("<Leave>", lambda e: (self._set_hover_note(None), self._hide_link_tip()))
         self.root.bind_all("<MouseWheel>", self.on_wheel)
         self.root.bind_all("<Shift-MouseWheel>", lambda e: self.on_wheel(e, horizontal=True))
 
@@ -1199,6 +1217,8 @@ class SpreadsheetApp:
             ("Chèn...", self.insert_cells_dialog, "Ctrl++"), ("Xóa...", self.delete_cells_dialog, "Ctrl+-"),
             ("Xóa nội dung", self.clear_contents, "Delete"), None,
             ("Chèn/Sửa ghi chú...", self.edit_note, "Shift+F2"), ("Xóa ghi chú", self.delete_notes), None,
+            ("Liên kết...", self.insert_hyperlink, "Ctrl+K"), ("Mở liên kết", self.open_hyperlink),
+            ("Loại bỏ liên kết", self.remove_hyperlinks), None,
             ("Lọc", [("Lọc theo giá trị của ô đã chọn", self.filter_by_value),
                      ("Lọc theo màu của ô đã chọn", lambda: self.filter_by_color("bg")),
                      ("Lọc theo màu phông của ô đã chọn", lambda: self.filter_by_color("fg")), None,
@@ -1211,6 +1231,9 @@ class SpreadsheetApp:
             ("Đổi kiểu biểu đồ", [(f"Biểu đồ {label.lower()}", lambda k=kind: self.set_chart_type(k))
                                   for kind, label in dialogs.CHART_KINDS]),
             ("Dữ liệu và tiêu đề biểu đồ...", self.edit_chart), None, ("Xóa biểu đồ", self.delete_chart)])
+        self.picture_menu = self._make_menu([
+            ("Đặt lại kích thước ảnh", self.reset_picture_size, "", "picture"), ("Thay ảnh...", self.change_picture),
+            None, ("Xóa ảnh", self.delete_chart, "Delete", "delete_x")])
         common = [("Cắt", self.cut), ("Sao chép", self.copy), ("Dán", self.paste), None]
         self.row_menu = self._make_menu(common + [
             ("Chèn", self.insert_rows, "", "insert_row"), ("Xóa", self.delete_rows, "", "delete_row"),
@@ -1248,7 +1271,8 @@ class SpreadsheetApp:
         for seq, func in extra.items():
             cv.bind(seq, lambda e, f=func: self._key_action(f))
         global_keys = {"n": self.new_file, "o": self.open_file, "s": self.save_file, "f": self.open_find,
-                       "h": lambda: self.open_find(True), "g": self.focus_name_box, "p": self.print_preview}
+                       "h": lambda: self.open_find(True), "g": self.focus_name_box, "p": self.print_preview,
+                       "k": self.insert_hyperlink}
         for key, func in global_keys.items():
             for k in (key, key.upper()):
                 self.root.bind_all(f"<Control-{k}>", lambda e, f=func: self._key_action(f))
@@ -1806,9 +1830,12 @@ class SpreadsheetApp:
             box = self._chart_box(chart)
             if box[2] < self.header_w or box[0] > W or box[3] < self.header_h or box[1] > H:
                 continue
-            labels, series = self.wb.chart_data(self.sheet, chart)
-            charts.draw_chart(cv, box, chart["type"], chart.get("title"), labels, series,
-                              self.font_for({"size": 14}), self.font_for({"size": 9}), self.px)
+            if chart["type"] == fe.PICTURE:
+                self._draw_picture(cv, chart, box)
+            else:
+                labels, series = self.wb.chart_data(self.sheet, chart)
+                charts.draw_chart(cv, box, chart["type"], chart.get("title"), labels, series,
+                                  self.font_for({"size": 14}), self.font_for({"size": 9}), self.px)
             self._chart_boxes.append((i, box))
             if i == self.chart_sel:
                 x0, y0, x1, y1 = box
@@ -1816,6 +1843,19 @@ class SpreadsheetApp:
                 s = max(3, round(4 * self.px))
                 for hx, hy in self._chart_handles(box).values():
                     cv.create_rectangle(hx - s, hy - s, hx + s, hy + s, fill="#ffffff", outline="#5f5f5f")
+
+    def _draw_picture(self, cv, picture, box):
+        x0, y0, x1, y1 = box
+        photo = self.pictures.photo(picture["id"], picture["image"], picture.get("format", "png"), x1 - x0, y1 - y0)
+        if photo is not None:
+            # without Pillow pictures scale in whole steps: centre what Tk made on the box
+            cv.create_image((x0 + x1) / 2, (y0 + y1) / 2, image=photo, anchor="center")
+        else:
+            cv.create_rectangle(x0, y0, x1, y1, fill="#f2f2f2", outline="#a6a6a6")
+            hint = ("Ảnh JPEG: cài Pillow để xem trên màn hình\n(pip install pillow)"
+                    if picture.get("format") == "jpeg" else "Không hiển thị được ảnh")
+            cv.create_text((x0 + x1) / 2, (y0 + y1) / 2, width=max(40, x1 - x0 - 10), fill="#595959",
+                           font=self.ui.small_font, justify="center", text=hint)
 
     @staticmethod
     def _chart_handles(box):
@@ -1865,6 +1905,10 @@ class SpreadsheetApp:
                 y0 = max(self.header_h, min(y0 + dy, y1 - least))
             if "b" in edges:
                 y1 = max(y1 + dy, y0 + least)
+            if len(edges) == 2 and self.sh.charts[d["index"]]["type"] == fe.PICTURE:  # corners keep the shape
+                bx0, by0, bx1, by1 = d["box"]
+                height = (x1 - x0) * (by1 - by0) / max(1, bx1 - bx0)
+                y0, y1 = (y1 - height, y1) if "t" in edges else (y0, y0 + height)
         self._place_chart(d["index"], (x0, y0, x1, y1))
         self.redraw()
 
@@ -2360,6 +2404,8 @@ class SpreadsheetApp:
                 self.ext = (r, c)
             else:
                 self.cur = self.ext = self._anchor((r, c))
+                if not self.painter and not e.state & CONTROL and self.wb.hyperlink_at(self.sheet, *self.cur):
+                    self._link_click = (self.sheet, self.cur, e.time)  # opened on release unless held
             self.drag = {"mode": "select"}
         self.refresh()
         return None
@@ -2428,6 +2474,8 @@ class SpreadsheetApp:
 
     def on_release(self, e):
         d, self.drag = self.drag, None
+        click, self._link_click = self._link_click, None
+        self._hide_link_tip()
         if self._autoscroll_job is not None:
             self.root.after_cancel(self._autoscroll_job)
             self._autoscroll_job = None
@@ -2445,6 +2493,13 @@ class SpreadsheetApp:
             return
         elif d["mode"] in ("select", "colsel", "rowsel") and self.painter:
             self._apply_painter()
+        if (click and d["mode"] == "select" and click[:2] == (self.sheet, self.cur) and self.ext == self.cur
+                and 0 <= e.time - click[2] < 600):  # a click, not a hold, on a linked cell follows the link
+            link = self.wb.hyperlink_at(self.sheet, *self.cur)
+            if link:
+                self.refresh()
+                self.follow_link(link)
+                return
         self.refresh()
 
     def on_double(self, e):
@@ -2500,6 +2555,15 @@ class SpreadsheetApp:
             cursor = "pencil"
         else:
             cursor = {"colhead": "sb_down_arrow", "rowhead": "sb_right_arrow", "cell": "plus"}.get(self.hit(e.x, e.y)[0], "")
+        link = self.wb.hyperlink_at(self.sheet, *anchor) if cursor == "plus" and not self.is_editing() else None
+        if link:
+            cursor = "hand2"
+        hover = (self.sheet, anchor) if link else None
+        if hover != self._link_hover:
+            self._link_hover = hover
+            self._hide_link_tip()
+            if link:
+                self._show_link_tip(link, e.x_root, e.y_root)
         if cursor != self._cursor:
             self._cursor = cursor
             self.canvas.config(cursor=cursor)
@@ -2542,10 +2606,11 @@ class SpreadsheetApp:
         if hit is not None:
             self.chart_sel = hit[0]
             self.redraw()
+            menu = self.picture_menu if self.sh.charts[hit[0]]["type"] == fe.PICTURE else self.chart_menu
             try:
-                self.chart_menu.tk_popup(e.x_root, e.y_root)
+                menu.tk_popup(e.x_root, e.y_root)
             finally:
-                self.chart_menu.grab_release()
+                menu.grab_release()
             return
         self.chart_sel = None
         kind, r, c = self.hit(e.x, e.y)
@@ -3563,6 +3628,8 @@ class SpreadsheetApp:
                     if contents:
                         self.wb.set_raw(self.sheet, *key, None)
             sh.set_merges([m for m in sh.merges if not (m[0] <= r2 and m[2] >= r1 and m[1] <= c2 and m[3] >= c1)])
+            if contents:  # Clear All takes the links too
+                sh.links = {k: v for k, v in sh.links.items() if not (r1 <= k[0] <= r2 and c1 <= k[1] <= c2)}
             self.autofit_rows({r for r in sh.row_heights if r1 <= r <= r2})
         self._structural(clear)
 
@@ -4117,19 +4184,180 @@ class SpreadsheetApp:
         self.redraw()
 
     def edit_chart(self):
-        if self.chart_sel is not None:
+        if self.chart_sel is not None and self.sh.charts[self.chart_sel]["type"] != fe.PICTURE:
             result = dialogs.ChartDialog(self.root, self.sh.charts[self.chart_sel]).show()
             if result:
                 self._update_chart(**result)
 
     def set_chart_type(self, kind):
-        if self.chart_sel is not None:
+        if self.chart_sel is not None and self.sh.charts[self.chart_sel]["type"] != fe.PICTURE:
             self._update_chart(type=kind)
 
     def delete_chart(self):
         if self.chart_sel is not None:
             index, self.chart_sel = self.chart_sel, None
             self._structural(lambda: self.sh.charts.pop(index))
+
+    # ------------------------------------------------------------------ pictures
+
+    def _ask_picture(self):
+        path = filedialog.askopenfilename(parent=self.root, title="Chèn ảnh", filetypes=[
+            ("Ảnh", "*.png *.gif *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"), ("Tất cả các tệp", "*.*")])
+        if not path:
+            return None
+        try:
+            return images.load_picture(path) + (os.path.splitext(os.path.basename(path))[0],)
+        except (OSError, ValueError) as err:
+            messagebox.showerror(APP_NAME, f"Không chèn được ảnh:\n{path}\n\n{err}", parent=self.root)
+            return None
+
+    @staticmethod
+    def _fit_picture(size, limit=(640, 480)):
+        w, h = size
+        k = min(1.0, limit[0] / max(1, w), limit[1] / max(1, h))
+        return max(8, round(w * k)), max(8, round(h * k))
+
+    def insert_picture(self):
+        """Insert > Pictures: a picture floating over the cells at the active cell."""
+        self.commit_edit()
+        found = self._ask_picture()
+        if not found:
+            return
+        data, fmt, size, name = found
+        r, c = self.cur
+        picture = {"type": fe.PICTURE, "image": data, "format": fmt, "id": fe.new_picture_id(), "name": name,
+                   "anchor": (r, c, 0, 0), "size": self._fit_picture(size), "native": list(size)}
+        if self._structural(lambda: self.sh.charts.append(picture)):
+            self.chart_sel = len(self.sh.charts) - 1
+            self.redraw()
+
+    def change_picture(self):
+        if self.chart_sel is None:
+            return
+        found = self._ask_picture()
+        if found:
+            data, fmt, size, name = found
+            old = self.sh.charts[self.chart_sel]
+            width = old["size"][0]
+            self._update_chart(image=data, format=fmt, id=fe.new_picture_id(), name=name, native=list(size),
+                               size=(width, max(8, round(width * size[1] / max(1, size[0])))))
+
+    def reset_picture_size(self):
+        if self.chart_sel is None:
+            return
+        picture = self.sh.charts[self.chart_sel]
+        native = picture.get("native") or images.image_info(base64.b64decode(picture["image"]))[1:]
+        self._update_chart(size=tuple(native))
+
+    # ------------------------------------------------------------------ hyperlinks
+
+    def insert_hyperlink(self):
+        """Insert > Link (Ctrl+K): link the active cell to a web page, a file, a place or an e-mail address."""
+        self.commit_edit()
+        r, c = self.cur = self.ext = self._anchor(self.cur)
+        if self._pivot_guard(r, c, r, c):
+            return
+        sheet, link = self.sheet, self.sh.links.get((r, c))
+        text = self.wb.display_text(sheet, r, c)
+        result = dialogs.HyperlinkDialog(self.root, text, link, list(self.wb.sheets),
+                                         [d["name"] for d in self.wb.sorted_names()], cell_name(r, c),
+                                         os.path.dirname(self.path) if self.path else None).show()
+        if not result:
+            return
+        if result.get("remove"):
+            self.remove_hyperlinks()
+            return
+
+        def change():
+            self.wb.sheets[sheet].links[(r, c)] = {"target": result["target"], "tip": result["tip"]}
+            if result["text"] != text or not self.wb.get_raw(sheet, r, c):
+                shown = result["text"]
+                self.wb.set_raw(sheet, r, c, "'" + shown if shown.startswith(("=", "'")) else shown)
+            fmt = dict(self.wb.get_format(sheet, r, c) or {}, fg=HYPERLINK_FG, underline=True)
+            self.wb.set_format(sheet, r, c, fmt)
+        self._structural(change)
+
+    def remove_hyperlinks(self):
+        """Remove Hyperlinks: the links in the selection and their blue underlined look."""
+        self.commit_edit()
+        r1, c1, r2, c2 = self.sel_rect()
+        keys = [k for k in self.sh.links if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
+        if not keys:
+            self.root.bell()
+            return
+        sheet = self.sheet
+
+        def change():
+            for key in keys:
+                del self.wb.sheets[sheet].links[key]
+                fmt = dict(self.wb.get_format(sheet, *key) or {})
+                if fmt.get("fg") == HYPERLINK_FG:
+                    fmt.pop("fg")
+                    fmt.pop("underline", None)
+                self.wb.set_format(sheet, *key, fmt or None)
+        self._structural(change)
+
+    def open_hyperlink(self):
+        link = self.wb.hyperlink_at(self.sheet, *self._anchor(self.cur))
+        if link:
+            self.follow_link(link)
+        else:
+            self.root.bell()
+
+    def follow_link(self, link):
+        """Open a link: '#Sheet!A1' or '#Name' goes there; web and mail addresses open in their programs;
+        anything else is a file (relative to the workbook's folder)."""
+        target = link["target"].strip()
+        if target.startswith("#"):
+            place = target[1:]
+            if place.upper() in self.wb.names:
+                if not self.go_to_name(place):
+                    self.root.bell()
+                return
+            sheet_part, _, addr = place.rpartition("!")
+            sheet = self.wb.resolve_sheet(sheet_part.strip("'").replace("''", "'")) if sheet_part else self.sheet
+            rect = fe.parse_range(addr.replace("$", "").strip())
+            if sheet is None or rect is None:
+                messagebox.showerror(APP_NAME, f"Không tìm thấy vị trí {place}.", parent=self.root)
+                return
+            self.commit_edit()
+            self.switch_sheet(sheet)
+            self.cur, self.ext = rect[:2], rect[2:]
+            self.ensure_visible(*self.cur)
+            self.refresh()
+            return
+        if re.match(r"[a-z][a-z0-9+.-]+:", target, re.I) and not re.match(r"[a-z]:[\\/]", target, re.I):
+            webbrowser.open(target)  # http:, https:, mailto:, ...
+            return
+        folder = os.path.dirname(self.path) if self.path else os.getcwd()
+        path = target if os.path.isabs(target) else os.path.join(folder, target)
+        try:
+            self._open_document(path)
+        except OSError as err:
+            messagebox.showerror(APP_NAME, f"Không mở được:\n{path}\n\n{err}", parent=self.root)
+
+    def _show_link_tip(self, link, x, y):
+        """The ScreenTip of a linked cell under the pointer (after a short pause), like Excel's."""
+        self._hide_link_tip()
+        text = (link.get("tip") or link["target"]) + "\nNhấp một lần để mở. Nhấp và giữ để chọn ô này."
+
+        def show():
+            self._link_tip_job = None
+            tip = self._link_tip = tk.Toplevel(self.root)
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            tk.Label(tip, text=text, bg="#ffffff", fg="#333333", bd=1, relief="solid", padx=7, pady=4, justify="left",
+                     font=self.ui.small_font).pack()
+            tip.geometry(f"+{x + 14}+{y + 18}")
+        self._link_tip_job = self.root.after(600, show)
+
+    def _hide_link_tip(self):
+        if self._link_tip_job:
+            self.root.after_cancel(self._link_tip_job)
+            self._link_tip_job = None
+        if self._link_tip is not None:
+            self._link_tip.destroy()
+            self._link_tip = None
 
     # ------------------------------------------------------------------ PivotTables
 

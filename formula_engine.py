@@ -10,6 +10,7 @@ rows/columns/cells are inserted or deleted, and reads/writes .pyxl (JSON),
 
 from __future__ import annotations
 
+import base64
 import calendar
 import copy
 import csv
@@ -1691,6 +1692,12 @@ def _f_isodd(x):
     return math.trunc(_num(x)) % 2 == 1
 
 
+@_register("HYPERLINK")
+def _f_hyperlink(link, name=None):
+    """Shows `name` (or the link); clicking the cell opens the link (see hyperlink_at)."""
+    return scalar(link) if name is None else scalar(name)
+
+
 @_register("ISFORMULA")
 def _f_isformula(ref):
     rng = _range_arg(ref)
@@ -2448,6 +2455,11 @@ def dynamic_date_span(kind, today):
 # ------------------------------------------------------------------ workbook
 
 CHART_TYPES = ("column", "bar", "line", "pie")
+PICTURE = "picture"  # a picture floating over the cells, kept with the charts
+
+
+def new_picture_id():
+    return os.urandom(6).hex()
 CHART_SIZE = (480, 288)  # Excel's default 5 x 3 inches
 VALIDATION_TYPES = ("any", "whole", "decimal", "list", "date", "length", "custom")
 VALIDATION_OPS = ("between", "notbetween", "=", "<>", ">", "<", ">=", "<=")
@@ -2504,7 +2516,8 @@ class Sheet:
 
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
               "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
-              "charts", "pivots", "page_setup", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols")
+              "charts", "pivots", "page_setup", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols",
+              "links")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2525,8 +2538,11 @@ class Sheet:
         self.freeze = None      # (r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 stay put when scrolling
         self.validations = []   # [{"range": (r1, c1, r2, c2), "type": ..., ...}] - later rules win, see VALIDATION_TYPES
         self.notes = {}         # (row, col) -> note text
+        self.links = {}         # (row, col) -> {"target": URL, file, mailto: or "#Sheet!A1", "tip": ScreenTip}
         self.charts = []        # [{"type": CHART_TYPES[i], "range": (r1, c1, r2, c2), "title": str,
-                                #   "anchor": (row, col, dx, dy), "size": (w, h)}] - offsets and size in pixels at 96 DPI
+                                #   "anchor": (row, col, dx, dy), "size": (w, h)}] - offsets and size in pixels at 96 DPI;
+                                #   pictures float the same way: {"type": PICTURE, "image": base64, "format": "png",
+                                #   "id": str, "name": str, "anchor", "size"} (no range)
         self.pivots = []        # PivotTables whose reports sit on this sheet (see pivot.new_pivot)
         self.page_setup = None  # printing options that differ from printing.DEFAULT_SETUP
         self.row_levels = {}    # row -> outline (group) level 1..MAX_OUTLINE; summary rows sit below groups
@@ -2827,6 +2843,24 @@ class Workbook:
 
     def display_text(self, sheet, r, c):
         return format_value(*self.cell_display(sheet, r, c))
+
+    def hyperlink_at(self, sheet, r, c):
+        """{"target", "tip"} a click on the cell opens: its hyperlink, or a =HYPERLINK(link, ...) formula's link."""
+        sh = self.sheets[sheet]
+        link = sh.links.get((r, c))
+        if link:
+            return link
+        raw = sh.cells.get((r, c), "")
+        if is_formula(raw) and "HYPERLINK" in raw.upper():
+            ast = self._parsed((sheet, r, c), raw)
+            if ast[0] == "func" and ast[1] == "HYPERLINK" and ast[2]:
+                try:
+                    target = scalar(self._eval(ast[2][0], sheet))
+                except CellError:
+                    return None
+                if target not in (None, ""):
+                    return {"target": str(target), "tip": ""}
+        return None
 
     # conditional formatting
     def cond_format(self, sheet, r, c):
@@ -3233,6 +3267,7 @@ class Workbook:
 
         sh = self.sheets[sheet]
         sh.cells, sh.formats, sh.notes = remap(sh.cells), remap(sh.formats), remap(sh.notes)
+        sh.links = remap(sh.links)
         sh.set_merges(m for m in map(move_rect, sh.merges) if m and (m[0], m[1]) != (m[2], m[3]))
         sh.cond_formats = [dict(rule, range=rect) for rule in sh.cond_formats
                            if (rect := move_rect(rule["range"])) is not None]
@@ -3263,15 +3298,15 @@ class Workbook:
                     p["rect"] = move_rect(p["rect"])
         charts = []
         for chart in sh.charts:
-            rect = move_rect(chart["range"])
-            if rect is None:  # its data is gone
+            rect = move_rect(chart["range"]) if chart.get("range") else None
+            if rect is None and chart.get("range"):  # its data is gone
                 continue
             r, c, dx, dy = chart["anchor"]
             if band is None:  # charts sit on whole rows/columns: they move when those do
                 n = move(r if axis == 0 else c)
                 n = min(at, limit - 1) if n is None else n
                 r, c = (n, c) if axis == 0 else (r, n)
-            charts.append(dict(chart, range=rect, anchor=(r, c, dx, dy)))
+            charts.append(dict(chart, anchor=(r, c, dx, dy), **({"range": rect} if rect else {})))
         sh.charts = charts
         if sh.filter:
             rect = move_rect(sh.filter["range"])
@@ -3523,9 +3558,12 @@ class Workbook:
                 d["validations"] = [dict(rule, range=range_name(*rule["range"])) for rule in s.validations]
             if s.notes:
                 d["notes"] = {cell_name(r, c): text for (r, c), text in sorted(s.notes.items())}
+            if s.links:
+                d["links"] = {cell_name(r, c): link for (r, c), link in sorted(s.links.items())}
             if s.charts:
-                d["charts"] = [dict(ch, range=range_name(*ch["range"]), anchor=list(ch["anchor"]),
-                                    size=list(ch["size"])) for ch in s.charts]
+                d["charts"] = [dict(ch, anchor=list(ch["anchor"]), size=list(ch["size"]),
+                                    **({"range": range_name(*ch["range"])} if ch.get("range") else {}))
+                               for ch in s.charts]
             if s.pivots:
                 d["pivots"] = [_pivot_to_dict(p) for p in s.pivots]
             if s.page_setup:
@@ -3589,6 +3627,10 @@ class Workbook:
                 pos = parse_address(addr)
                 if pos and len(pos) == 2 and text:
                     sh.notes[pos] = str(text)
+            for addr, link in sd.get("links", {}).items():
+                pos = parse_address(addr)
+                if pos and len(pos) == 2 and isinstance(link, dict) and link.get("target"):
+                    sh.links[pos] = {"target": str(link["target"]), "tip": str(link.get("tip") or "")}
             sh.pivots = [p for p in map(_pivot_from_dict, sd.get("pivots", [])) if p]
             ps = sd.get("page_setup")
             if isinstance(ps, dict):
@@ -3599,6 +3641,11 @@ class Workbook:
                     ps[key] = [int(i) - 1 for i in ps.get(key, [])]
                 sh.page_setup = ps
             for ch in sd.get("charts", []):
+                if ch.get("type") == PICTURE and ch.get("image"):
+                    sh.charts.append(dict(ch, id=ch.get("id") or new_picture_id(),
+                                          anchor=tuple(ch.get("anchor", (0, 0, 0, 0))),
+                                          size=tuple(ch.get("size", CHART_SIZE))))
+                    continue
                 rect = parse_range(ch.get("range", ""))
                 if rect and ch.get("type") in CHART_TYPES:
                     sh.charts.append(dict(ch, range=rect, anchor=tuple(ch.get("anchor", (0, 0, 0, 0))),
@@ -3932,6 +3979,71 @@ def _xl_validation(rule):
 _EMU_PER_PX = 9525
 
 
+def _link_from_xlsx(hl):
+    target = hl.target or (f"#{hl.location}" if hl.location else "")
+    return {"target": target, "tip": hl.tooltip or ""} if target else None
+
+
+def _xl_link(cell, link):
+    from openpyxl.worksheet.hyperlink import Hyperlink
+
+    target = link["target"]
+    ref = cell.coordinate
+    if target.startswith("#"):
+        cell.hyperlink = Hyperlink(ref=ref, location=target[1:], tooltip=link.get("tip") or None)
+    else:
+        cell.hyperlink = Hyperlink(ref=ref, target=target, tooltip=link.get("tip") or None)
+
+
+def _xl_picture(picture):
+    """An openpyxl image of a picture without needing Pillow (openpyxl's own Image class opens it)."""
+    from openpyxl.drawing.image import Image
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+    from openpyxl.drawing.xdr import XDRPositiveSize2D
+
+    class RawImage(Image):
+        def __init__(self, data, fmt, size):  # noqa: super().__init__ would need Pillow
+            self.ref, self._raw, self.format = None, data, fmt
+            self.width, self.height = size
+            self.anchor = "A1"
+
+        def _data(self):
+            return self._raw
+
+    data = base64.b64decode(picture["image"])
+    img = RawImage(data, picture.get("format", "png"), picture["size"])
+    r, c, dx, dy = picture["anchor"]
+    w, h = picture["size"]
+    img.anchor = OneCellAnchor(_from=AnchorMarker(col=c, colOff=dx * _EMU_PER_PX, row=r, rowOff=dy * _EMU_PER_PX),
+                               ext=XDRPositiveSize2D(w * _EMU_PER_PX, h * _EMU_PER_PX))
+    return img
+
+
+def _pictures_from_xlsx(ws):
+    """Pictures of a sheet (openpyxl only reads them when Pillow is installed)."""
+    pictures = []
+    for img in getattr(ws, "_images", []):
+        try:
+            data = img._data()
+        except Exception:  # unreadable picture data
+            continue
+        fmt = (img.format or "png").lower().replace("jpg", "jpeg")
+        if fmt not in ("png", "gif", "jpeg"):
+            continue
+        anchor = img.anchor
+        start = getattr(anchor, "_from", None)
+        if start is None:
+            continue
+        ext = getattr(anchor, "ext", None)
+        size = ((round(ext.width / _EMU_PER_PX), round(ext.height / _EMU_PER_PX)) if ext is not None and ext.width
+                else (img.width, img.height))
+        pictures.append({"type": PICTURE, "image": base64.b64encode(data).decode("ascii"), "format": fmt,
+                         "id": new_picture_id(), "name": "", "size": (max(8, size[0]), max(8, size[1])),
+                         "anchor": (start.row, start.col, round(start.colOff / _EMU_PER_PX),
+                                    round(start.rowOff / _EMU_PER_PX))})
+    return pictures
+
+
 def _charts_from_xlsx(ws, sh):
     """Charts whose series all come from their own sheet, each as one block of cells (approximately
     the bounding box of its series names, values and categories)."""
@@ -4237,6 +4349,10 @@ def _load_xlsx(path):
                     sh.formats[pos] = fmt
                 if cell.comment is not None and cell.comment.text:
                     sh.notes[pos] = cell.comment.text.strip()
+                if cell.hyperlink is not None:
+                    link = _link_from_xlsx(cell.hyperlink)
+                    if link:
+                        sh.links[pos] = link
         for key, dim in ws.column_dimensions.items():
             lo = dim.min or (col_index(key) + 1 if re.fullmatch(r"[A-Z]{1,3}", key) else None)
             if lo is None:
@@ -4268,7 +4384,7 @@ def _load_xlsx(path):
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
         sh.freeze = _freeze_from_xlsx(ws)
         sh.validations = _validations_from_xlsx(ws)
-        sh.charts = _charts_from_xlsx(ws, sh)
+        sh.charts = _charts_from_xlsx(ws, sh) + _pictures_from_xlsx(ws)
         sh.page_setup = _page_setup_from_xlsx(ws)
         rules = []
         for cf in ws.conditional_formatting:
@@ -4406,6 +4522,8 @@ def _save_xlsx(wb, path, active=None):
             comment = Comment(text, FILE_TAG)
             comment.width, comment.height = 200, max(60, 20 * (text.count("\n") + 2))
             ws.cell(row=r + 1, column=c + 1).comment = comment
+        for (r, c), link in sh.links.items():
+            _xl_link(ws.cell(row=r + 1, column=c + 1), link)
         for r, c in set(sh.cells) | set(sh.formats):
             cell = ws.cell(row=r + 1, column=c + 1)
             raw = sh.cells.get((r, c))
@@ -4480,7 +4598,12 @@ def _save_xlsx(wb, path, active=None):
             if rule.get("type", "any") != "any":
                 ws.add_data_validation(_xl_validation(rule))
         for chart in sh.charts:
-            ws.add_chart(_xl_chart(wb, sh.name, ws, chart))
+            if chart["type"] == PICTURE:
+                picture = _xl_picture(chart)
+                if picture is not None:
+                    ws.add_image(picture)
+            else:
+                ws.add_chart(_xl_chart(wb, sh.name, ws, chart))
         if sh.page_setup:
             _xl_page_setup(ws, sh.page_setup)
         for rule in reversed(sh.cond_formats):  # Excel: the first rule added gets the top priority

@@ -43,10 +43,17 @@ class PdfFont:
         return "<" + "".join(out) + ">"
 
 
+class PdfImage:
+    """A picture in the document (see images.pdf_image for `info`), drawn by any page that wants it."""
+
+    def __init__(self, info, resource, obj_id):
+        self.info, self.resource, self.obj_id = info, resource, obj_id
+
+
 class Page:
     def __init__(self, doc, width, height):
         self.doc, self.width, self.height = doc, width, height
-        self.ops, self.fonts = [], set()
+        self.ops, self.fonts, self.images = [], set(), set()
 
     def _y(self, y):
         return self.height - y
@@ -130,6 +137,11 @@ class Page:
             self.ops.append(f"BT /{pfont.resource} {_n(size)} Tf {_n(x)} {_n(self._y(y))} Td {pfont.encode(run)} Tj ET")
             x += self.doc.run_width(pfont.font, run, size)
 
+    def image(self, x0, y0, x1, y1, img):
+        """Draw a PdfImage (PdfDocument.add_image) stretched over the box."""
+        self.images.add(img)
+        self.ops.append(f"q {_n(x1 - x0)} 0 0 {_n(y1 - y0)} {_n(x0)} {_n(self._y(y1))} cm /{img.resource} Do Q")
+
     def clip(self, x0, y0, x1, y1):
         """Restrict drawing to a rectangle until unclip()."""
         self.ops.append(f"q {_n(x0)} {_n(self._y(y1))} {_n(x1 - x0)} {_n(y1 - y0)} re W n")
@@ -141,7 +153,7 @@ class Page:
 class PdfDocument:
     def __init__(self, library, title=""):
         self.library, self.title = library, title
-        self.pages, self.fonts = [], {}
+        self.pages, self.fonts, self.images = [], {}, {}
         self._next_id = 3  # 1: catalog, 2: page tree
 
     def _reserve(self, count=1):
@@ -160,6 +172,13 @@ class PdfDocument:
         if pf is None:
             pf = self.fonts[key] = PdfFont(font, f"F{len(self.fonts) + 1}", self._reserve(5))
         return pf
+
+    def add_image(self, key, info):
+        """The PdfImage for a picture (`info` from images.pdf_image), written once however often drawn."""
+        img = self.images.get(key)
+        if img is None:
+            img = self.images[key] = PdfImage(info, f"Im{len(self.images) + 1}", self._reserve(2))
+        return img
 
     def runs(self, text, font):
         """[(PdfFont, text)]: stretches of text each drawn with one font."""
@@ -206,11 +225,25 @@ class PdfDocument:
             cid = pid + 1
             page_ids.append(pid)
             fonts = " ".join(f"/{pf.resource} {pf.obj_id} 0 R" for pf in sorted(page.fonts, key=lambda f: f.resource))
+            pictures = " ".join(f"/{im.resource} {im.obj_id} 0 R" for im in sorted(page.images, key=lambda i: i.resource))
+            xobjects = f" /XObject << {pictures} >>" if pictures else ""
             put(pid, f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {_n(page.width)} {_n(page.height)}] "
-                     f"/Resources << /Font << {fonts} >> >> /Contents {cid} 0 R >>")
+                     f"/Resources << /Font << {fonts} >>{xobjects} >> /Contents {cid} 0 R >>")
             stream(cid, "\n".join(page.ops).encode("latin-1"))
         for n, pf in enumerate(self.fonts.values()):
             self._write_font(pf, n, put, stream)
+        for img in self.images.values():
+            info = img.info
+            mask = f" /SMask {img.obj_id + 1} 0 R" if info["alpha"] else ""
+            decode = " /Decode [1 0 1 0 1 0 1 0]" if info.get("invert") else ""
+            put(img.obj_id, f"<< /Type /XObject /Subtype /Image /Width {info['w']} /Height {info['h']} "
+                            f"/ColorSpace /{info['space']} /BitsPerComponent 8 /Filter /{info['filter']}{mask}{decode} "
+                            f"/Length {len(info['data'])} >>\nstream\n".encode("latin-1") + info["data"] + b"\nendstream")
+            if info["alpha"]:
+                put(img.obj_id + 1, f"<< /Type /XObject /Subtype /Image /Width {info['w']} /Height {info['h']} "
+                                    f"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
+                                    f"/Length {len(info['alpha'])} >>\nstream\n".encode("latin-1") + info["alpha"]
+                    + b"\nendstream")
         put(1, "<< /Type /Catalog /Pages 2 0 R >>")
         put(2, f"<< /Type /Pages /Kids [{' '.join(f'{p} 0 R' for p in page_ids)}] /Count {len(page_ids)} >>")
         info = self._reserve()

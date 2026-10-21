@@ -105,6 +105,7 @@ line_double
 line_medium
 line_thick
 line_thin
+link
 margins
 merge
 merge_across
@@ -132,6 +133,7 @@ paste_transpose
 paste_values
 pdf
 percent
+picture
 pivot
 pivot_fields
 portrait

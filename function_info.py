@@ -169,5 +169,7 @@ FUNCTION_INFO = {
     "ISEVEN": (_INFO, "ISEVEN(số)", "Có phải số chẵn không."),
     "ISODD": (_INFO, "ISODD(số)", "Có phải số lẻ không."),
     "ISFORMULA": (_INFO, "ISFORMULA(ô)", "Ô có chứa công thức không."),
+    "HYPERLINK": (_LOOKUP, "HYPERLINK(địa_chỉ, [tên_hiển_thị])",
+                  "Tạo liên kết: nhấp vào ô để mở trang web, tệp hoặc đi tới ô (\"#Sheet2!A1\")."),
     "NA": (_INFO, "NA()", "Trả về lỗi #N/A."),
 }

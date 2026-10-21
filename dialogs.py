@@ -1944,3 +1944,116 @@ class CreateNamesDialog(Dialog):
             self.bell()
             return None
         return picked
+
+
+class HyperlinkDialog(Dialog):
+    """Insert Hyperlink (Ctrl+K): a web page or file, a place in this workbook, or an e-mail address.
+    collect() gives {"text", "target", "tip"}; Remove Link gives {"remove": True}."""
+
+    KINDS = (("web", "Trang web hoặc tệp"), ("place", "Vị trí trong tài liệu này"), ("mail", "Địa chỉ email"))
+
+    def __init__(self, master, text, link, sheets, names, cell, base_dir=None):
+        super().__init__(master, "Sửa Liên kết" if link else "Chèn Liên kết")
+        self.base_dir = base_dir
+        f = self.body
+        target = (link or {}).get("target", "")
+        kind = "place" if target.startswith("#") else "mail" if target.lower().startswith("mailto:") else "web"
+        ttk.Label(f, text="Văn bản hiển thị:").grid(row=0, column=0, sticky="w", pady=3)
+        self.text = tk.StringVar(value=text)
+        ttk.Entry(f, textvariable=self.text, width=44).grid(row=0, column=1, columnspan=2, sticky="we", padx=6)
+        self.kind = tk.StringVar(value=kind)
+        row = ttk.Frame(f)
+        row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        for key, label in self.KINDS:
+            ttk.Radiobutton(row, text=label, value=key, variable=self.kind, command=self._switch).pack(
+                side="left", padx=(0, 12))
+        self.pages = {}
+        page = self.pages["web"] = ttk.Frame(f)
+        ttk.Label(page, text="Địa chỉ:").grid(row=0, column=0, sticky="w", pady=3)
+        self.address = tk.StringVar(value=target if kind == "web" else "")
+        self.address_entry = ttk.Entry(page, textvariable=self.address, width=40)
+        self.address_entry.grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Button(page, text="Duyệt tệp...", command=self._browse).grid(row=0, column=2)
+        ttk.Label(page, text="Ví dụ: https://www.google.com hoặc D:\\Ho so\\bang_gia.xlsx", foreground="#666").grid(
+            row=1, column=1, columnspan=2, sticky="w", padx=6)
+        page = self.pages["place"] = ttk.Frame(f)
+        place = target[1:] if kind == "place" else ""
+        sheet_part, _, cell_part = place.rpartition("!")
+        ttk.Label(page, text="Trang tính / tên:").grid(row=0, column=0, sticky="w", pady=3)
+        self.sheet_names, self.name_list = list(sheets), list(names)
+        choices = self.sheet_names + self.name_list
+        self.sheet = ttk.Combobox(page, values=choices, state="readonly", width=30)
+        current = sheet_part.strip("'").replace("''", "'") if sheet_part else (place if place in names else "")
+        self.sheet.set(current if current in choices else (sheets[0] if sheets else ""))
+        self.sheet.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(page, text="Ô:").grid(row=1, column=0, sticky="w", pady=3)
+        self.cell = tk.StringVar(value=cell_part or (cell if not place else ""))
+        ttk.Entry(page, textvariable=self.cell, width=12).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(page, text="(bỏ trống khi chọn một tên)", foreground="#666").grid(row=2, column=1, sticky="w", padx=6)
+        page = self.pages["mail"] = ttk.Frame(f)
+        mail = target[7:] if kind == "mail" else ""
+        address, _, query = mail.partition("?")
+        ttk.Label(page, text="Email:").grid(row=0, column=0, sticky="w", pady=3)
+        self.mail = tk.StringVar(value=address)
+        ttk.Entry(page, textvariable=self.mail, width=40).grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Label(page, text="Tiêu đề:").grid(row=1, column=0, sticky="w", pady=3)
+        subject = query[8:] if query.lower().startswith("subject=") else ""
+        self.subject = tk.StringVar(value=subject)
+        ttk.Entry(page, textvariable=self.subject, width=40).grid(row=1, column=1, sticky="we", padx=6)
+        ttk.Label(f, text="Chú thích khi rê chuột:").grid(row=3, column=0, sticky="w", pady=(10, 3))
+        self.tip = tk.StringVar(value=(link or {}).get("tip", ""))
+        ttk.Entry(f, textvariable=self.tip, width=44).grid(row=3, column=1, columnspan=2, sticky="we", padx=6,
+                                                          pady=(10, 3))
+        bar = self.add_buttons()
+        if link:
+            ttk.Button(bar, text="Loại bỏ Liên kết", command=self._remove).pack(side="left")
+        self._switch()
+
+    def show(self):
+        return super().show(self.address_entry)
+
+    def _switch(self):
+        for key, page in self.pages.items():
+            if key == self.kind.get():
+                page.grid(row=2, column=0, columnspan=3, sticky="we")
+            else:
+                page.grid_remove()
+
+    def _browse(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self, title="Chọn tệp", initialdir=self.base_dir or None)
+        if path:
+            self.address.set(path)
+            if not self.text.get().strip():
+                import os
+                self.text.set(os.path.basename(path))
+
+    def _remove(self):
+        self.result = {"remove": True}
+        self.destroy()
+
+    def collect(self):
+        kind = self.kind.get()
+        if kind == "web":
+            target = self.address.get().strip()
+            if target and "://" not in target and target.lower().startswith("www."):
+                target = "http://" + target
+        elif kind == "place":
+            where, cell = self.sheet.get(), self.cell.get().strip().replace("$", "").upper()
+            if where in self.name_list and not cell:
+                target = f"#{where}"
+            elif where not in self.sheet_names or (cell and fe.parse_range(cell) is None):
+                self.bell()
+                return None
+            else:
+                target = f"#{fe.quote_sheet(where)}!{cell or 'A1'}"
+        else:
+            address = self.mail.get().strip()
+            target = f"mailto:{address}" + (f"?subject={self.subject.get().strip()}" if self.subject.get().strip()
+                                            else "") if address else ""
+        if not target:
+            self.bell()
+            return None
+        text = self.text.get().strip() or (target[1:] if target.startswith("#") else
+                                           target[7:].split("?")[0] if kind == "mail" else target)
+        return {"text": text, "target": target, "tip": self.tip.get().strip()}

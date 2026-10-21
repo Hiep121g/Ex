@@ -9,8 +9,11 @@ at 96 DPI are converted with PT (0.75).
 import datetime as dt
 import os
 
+import base64
+
 import charts
 import formula_engine as fe
+import images
 import pdf
 
 PT = 0.75  # points per pixel at 96 DPI
@@ -205,6 +208,17 @@ class PdfSurface:
 
     def text(self, x, y, text, spec, size, color):
         self.page.text(x, y, text, self.font(spec), size, color)
+
+    def picture(self, x0, y0, x1, y1, picture):
+        doc = self.page.doc
+        img = doc.images.get(picture["id"])
+        if img is None:
+            info = images.pdf_image(base64.b64decode(picture["image"]), picture.get("format", "png"))
+            if info is None:
+                self.page.rect(x0, y0, x1, y1, fill="#f2f2f2", stroke="#a6a6a6", width=0.5)
+                return
+            img = doc.add_image(picture["id"], info)
+        self.page.image(x0, y0, x1, y1, img)
 
     def __getattr__(self, name):  # rect, line, polyline, polygon, ellipse, arc, clip, unclip
         return getattr(self.page, name)
@@ -427,6 +441,9 @@ def render_page(surface, layout, index, file_name=""):
             cx, cy = edge_x(c) + dx * PT * s, edge_y(r) + dy * PT * s
             w, h = chart["size"][0] * PT * s, chart["size"][1] * PT * s
             if cx > x0 + width or cx + w < x0 or cy > y0 + height or cy + h < top_body:
+                continue
+            if chart["type"] == fe.PICTURE:
+                surface.picture(cx, cy, cx + w, cy + h, chart)
                 continue
             labels, series = wb.chart_data(sheet, chart)
             charts.draw_chart(canvas, (cx, cy, cx + w, cy + h), chart["type"], chart.get("title"), labels, series,
