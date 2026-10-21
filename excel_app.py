@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import webbrowser
 import tkinter as tk
 import tkinter.font as tkfont
@@ -28,6 +29,7 @@ import images
 import pivot as pv
 import printing
 import richclip
+import session
 import ttf
 from formula_assist import FormulaAssist
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
@@ -132,6 +134,7 @@ STYLE_KEYS = ("font", "size", "bold", "italic", "underline", "strike", "fg", "bg
 # picture shown beside a menu entry, by label (without a trailing "..."); see ribbon.ICONS
 MENU_ICONS = {
     "Mới": "file_new", "Mở": "file_open", "Lưu": "save", "Lưu thành": "file_save_as", "Thoát": "file_exit",
+    "Mở gần đây": "file_open", "Lưu tự động bản khôi phục": "save",
     "In": "print", "Xuất PDF": "pdf", "Thiết lập Trang": "page_setup",
     "Nhóm": "group", "Bỏ nhóm": "ungroup", "Tổng phụ": "subtotal", "Xóa dàn bài": "clear",
     "Trình Quản lý Tên": "name_manager", "Liên kết": "link", "Mở liên kết": "link", "Loại bỏ liên kết": "delete_x",
@@ -263,6 +266,8 @@ PHÍM TẮT
 TỆP
   .xlsx mở được bằng Microsoft Excel (giữ công thức, định dạng, ô hợp nhất, định dạng có điều kiện,
   bộ lọc); .pyxl là định dạng riêng (JSON); .csv chỉ lưu giá trị của trang tính đang mở.
+  Tệp → Mở gần đây: 10 tệp mở gần nhất. PyExcel tự lưu bản khôi phục mỗi 5 phút khi có thay đổi chưa lưu
+  (Tệp → Lưu tự động bản khôi phục để đổi số phút); nếu máy tắt đột ngột, lần mở sau sẽ hỏi khôi phục.
 
 IN VÀ XUẤT PDF
   • Tệp → In... (Ctrl+P): xem trước từng trang; chọn in trang tính hiện hành, cả sổ làm việc hoặc vùng chọn,
@@ -328,6 +333,8 @@ class SpreadsheetApp:
         self.views = {}                # sheet -> (top, left, cur, ext)
         self.undo_stack, self.redo_stack = [], []
         self.edit_serial = 0           # counts changes, for caches of derived data
+        self.settings = session.Settings()
+        self.recovery = session.Recovery(self.settings.folder)
         self._font_library, self._layout_cache = None, (None, None)
         self.breaks_shown = set()      # sheets showing page-break lines (after a print preview)
         self.clip = None
@@ -389,6 +396,9 @@ class SpreadsheetApp:
             self.open_path(path)
         self.refresh_all()
         self.canvas.focus_set()
+        self.recovery.beat(path=self.path)
+        root.after(1200, self._offer_recovery)
+        root.after(60_000, self._autosave_tick)
 
     @property
     def sh(self):
@@ -578,11 +588,14 @@ class SpreadsheetApp:
             RibbonButton(rb.qat, ui, icon=icon, command=command, tooltip=tip, color="#ffffff", bg=TAB_BAR_BG,
                          hover_bg=TAB_HOVER_BG).pack(side="left")
         self.file_menu = self._make_menu([
-            ("Mới", self.new_file, "Ctrl+N"), ("Mở...", self.open_file, "Ctrl+O"), None,
+            ("Mới", self.new_file, "Ctrl+N"), ("Mở...", self.open_file, "Ctrl+O"), ("Mở gần đây", []), None,
             ("Lưu", self.save_file, "Ctrl+S"), ("Lưu thành...", self.save_as, "F12"), None,
             ("In...", self.print_preview, "Ctrl+P"), ("Xuất PDF...", self.export_pdf),
             ("Thiết lập Trang...", self.page_setup_dialog), None,
+            ("Lưu tự động bản khôi phục...", self.autosave_options), None,
             ("Thoát", self.quit)])
+        self.recent_menu = tk.Menu(self.file_menu, tearoff=0, postcommand=self._fill_recent_menu)
+        self.file_menu.entryconfigure(self.file_menu.index("Mở gần đây"), menu=self.recent_menu)
         rb.add_tab("Tệp", command=lambda label: self.file_menu.tk_popup(
             label.winfo_rootx(), label.winfo_rooty() + label.winfo_height()))
         self._build_home(rb.add_tab("Trang chủ"))
@@ -5692,6 +5705,9 @@ class SpreadsheetApp:
         self.areas = []
         self.breaks_shown.clear()
         self.path = path
+        if path:
+            self.settings.add_recent(path)
+        self.recovery.discard()
         self.dirty = False
         self.refresh_all()
 
@@ -5721,13 +5737,91 @@ class SpreadsheetApp:
             return False
         self.path = path
         self.dirty = False
+        self.settings.add_recent(path)
+        self.recovery.discard()
+        self.recovery.beat(path=path)
         self.update_title()
         self.set_mode(f"Đã lưu {os.path.basename(path)}")
         return True
 
     def quit(self):
         if self.confirm_discard():
+            self.recovery.close()  # nothing left to recover: changes were saved or dropped on purpose
             self.root.destroy()
+
+    # ------------------------------------------------------------------ recent files and AutoRecover
+
+    def _fill_recent_menu(self):
+        menu = self.recent_menu
+        menu.delete(0, "end")
+        items = self.settings.recent()
+        if not items:
+            menu.add_command(label="(Chưa có tệp nào)", state="disabled")
+            return
+        for i, path in enumerate(items, 1):
+            menu.add_command(label=f"{i}  {os.path.basename(path)}", underline=0,
+                             accelerator=os.path.dirname(path), command=lambda p=path: self.open_recent(p))
+        menu.add_separator()
+        menu.add_command(label="Xóa danh sách gần đây", command=self.settings.clear_recent)
+
+    def open_recent(self, path):
+        if not os.path.exists(path):
+            messagebox.showerror(APP_NAME, f"Không tìm thấy tệp:\n{path}", parent=self.root)
+            return
+        if self.confirm_discard():
+            self.open_path(path)
+
+    def autosave_options(self):
+        minutes = simpledialog.askinteger(
+            "Lưu tự động", "Lưu bản khôi phục sau mỗi bao nhiêu phút?\n(0 = tắt; bản khôi phục giúp lấy lại dữ liệu\n"
+                          "khi máy tắt đột ngột hoặc chương trình bị lỗi)",
+            initialvalue=self.settings.autosave_minutes, minvalue=0, maxvalue=120, parent=self.root)
+        if minutes is not None:
+            self.settings.autosave_minutes = minutes
+
+    def _autosave_tick(self):
+        """Every minute: a heartbeat; with unsaved changes, an AutoRecover copy every few minutes."""
+        try:
+            minutes = self.settings.autosave_minutes
+            self.recovery.beat(path=self.path)
+            last = self.recovery.saved_at
+            if (self.dirty and minutes and not self.is_editing() and not self.drag
+                    and (last is None or time.time() - last >= minutes * 60)):
+                if self.recovery.save(self.wb, self.sheet) and self.mode_label.cget("text") == "Sẵn sàng":
+                    self.set_mode(f"Đã lưu bản khôi phục lúc {dt.datetime.now():%H:%M}")
+        finally:
+            self.root.after(60_000, self._autosave_tick)
+
+    def _offer_recovery(self):
+        """After a crash: offer the AutoRecover copies the previous sessions left behind."""
+        entries = self.recovery.orphans()
+        if not entries:
+            return
+        options = [(f"{dt.datetime.fromtimestamp(e['saved']):%d/%m/%Y %H:%M}  —  "
+                    f"{os.path.basename(e['path']) if e['path'] else 'Sổ làm việc chưa lưu'}", str(i))
+                   for i, e in enumerate(entries)]
+        options.append(("Không khôi phục (xóa các bản này)", "none"))
+        choice = dialogs.ChoiceDialog(
+            self.root, "Khôi phục tài liệu", options, "0",
+            prompt="Lần trước PyExcel đã đóng đột ngột khi còn thay đổi chưa lưu.\n"
+                   "Chọn bản khôi phục muốn mở (Hủy: để lại, hỏi lại lần sau):").show()
+        if choice is None:
+            return
+        if choice != "none":
+            entry = entries[int(choice)]
+            if not self.confirm_discard():
+                return
+            try:
+                wb = fe.load_workbook(entry["file"])
+            except Exception as err:  # a damaged copy is reported, not fatal
+                messagebox.showerror(APP_NAME, f"Không mở được bản khôi phục:\n{err}", parent=self.root)
+                return
+            self._load(wb, entry["path"])
+            self.dirty = True  # recovered work still needs saving
+            self.update_title()
+            self.set_mode("Đã khôi phục — hãy lưu lại (Ctrl+S)")
+        for entry in entries:
+            self.recovery.forget(entry)
 
 
 def main():

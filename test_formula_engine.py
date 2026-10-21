@@ -1478,5 +1478,38 @@ class ProtectionAndSplitTests(unittest.TestCase):
             self.assertEqual(got.formats[(1, 0)], {"unlocked": True, "hide_formula": True}, ext)
 
 
+class SessionTests(unittest.TestCase):
+    def test_recent_files_and_settings(self):
+        import session
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = session.Settings(tmp)
+            a = os.path.join(tmp, "a.xlsx")
+            open(a, "w").close()
+            settings.add_recent(a)
+            settings.add_recent(os.path.join(tmp, "gone.xlsx"))
+            settings.add_recent(a)  # moves to the top, no duplicate
+            settings.autosave_minutes = 3
+            again = session.Settings(tmp)
+            self.assertEqual(again.recent(), [a])
+            self.assertEqual(again.autosave_minutes, 3)
+
+    def test_autorecover(self):
+        import time
+        import session
+        with tempfile.TemporaryDirectory() as tmp:
+            crashed = session.Recovery(tmp)
+            wb = make({"A1": "chưa lưu"})
+            crashed.beat(path="D:/bang.xlsx")
+            self.assertTrue(crashed.save(wb))
+            now = session.Recovery(tmp)
+            self.assertEqual(now.orphans(), [])  # still beating: another PyExcel, not a crash
+            found = now.orphans(now=time.time() + 600)
+            self.assertEqual([e["path"] for e in found], ["D:/bang.xlsx"])
+            self.assertEqual(fe.load_workbook(found[0]["file"]).get_raw("Sheet1", 0, 0), "chưa lưu")
+            now.forget(found[0])
+            crashed.discard()
+            self.assertEqual(now.orphans(now=time.time() + 600), [])
+
+
 if __name__ == "__main__":
     unittest.main()

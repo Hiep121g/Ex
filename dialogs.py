@@ -740,9 +740,11 @@ class SeriesDialog(Dialog):
 class ChoiceDialog(Dialog):
     """A list of radio options (Insert/Delete cells, ...)."""
 
-    def __init__(self, master, title, options, default=None):
+    def __init__(self, master, title, options, default=None, prompt=None):
         super().__init__(master, title)
         self.var = tk.StringVar(value=default or options[0][1])
+        if prompt:
+            ttk.Label(self.body, text=prompt, justify="left").pack(anchor="w", pady=(0, 8))
         for text, value in options:
             ttk.Radiobutton(self.body, text=text, value=value, variable=self.var).pack(anchor="w", pady=1)
         self.add_buttons()
