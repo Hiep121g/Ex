@@ -2400,7 +2400,7 @@ class Sheet:
 
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
               "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
-              "charts")
+              "charts", "pivots")
     __slots__ = ("name", "_merge_map") + _STATE
 
     def __init__(self, name):
@@ -2423,6 +2423,7 @@ class Sheet:
         self.notes = {}         # (row, col) -> note text
         self.charts = []        # [{"type": CHART_TYPES[i], "range": (r1, c1, r2, c2), "title": str,
                                 #   "anchor": (row, col, dx, dy), "size": (w, h)}] - offsets and size in pixels at 96 DPI
+        self.pivots = []        # PivotTables whose reports sit on this sheet (see pivot.new_pivot)
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -2514,6 +2515,10 @@ class Workbook:
                     sh.cells[key] = _rename_in_formula(raw, old, new)
         self.sheets = {(new if n == old else n): s for n, s in self.sheets.items()}
         self.sheets[new].name = new
+        for sh in self.sheets.values():
+            for p in sh.pivots:
+                if p["source"]["sheet"].lower() == old.lower():
+                    p["source"]["sheet"] = new
         self._ast.clear()
         self.invalidate()
 
@@ -3107,6 +3112,18 @@ class Workbook:
                            if (rect := move_rect(rule["range"])) is not None]
         sh.validations = [dict(rule, range=rect) for rule in sh.validations
                           if (rect := move_rect(rule["range"])) is not None]
+        for other in self.sheets.values():  # pivots reading this sheet, wherever their reports are
+            for p in other.pivots:
+                if p["source"]["sheet"].lower() == target:
+                    p["source"]["range"] = move_rect(p["source"]["range"]) or p["source"]["range"]
+        if band is None:
+            for p in sh.pivots:
+                r, c = p["anchor"]
+                n = move(r if axis == 0 else c)
+                n = min(at, limit - 1) if n is None else n
+                p["anchor"] = (n, c) if axis == 0 else (r, n)
+                if p["rect"]:
+                    p["rect"] = move_rect(p["rect"])
         charts = []
         for chart in sh.charts:
             rect = move_rect(chart["range"])
@@ -3174,6 +3191,8 @@ class Workbook:
             if s.charts:
                 d["charts"] = [dict(ch, range=range_name(*ch["range"]), anchor=list(ch["anchor"]),
                                     size=list(ch["size"])) for ch in s.charts]
+            if s.pivots:
+                d["pivots"] = [_pivot_to_dict(p) for p in s.pivots]
             if s.filter:
                 d["filter"] = {"range": range_name(*s.filter["range"]),
                                "criteria": {col_name(c): v if isinstance(v, dict) else sorted(v)
@@ -3217,6 +3236,7 @@ class Workbook:
                 pos = parse_address(addr)
                 if pos and len(pos) == 2 and text:
                     sh.notes[pos] = str(text)
+            sh.pivots = [p for p in map(_pivot_from_dict, sd.get("pivots", [])) if p]
             for ch in sd.get("charts", []):
                 rect = parse_range(ch.get("range", ""))
                 if rect and ch.get("type") in CHART_TYPES:
@@ -3233,6 +3253,35 @@ class Workbook:
             wb.apply_filter(name)
         wb.active = data.get("active") if data.get("active") in wb.sheets else None
         return wb
+
+
+def _pivot_to_dict(p):
+    return dict(p, source={"sheet": p["source"]["sheet"], "range": range_name(*p["source"]["range"])},
+                anchor=cell_name(*p["anchor"]), rect=range_name(*p["rect"]) if p["rect"] else None,
+                items={f: sorted(v) for f, v in p["items"].items()}, values=[dict(v) for v in p["values"]])
+
+
+def _pivot_from_dict(d):
+    """A pivot read back from a file, or None when it is unusable."""
+    try:
+        rect, anchor = parse_range(d["source"]["range"]), parse_address(d["anchor"])
+        if not rect or not anchor or len(anchor) != 2:
+            return None
+        p = dict(d, source={"sheet": str(d["source"]["sheet"]), "range": rect}, anchor=anchor,
+                 rect=parse_range(d["rect"]) if d.get("rect") else None,
+                 items={f: set(v) for f, v in d.get("items", {}).items()},
+                 values=[dict(v) for v in d.get("values", [])])
+        for key in ("filters", "cols", "rows"):
+            p[key] = [str(f) for f in d.get(key, [])]
+        for key, default in (("sort", {}), ("group", {}), ("grand_rows", True), ("grand_cols", True),
+                             ("subtotals", True), ("layout", "compact"), ("name", "PivotTable")):
+            p.setdefault(key, default)
+        return p
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
+PIVOT_STORE = "_PyExcelPivots"  # very hidden sheet keeping pivot definitions in .xlsx files
 
 
 # ------------------------------------------------------------------ files
@@ -3700,7 +3749,10 @@ def _load_xlsx(path):
 
     book = openpyxl.load_workbook(path)  # formulas are kept as text
     wb = Workbook(())
+    store = book[PIVOT_STORE] if PIVOT_STORE in book.sheetnames else None
     for ws in book.worksheets:
+        if ws is store:
+            continue
         name = wb.add_sheet(ws.title if wb.check_sheet_name(ws.title) is None else None)
         sh = wb.sheets[name]
         for row in ws.iter_rows(max_row=min(ws.max_row, MAX_ROWS), max_col=min(ws.max_column, MAX_COLS)):
@@ -3766,7 +3818,15 @@ def _load_xlsx(path):
         if sh.filter:
             wb.apply_filter(name)
             sh.hidden_rows -= sh.filter["hidden"]  # Excel stores filtered-out rows as hidden rows
-    titles = [ws.title for ws in book.worksheets]
+    if store is not None:
+        try:
+            saved = json.loads(store["A1"].value or "{}")
+        except (TypeError, ValueError):
+            saved = {}
+        for title, pivots in saved.items():
+            if title in wb.sheets:
+                wb.sheets[title].pivots = [p for p in map(_pivot_from_dict, pivots) if p]
+    titles = [ws.title for ws in book.worksheets if ws is not store]
     names = list(wb.sheets)
     if book.active is not None and book.active.title in titles:
         wb.active = names[titles.index(book.active.title)]
@@ -3930,6 +3990,11 @@ def _save_xlsx(wb, path, active=None):
             xl_rule = _xl_cf_rule(rule)
             if xl_rule is not None:
                 ws.conditional_formatting.add(range_name(*rule["range"]), xl_rule)
+    pivots = {sh.name: [_pivot_to_dict(p) for p in sh.pivots] for sh in wb.sheets.values() if sh.pivots}
+    if pivots:  # Excel shows the reports as plain cells; PyExcel reads the definitions back from here
+        store = book.create_sheet(PIVOT_STORE)
+        store["A1"] = json.dumps(pivots, ensure_ascii=False)
+        store.sheet_state = "veryHidden"
     if active in wb.sheets:
         book.active = list(wb.sheets).index(active)
     book.save(path)

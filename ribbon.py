@@ -767,6 +767,30 @@ def _icon_by_color(cv, P, k, c, sort):
         cv.create_oval(*P(9 + 2.2 * i - 1.6, 12.6, 9 + 2.2 * i + 1.6, 15.8), fill=color, outline="#7f7f7f")
 
 
+def _icon_pivot(cv, P, k, c):
+    _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+    cv.create_rectangle(*P(1.5, 1.5, 14.5, 5.83), fill="#bdd7ee", outline=GRAY)
+    cv.create_rectangle(*P(1.5, 1.5, 5.83, 14.5), fill="#c6e0b4", outline=GRAY)
+    cv.create_line(*P(8, 9.5, 8, 12.5, 11.5, 12.5), fill=BLUE, width=max(1, round(1.2 * k)), arrow="last",
+                   arrowshape=(round(2.5 * k), round(3 * k), round(1.4 * k)))
+
+
+def _icon_refresh(cv, P, k, c):
+    w = max(2, round(1.6 * k))
+    cv.create_arc(*P(2, 2, 14, 14), start=20, extent=150, style="arc", outline=GREEN, width=w)
+    cv.create_arc(*P(2, 2, 14, 14), start=200, extent=150, style="arc", outline=GREEN, width=w)
+    cv.create_polygon(*P(1, 7.5, 3.6, 11, 6, 7.5), fill=GREEN)
+    cv.create_polygon(*P(15, 8.5, 12.4, 5, 10, 8.5), fill=GREEN)
+
+
+def _icon_pivot_fields(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 1.5, 14.5, 14.5), fill="#ffffff", outline=GRAY)
+    for i, on in enumerate((True, False, True)):
+        y = 3.5 + 4 * i
+        cv.create_rectangle(*P(3, y, 6, y + 3), fill=BLUE if on else "#ffffff", outline=BLUE)
+        cv.create_line(*P(7.5, y + 1.5, 13, y + 1.5), fill=DARK, width=max(1, round(k)))
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -851,6 +875,7 @@ ICONS.update({
     "freeze_col": lambda *a: _icon_freeze_part(*a, "col"), "validation_clear": _icon_validation_clear,
     "delete_x": _icon_delete_x, "chart_edit": _icon_chart_edit,
     "sort_color": lambda *a: _icon_by_color(*a, True), "filter_color": lambda *a: _icon_by_color(*a, False),
+    "pivot": _icon_pivot, "refresh": _icon_refresh, "pivot_fields": _icon_pivot_fields,
 })
 
 

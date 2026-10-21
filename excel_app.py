@@ -19,9 +19,11 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 import charts
 import dialogs
 import formula_engine as fe
+import pivot as pv
 import richclip
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
 from function_info import CATEGORIES, FUNCTION_INFO
+from pivot_pane import PivotPane
 from ribbon import (RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, MenuIcons, Ribbon, RibbonButton, RibbonStyle, StyleTile,
                     Tooltip, color_popup, gallery_popup, mix)
 
@@ -152,7 +154,7 @@ MENU_ICONS = {
     "Chèn/Sửa ghi chú": "note", "Xóa ghi chú": "note_delete",
     "Đổi kiểu biểu đồ": "chart_column", "Biểu đồ cột": "chart_column", "Biểu đồ thanh": "chart_bar",
     "Biểu đồ đường": "chart_line", "Biểu đồ tròn": "chart_pie", "Dữ liệu và tiêu đề biểu đồ": "chart_edit",
-    "Xóa biểu đồ": "delete_x",
+    "Xóa biểu đồ": "delete_x", "PivotTable": "pivot", "Làm mới tất cả": "refresh",
 }
 
 SHIFT, CONTROL, ALT = 0x0001, 0x0004, 0x20000
@@ -177,6 +179,10 @@ THANH RIBBON
   • Dữ liệu → Xác thực dữ liệu: giới hạn giá trị được nhập (số, ngày, độ dài) hoặc tạo danh sách thả xuống
     (nguồn  Có,Không  hoặc  =$A$1:$A$10). Nhấp mũi tên cạnh ô hoặc Alt+↓ để chọn.
   • Xem lại → Ghi chú mới (Shift+F2): ô có ghi chú có tam giác đỏ ở góc, rê chuột vào để xem.
+  • PivotTable: quét chọn bảng có hàng tiêu đề rồi bấm Chèn → PivotTable. Trong ngăn Các trường PivotTable,
+    tích trường hoặc kéo trường vào Bộ lọc / Cột / Hàng / Giá trị; nhấp vào trường trong một vùng để sắp xếp,
+    lọc mục, nhóm ngày hay chọn Tổng/Đếm/Trung bình... Sửa dữ liệu nguồn xong bấm Làm mới; nhấp đúp vào
+    một số để xem các dòng dữ liệu tạo nên số đó.
   • Lọc dữ liệu: quét chọn bảng (kể cả hàng tiêu đề) rồi bấm Dữ liệu → Lọc (Ctrl+Shift+L). Nút ▾ ở tiêu đề
     có: sắp xếp (cả theo màu), lọc theo màu, Bộ lọc số / văn bản / ngày (lớn hơn, nằm giữa, có chứa, 10 mục
     đầu, trên trung bình, tháng này...), Bộ lọc tùy chỉnh (2 điều kiện Và/Hoặc, dùng * và ?) và danh sách
@@ -278,6 +284,8 @@ class SpreadsheetApp:
         self.hover_note = None         # (sheet, row, col) of the note shown under the pointer
         self._list_button = None       # canvas box of the active cell's validation-list arrow
         self.chart_sel = None          # index of the selected chart on this sheet
+        self.show_pivot_fields = True  # the PivotTable Fields pane appears in a pivot report
+        self._pane_key = None          # (sheet, pivot id, layout) the pane shows
         self._chart_boxes = []         # [(index, canvas box)] of the charts drawn
         self.last_fill, self.last_fg = "#ffff00", "#ff0000"
         self.border_style, self.border_color, self.last_border = "thin", "#000000", "bottom"
@@ -741,6 +749,8 @@ class SpreadsheetApp:
     def _build_insert_tab(self, page):
         rb = self.ribbon
         g = rb.group(page, "Bảng")
+        self._btn(g, large=True, icon="pivot", text="PivotTable\n", label="PivotTable", command=self.insert_pivot,
+                  tooltip="Chèn PivotTable\nTóm tắt dữ liệu: tổng, đếm, trung bình... theo hàng và cột")
         self._btn(g, large=True, icon="format_table", text="Bảng", menu=self._table_gallery, tooltip="Tạo bảng có định dạng")
         g = rb.group(page, "Ô và trang tính")
         col = g.column()
@@ -801,6 +811,12 @@ class SpreadsheetApp:
         col = g.column()
         self._btn(g, col, side="top", icon="filter_clear", text="Xóa bộ lọc", command=self.clear_filter)
         self._btn(g, col, side="top", icon="calc", text="Áp dụng lại", command=self.reapply_filter)
+        g = rb.group(page, "PivotTable")
+        self._btn(g, large=True, icon="refresh", text="Làm mới\ntất cả", command=self.refresh_all_pivots,
+                  tooltip="Làm mới tất cả PivotTable theo dữ liệu nguồn hiện tại")
+        self.btn_pivot_fields = self._btn(g, large=True, icon="pivot_fields", text="Danh sách\ntrường",
+                                          command=self.toggle_pivot_fields,
+                                          tooltip="Hiện/ẩn ngăn Các trường PivotTable")
         g = rb.group(page, "Công cụ dữ liệu")
         self._btn(g, large=True, icon="remove_dup", text="Loại bỏ\ntrùng lặp", command=self.remove_duplicates)
         self._btn(g, large=True, icon="validation", text="Xác thực\ndữ liệu", command=self.data_validation_dialog,
@@ -1017,6 +1033,7 @@ class SpreadsheetApp:
         self.vbar = ttk.Scrollbar(frame, orient="vertical", command=self.on_vscroll)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.vbar.grid(row=0, column=1, sticky="ns")
+        self.pivot_pane = PivotPane(frame, self.ui, self.menu_icons, self._pivot_pane_change, self._pivot_pane_action)
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         cv = self.canvas
@@ -1829,6 +1846,7 @@ class SpreadsheetApp:
         self.update_name_box()
         self.update_toolbar()
         self.update_status()
+        self._sync_pivot_pane()
 
     def refresh_all(self):
         self.build_tabs()
@@ -2224,6 +2242,10 @@ class SpreadsheetApp:
             return "break"
         kind, r, c = self.hit(e.x, e.y)
         if kind == "cell" and not self.is_editing() and not self.painter:
+            p = pv.pivot_at(self.wb, self.sheet, r, c)
+            if p is not None:
+                self.pivot_details(p, r, c)
+                return "break"
             self.cur = self.ext = self._anchor((r, c))
             self.start_edit(mode="edit")
         return "break"
@@ -2332,8 +2354,20 @@ class SpreadsheetApp:
     def is_editing(self):
         return self.editor is not None or self.bar_editing
 
+    def _pivot_guard(self, r1, c1, r2, c2):
+        """True (after telling the user) when the cells overlap a pivot report, which is not edited by hand."""
+        for p in self.sh.pivots:
+            a1, b1, a2, b2 = p["rect"] or (0, 0, -1, -1)
+            if a1 <= r2 and r1 <= a2 and b1 <= c2 and c1 <= b2:
+                messagebox.showinfo(APP_NAME, "Không thể sửa ô của báo cáo PivotTable. Hãy sửa dữ liệu nguồn rồi "
+                                    "bấm Làm mới, hoặc dùng ngăn Các trường PivotTable.", parent=self.root)
+                return True
+        return False
+
     def start_edit(self, initial=None, mode="edit"):
         if self.is_editing():
+            return
+        if self._pivot_guard(*self._cell_box(*self._anchor(self.cur))):
             return
         if self.painter:
             self.stop_painter()
@@ -2785,6 +2819,8 @@ class SpreadsheetApp:
     def paste(self, mode="all", transpose=False, skip_blanks=False):
         """Paste the clipboard: mode is "all", "formulas", "values" or "formats"."""
         self.commit_edit()
+        if self._pivot_guard(*self.sel_rect()):
+            return
         try:
             text = self.root.clipboard_get()
         except tk.TclError:
@@ -3264,6 +3300,8 @@ class SpreadsheetApp:
     def clear_contents(self):
         self.commit_edit()
         r1, c1, r2, c2 = self.sel_rect()
+        if self._pivot_guard(r1, c1, r2, c2):
+            return
         cs = ChangeSet(self.wb)
         for r, c in list(self.sh.cells):
             if r1 <= r <= r2 and c1 <= c <= c2:
@@ -3749,6 +3787,233 @@ class SpreadsheetApp:
             index, self.chart_sel = self.chart_sel, None
             self._structural(lambda: self.sh.charts.pop(index))
 
+    # ------------------------------------------------------------------ PivotTables
+
+    def insert_pivot(self):
+        """Insert > PivotTable: a pivot of the selected block (or the data around the active cell)."""
+        self.commit_edit()
+        rect = self.sel_rect()
+        if rect == self._cell_box(*self.cur):
+            rect = self.current_region(*self.cur) if self.cur in self.sh.cells else (0, 0, 0, 0)
+        elif self._is_huge(*rect):
+            rows, cols = self.wb.used_extent(self.sheet)
+            rect = (rect[0], rect[1], max(rect[0], min(rect[2], rows - 1)), max(rect[1], min(rect[3], cols - 1)))
+        result = dialogs.PivotDialog(self.root, self.wb, self.sheet, rect).show()
+        if not result:
+            return
+        names = {p["name"] for sh in self.wb.sheets.values() for p in sh.pivots}
+        name = next(f"PivotTable{n}" for n in itertools.count(1) if f"PivotTable{n}" not in names)
+        src_sheet, src_rect = result["source"]
+        p = pv.new_pivot(name, src_sheet, src_rect, (2, 0))
+        try:
+            pv.Source(self.wb, p)
+        except pv.PivotError as err:
+            messagebox.showerror(APP_NAME, str(err), parent=self.root)
+            return
+        dest = result["dest"]
+        if dest:
+            p["anchor"] = dest[1:]
+            if pv.overlaps(self.wb, dest[0], p, pv.compute(self.wb, p)) and not messagebox.askyesno(
+                    APP_NAME, "Nơi đặt PivotTable đã có dữ liệu. Ghi đè lên dữ liệu đó?", parent=self.root):
+                return
+        placed = []
+
+        def create():
+            sheet = dest[0] if dest else self.wb.add_sheet(index=list(self.wb.sheets).index(self.sheet))
+            self.wb.sheets[sheet].pivots.append(p)
+            pv.place(self.wb, sheet, p, pv.compute(self.wb, p))
+            placed.append(sheet)
+        if self._structural(create):
+            self.show_pivot_fields = True
+            if placed[0] != self.sheet:
+                self.switch_sheet(placed[0])
+            self.select_to(p["anchor"])
+
+    def _fit_report_columns(self, sheet, rect):
+        """Size a pivot report's columns to its contents (Excel autofits them on every update)."""
+        sh = self.wb.sheets[sheet]
+        for c, width in self._content_widths(sheet, rect[1], rect[3], rows=(rect[0], rect[2])).items():
+            sh.col_widths[c] = max(width, fe.DEFAULT_COL_WIDTH * 3 // 4)
+
+    def _current_pivot(self):
+        return pv.pivot_at(self.wb, self.sheet, *self.cur)
+
+    def update_pivot(self, p, **changes):
+        """Apply changes to pivot p on this sheet, recompute and rewrite its report (one undo step)."""
+        sheet = self.sheet
+        trial = dict(p, **changes)
+        try:
+            report = pv.compute(self.wb, trial)
+            pv.report_rect(trial, report)
+        except pv.PivotError as err:
+            messagebox.showerror(APP_NAME, str(err), parent=self.root)
+            self._pane_key = None
+            self.refresh()
+            return False
+        if pv.overlaps(self.wb, sheet, trial, report) and not messagebox.askyesno(
+                APP_NAME, "Báo cáo PivotTable mới sẽ ghi đè lên ô đang có dữ liệu. Tiếp tục?", parent=self.root):
+            self._pane_key = None
+            self.refresh()
+            return False
+
+        def change():
+            p.update({key: trial[key] for key in changes})
+            pv.place(self.wb, sheet, p, report)
+            self._fit_report_columns(sheet, p["rect"])
+        return self._structural(change)
+
+    def refresh_pivot(self, p):
+        self.update_pivot(p)
+
+    def refresh_all_pivots(self):
+        """Data > Refresh All: recompute every pivot from its source as it is now."""
+        self.commit_edit()
+        pivots = [(name, p) for name, sh in self.wb.sheets.items() for p in sh.pivots]
+        if not pivots:
+            messagebox.showinfo(APP_NAME, "Sổ làm việc chưa có PivotTable nào.", parent=self.root)
+            return
+        errors = []
+
+        def change():
+            for sheet, p in pivots:
+                try:
+                    pv.refresh(self.wb, sheet, p)
+                    self._fit_report_columns(sheet, p["rect"])
+                except pv.PivotError as err:
+                    errors.append(f"{p['name']}: {err}")
+        self._structural(change)
+        self._pane_key = None
+        self.refresh()
+        if errors:
+            messagebox.showwarning(APP_NAME, "\n".join(errors), parent=self.root)
+
+    def delete_pivot(self, p):
+        if not messagebox.askyesno(APP_NAME, f"Xóa {p['name']} và báo cáo của nó?", parent=self.root):
+            return
+
+        def change():
+            a1, b1, a2, b2 = p["rect"] or (0, 0, -1, -1)
+            for key in [k for k in set(self.sh.cells) | set(self.sh.formats) if a1 <= k[0] <= a2 and b1 <= k[1] <= b2]:
+                self.sh.cells.pop(key, None)
+                self.sh.formats.pop(key, None)
+            self.sh.pivots.remove(p)
+        self._structural(change)
+
+    def pivot_details(self, p, r, c):
+        """Double-click on a value: the source records behind it, on a new sheet (Excel's Show Details)."""
+        try:
+            source = pv.Source(self.wb, p)
+            report = pv.compute(self.wb, dict(p), source)
+        except pv.PivotError as err:
+            messagebox.showerror(APP_NAME, str(err), parent=self.root)
+            return
+        key = report.sources.get((r - p["anchor"][0], c - p["anchor"][1]))
+        if key is None:
+            return
+        names, records = pv.drill_down(self.wb, p, *key, source=source)
+        made = []
+
+        def create():
+            sheet = self.wb.add_sheet(index=list(self.wb.sheets).index(self.sheet))
+            sh = self.wb.sheets[sheet]
+            for j, name in enumerate(names):
+                sh.cells[(0, j)] = fe.value_to_raw(name) or name
+                sh.formats[(0, j)] = {"bold": True, "bg": "#ddebf7", "bb": ["thin", "#9bc2e6"]}
+            for i, rec in enumerate(records, 1):
+                for j, (value, _) in enumerate(rec):
+                    raw = fe.number_text(value) if fe.is_number(value) else fe.value_to_raw(value)
+                    if raw:
+                        sh.cells[(i, j)] = raw
+                    fmt = source.formats.get(names[j]) if fe.is_number(value) else None
+                    if fmt:
+                        sh.formats[(i, j)] = {"num": fmt}
+            sh.freeze = (0, 1, 0, 0)
+            for col, width in self._content_widths(sheet, 0, len(names) - 1).items():
+                sh.col_widths[col] = max(width, fe.DEFAULT_COL_WIDTH)
+            made.append(sheet)
+        if self._structural(create):
+            self.switch_sheet(made[0])
+            self.select_to((0, 0))
+
+    def toggle_pivot_fields(self):
+        self.show_pivot_fields = not self.show_pivot_fields
+        self._pane_key = None
+        self.refresh()
+
+    def _sync_pivot_pane(self):
+        """Show the PivotTable Fields pane while the active cell is in a pivot report, as Excel does."""
+        self.btn_pivot_fields.set_checked(self.show_pivot_fields)
+        p = self._current_pivot() if self.show_pivot_fields else None
+        if p is None:
+            if self.pivot_pane.winfo_ismapped() or self._pane_key is not None:
+                self.pivot_pane.grid_remove()
+                self._pane_key = None
+            return
+        key = (self.sheet, id(p), repr([p[area] for area in pv.AREAS]))
+        if key != self._pane_key:
+            try:
+                source = pv.Source(self.wb, p)
+                fields, kinds = source.names, source.kinds
+            except pv.PivotError:
+                fields, kinds = [], {}
+            self.pivot_pane.show(p, fields, kinds)
+            self._pane_key = key
+        if not self.pivot_pane.winfo_ismapped():
+            self.pivot_pane.grid(row=0, column=2, sticky="ns")
+
+    def _pivot_pane_change(self, areas):
+        p = self._current_pivot()
+        if p is not None:
+            self.update_pivot(p, **areas)
+
+    def _pivot_pane_action(self, action, *args):
+        p = self._current_pivot()
+        if action == "close":
+            self.toggle_pivot_fields()
+            return
+        if p is None:
+            return
+        if action == "refresh":
+            self.refresh_pivot(p)
+        elif action == "delete":
+            self.delete_pivot(p)
+        elif action == "options":
+            result = dialogs.PivotOptionsDialog(self.root, p).show()
+            if result:
+                self.update_pivot(p, **result)
+        elif action == "value":
+            values = [dict(v) for v in p["values"]]
+            result = dialogs.ValueFieldDialog(self.root, values[args[0]], pv.FUNCS, pv.SHOW_AS).show()
+            if result:
+                values[args[0]].update(result)
+                self.update_pivot(p, values=values)
+        elif action == "field":
+            area, index = args
+            field = p[area][index]
+            try:
+                source = pv.Source(self.wb, p)
+            except pv.PivotError as err:
+                messagebox.showerror(APP_NAME, str(err), parent=self.root)
+                return
+            result = dialogs.PivotFieldDialog(
+                self.root, field, pv.field_items(source, p, field), p["items"].get(field),
+                p["sort"].get(field) == "desc", p["group"].get(field), pv.GROUPS,
+                source.kinds.get(field) == "date").show()
+            if not result:
+                return
+            sort, group, items = dict(p["sort"]), dict(p["group"]), dict(p["items"])
+            sort.pop(field, None)
+            if result["desc"]:
+                sort[field] = "desc"
+            items.pop(field, None)
+            if result["group"] != group.get(field):
+                group.pop(field, None)  # new grouping, new items: all of them shown again
+                if result["group"]:
+                    group[field] = result["group"]
+            elif result["items"] is not None:
+                items[field] = result["items"]
+            self.update_pivot(p, sort=sort, group=group, items=items)
+
     # ------------------------------------------------------------------ data validation and notes
 
     def _validation_target(self):
@@ -3935,19 +4200,25 @@ class SpreadsheetApp:
         _, c1, _, c2 = self.sel_rect()
         self._structural(lambda: self.sh.hidden_cols.difference_update(range(c1, c2 + 1)))
 
+    def _content_widths(self, sheet, c1, c2, rows=None):
+        """{column: pixels at 96 DPI} its widest text needs (only rows r1..r2 when rows = (r1, r2))."""
+        sh = self.wb.sheets[sheet]
+        widest = {}
+        for r, c in sh.cells:
+            if c1 <= c <= c2 and not sh.merge_at(r, c) and (rows is None or rows[0] <= r <= rows[1]):
+                fmt = sh.formats.get((r, c))
+                text = self.wb.display_text(sheet, r, c)
+                indent = ((fmt or {}).get("indent") or 0) * round(9 * self.px)
+                widest[c] = max(widest.get(c, 0), self.text_width(self.font_for(fmt), text) + indent)
+        return {c: max(fe.MIN_COL_WIDTH, round((w + 3 * self.pad) / self.px)) for c, w in widest.items()}
+
     def autofit_columns(self, c1, c2):
         sh = self.sh
         before = self.wb.snapshot()
-        widest = {}
-        for r, c in sh.cells:
-            if c1 <= c <= c2 and not sh.merge_at(r, c):
-                fmt = sh.formats.get((r, c))
-                text = self.wb.display_text(self.sheet, r, c)
-                indent = ((fmt or {}).get("indent") or 0) * round(9 * self.px)
-                widest[c] = max(widest.get(c, 0), self.text_width(self.font_for(fmt), text) + indent)
+        widest = self._content_widths(self.sheet, c1, c2)
         for c in range(c1, c2 + 1):
             if c in widest:
-                sh.col_widths[c] = max(fe.MIN_COL_WIDTH, round((widest[c] + 3 * self.pad) / self.px))
+                sh.col_widths[c] = widest[c]
             else:
                 sh.col_widths.pop(c, None)
         self._push_snapshot(before, self._sel_state())

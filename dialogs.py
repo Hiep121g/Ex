@@ -1450,3 +1450,183 @@ class ChartDialog(Dialog):
             return None
         return {"type": next(k for k, label in CHART_KINDS if label == self.kind.get()), "range": rect,
                 "title": self.title_var.get().strip()}
+
+
+class PivotDialog(Dialog):
+    """Create PivotTable: the source range, and a new sheet or a place on an existing one. collect()
+    gives {"source": (sheet, rect), "new_sheet": bool, "dest": (sheet, row, col)}."""
+
+    def __init__(self, master, wb, sheet, rect):
+        super().__init__(master, "Tạo PivotTable")
+        self.wb, self.sheet = wb, sheet
+        ttk.Label(self.body, text="Chọn dữ liệu cần phân tích (gồm hàng tiêu đề):").pack(anchor="w")
+        self.source = tk.StringVar(value=f"{fe.quote_sheet(sheet)}!{fe.range_name(*rect)}")
+        self.entry = ttk.Entry(self.body, textvariable=self.source, width=40)
+        self.entry.pack(anchor="w", pady=(4, 10))
+        ttk.Label(self.body, text="Chọn nơi đặt báo cáo PivotTable:").pack(anchor="w")
+        self.new_sheet = tk.BooleanVar(value=True)
+        ttk.Radiobutton(self.body, text="Trang tính mới", value=True, variable=self.new_sheet).pack(anchor="w")
+        row = ttk.Frame(self.body)
+        row.pack(anchor="w", pady=(2, 0))
+        ttk.Radiobutton(row, text="Trang tính hiện có, tại ô:", value=False, variable=self.new_sheet).pack(side="left")
+        self.dest = tk.StringVar(value="")
+        dest = ttk.Entry(row, textvariable=self.dest, width=18)
+        dest.pack(side="left", padx=6)
+        dest.bind("<FocusIn>", lambda e: self.new_sheet.set(False))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.entry)
+
+    def _place(self, text):
+        """(sheet, a, b) from 'B3', 'Sheet2!B3' or 'Sheet2!B3:D9' (a, b: the cell or range tuple)."""
+        sheet_text, _, addr = text.strip().rpartition("!")
+        sheet = self.sheet
+        if sheet_text:
+            name = sheet_text[1:-1].replace("''", "'") if sheet_text.startswith("'") else sheet_text
+            sheet = self.wb.resolve_sheet(name)
+        return sheet, fe.parse_address(addr.replace("$", ""))
+
+    def collect(self):
+        sheet, rect = self._place(self.source.get())
+        if sheet is None or rect is None or len(rect) != 4 or rect[2] <= rect[0]:
+            self.bell()
+            return None
+        result = {"source": (sheet, rect), "new_sheet": self.new_sheet.get(), "dest": None}
+        if not result["new_sheet"]:
+            dest_sheet, cell = self._place(self.dest.get())
+            if dest_sheet is None or cell is None:
+                self.bell()
+                return None
+            result["dest"] = (dest_sheet, cell[0], cell[1])
+        return result
+
+
+PIVOT_FORMATS = [("Giống dữ liệu nguồn", None), ("Chung", "General"), ("Số: 1,234", "#,##0"),
+                 ("Số: 1,234.56", "#,##0.00"), ("Phần trăm: 12%", "0%"), ("Phần trăm: 12.34%", "0.00%")]
+
+
+class ValueFieldDialog(Dialog):
+    """Value Field Settings: caption, summary function, 'show values as' and number format."""
+
+    def __init__(self, master, value, funcs, show_as):
+        super().__init__(master, "Cài đặt trường giá trị")
+        self.funcs, self.show_as = funcs, show_as
+        ttk.Label(self.body, text=f"Trường nguồn:  {value['field']}").pack(anchor="w")
+        ttk.Label(self.body, text="Tên tùy chỉnh:").pack(anchor="w", pady=(8, 0))
+        self.name = tk.StringVar(value=value.get("name") or "")
+        self.entry = ttk.Entry(self.body, textvariable=self.name, width=40)
+        self.entry.pack(anchor="w")
+        ttk.Label(self.body, text="(để trống: tự đặt theo hàm, ví dụ “Tổng của …”)", foreground="#666").pack(anchor="w")
+        ttk.Label(self.body, text="Tóm tắt giá trị theo:").pack(anchor="w", pady=(8, 0))
+        self.listbox = tk.Listbox(self.body, height=7, exportselection=False, activestyle="none")
+        for key, label in funcs.items():
+            self.listbox.insert("end", label)
+        index = list(funcs).index(value["func"])
+        self.listbox.selection_set(index)
+        self.listbox.see(index)
+        self.listbox.pack(fill="x")
+        ttk.Label(self.body, text="Hiển thị giá trị dưới dạng:").pack(anchor="w", pady=(8, 0))
+        self.show_var = tk.StringVar(value=show_as[value.get("show", "normal")])
+        ttk.Combobox(self.body, values=list(show_as.values()), textvariable=self.show_var, state="readonly",
+                     width=30).pack(anchor="w")
+        ttk.Label(self.body, text="Định dạng số:").pack(anchor="w", pady=(8, 0))
+        self.num = tk.StringVar(value=next((label for label, f in PIVOT_FORMATS if f == value.get("num")),
+                                           value.get("num") or PIVOT_FORMATS[0][0]))
+        ttk.Combobox(self.body, values=[label for label, _ in PIVOT_FORMATS], textvariable=self.num,
+                     width=30).pack(anchor="w")
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.entry)
+
+    def collect(self):
+        sel = self.listbox.curselection()
+        func = list(self.funcs)[sel[0]] if sel else "sum"
+        num = dict(PIVOT_FORMATS).get(self.num.get(), self.num.get().strip() or None)
+        return {"name": self.name.get().strip() or None, "func": func,
+                "show": next(k for k, label in self.show_as.items() if label == self.show_var.get()), "num": num}
+
+
+class PivotFieldDialog(Dialog):
+    """Settings of a row, column or filter field: item order, date grouping and the items shown."""
+
+    def __init__(self, master, field, items, allowed, descending, group, groups, is_date):
+        super().__init__(master, f"Cài đặt trường - {field}")
+        self.items, self.groups = items, groups
+        self.order = tk.StringVar(value="desc" if descending else "asc")
+        row = ttk.Frame(self.body)
+        row.pack(anchor="w")
+        ttk.Label(row, text="Sắp xếp mục:").pack(side="left")
+        ttk.Radiobutton(row, text="A → Z", value="asc", variable=self.order).pack(side="left", padx=6)
+        ttk.Radiobutton(row, text="Z → A", value="desc", variable=self.order).pack(side="left")
+        self.group = tk.StringVar(value=groups[group])
+        if is_date:
+            row = ttk.Frame(self.body)
+            row.pack(anchor="w", pady=(8, 0))
+            ttk.Label(row, text="Nhóm ngày theo:").pack(side="left")
+            ttk.Combobox(row, values=list(groups.values()), textvariable=self.group, state="readonly",
+                         width=14).pack(side="left", padx=6)
+            ttk.Label(self.body, text="(đổi cách nhóm sẽ chọn lại tất cả các mục)", foreground="#666").pack(anchor="w")
+        ttk.Label(self.body, text="Hiện các mục:").pack(anchor="w", pady=(8, 2))
+        holder = ttk.Frame(self.body)
+        holder.pack(fill="both")
+        canvas = tk.Canvas(holder, width=280, height=200, bg="#ffffff", highlightthickness=1,
+                           highlightbackground="#c8c8c8")
+        bar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        canvas.config(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both")
+        bar.pack(side="right", fill="y")
+        inner = tk.Frame(canvas, bg="#ffffff")
+        canvas.create_window(0, 0, window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.config(scrollregion=canvas.bbox("all")))
+        self.vars = {item: tk.BooleanVar(value=allowed is None or item in allowed) for item in items}
+        self.all_var = tk.BooleanVar(value=all(v.get() for v in self.vars.values()))
+        tk.Checkbutton(inner, text="(Chọn tất cả)", variable=self.all_var, bg="#ffffff", anchor="w",
+                       command=lambda: [v.set(self.all_var.get()) for v in self.vars.values()]).pack(fill="x")
+        for item in items[:2000]:
+            tk.Checkbutton(inner, text=item, variable=self.vars[item], bg="#ffffff", anchor="w").pack(fill="x")
+        self.add_buttons()
+
+    def collect(self):
+        allowed = {item for item, var in self.vars.items() if var.get()}
+        if not allowed:
+            self.bell()
+            return None
+        group = next(k for k, label in self.groups.items() if label == self.group.get())
+        return {"desc": self.order.get() == "desc", "group": group,
+                "items": None if len(allowed) == len(self.items) else allowed}
+
+
+class PivotOptionsDialog(Dialog):
+    """PivotTable options: name, layout, subtotals and grand totals."""
+
+    def __init__(self, master, pivot):
+        super().__init__(master, "Tùy chọn PivotTable")
+        ttk.Label(self.body, text="Tên PivotTable:").grid(row=0, column=0, sticky="w")
+        self.name = tk.StringVar(value=pivot["name"])
+        self.entry = ttk.Entry(self.body, textvariable=self.name, width=28)
+        self.entry.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(self.body, text="Bố cục báo cáo:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.layout = tk.StringVar(value=pivot["layout"])
+        row = ttk.Frame(self.body)
+        row.grid(row=1, column=1, sticky="w", pady=(8, 0), padx=6)
+        ttk.Radiobutton(row, text="Thu gọn", value="compact", variable=self.layout).pack(side="left")
+        ttk.Radiobutton(row, text="Dạng bảng", value="tabular", variable=self.layout).pack(side="left", padx=8)
+        self.flags = {}
+        for i, (key, text) in enumerate((("subtotals", "Hiện tổng phụ"), ("grand_rows", "Tổng Cuối cho các hàng"),
+                                         ("grand_cols", "Tổng Cuối cho các cột"))):
+            self.flags[key] = tk.BooleanVar(value=pivot[key])
+            ttk.Checkbutton(self.body, text=text, variable=self.flags[key]).grid(row=2 + i, column=0, columnspan=2,
+                                                                                 sticky="w", pady=(6 if i == 0 else 0, 0))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.entry)
+
+    def collect(self):
+        if not self.name.get().strip():
+            self.bell()
+            return None
+        return {"name": self.name.get().strip(), "layout": self.layout.get(),
+                **{key: var.get() for key, var in self.flags.items()}}

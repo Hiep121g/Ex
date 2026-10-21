@@ -919,6 +919,113 @@ class AutoFilterTests(unittest.TestCase):
         self.roundtrip(".xlsx")
 
 
+class PivotTests(unittest.TestCase):
+    def setUp(self):
+        import pivot as pv
+        self.pv = pv
+        self.wb = Workbook(("Data", "Pivot"))
+        rows = [("Khu vực", "Sản phẩm", "Ngày", "Số lượng", "Doanh thu"),
+                ("Bắc", "Thép", "05/01/2026", "10", "1000"), ("Bắc", "Xi măng", "10/02/2026", "5", "250"),
+                ("Nam", "Thép", "15/01/2026", "8", "800"), ("Nam", "Thép", "20/02/2026", "2", "200"),
+                ("Bắc", "Thép", "25/02/2026", "4", "400"), ("Trung", "Xi măng", "01/03/2026", "6", "=50*6"),
+                ("", "", "", "", "")]
+        for r, row in enumerate(rows):
+            for c, v in enumerate(row):
+                self.wb.set_raw("Data", r, c, v)
+        self.wb.set_format("Data", 1, 4, {"num": "#,##0"})
+        self.p = pv.new_pivot("PivotTable1", "Data", (0, 0, 7, 4), (2, 0))
+        self.wb.sheets["Pivot"].pivots.append(self.p)
+
+    def grid(self, report):
+        return [[report.cells.get((r, c)) for c in range(report.width)] for r in range(report.height)]
+
+    def test_rows_with_subtotals_and_grand_total(self):
+        self.p.update(rows=["Khu vực", "Sản phẩm"], values=[{"field": "Doanh thu", "func": "sum"}])
+        rep = self.pv.compute(self.wb, self.p)
+        self.assertEqual(self.grid(rep), [
+            ["Nhãn Hàng", "Tổng của Doanh thu"], ["Bắc", 1650], ["Thép", 1400], ["Xi măng", 250], ["Nam", 1000],
+            ["Thép", 1000], ["Trung", 300], ["Xi măng", 300], ["Tổng Cuối", 2950]])
+        self.assertEqual(rep.formats[(2, 0)], {"indent": 1})
+        self.assertTrue(rep.formats[(1, 1)]["bold"])           # a parent line
+        self.assertEqual(rep.formats[(2, 1)]["num"], "#,##0")  # the source column's number format
+        self.assertEqual(rep.sources[(2, 1)], (("Bắc", "Thép"), ()))
+
+    def test_columns_grouped_dates_filters_and_two_values(self):
+        self.p.update(rows=["Khu vực"], cols=["Ngày"], group={"Ngày": "month"}, filters=["Sản phẩm"],
+                      items={"Sản phẩm": {"Thép"}},
+                      values=[{"field": "Doanh thu", "func": "sum"}, {"field": "Số lượng", "func": "average"}])
+        g = self.grid(self.pv.compute(self.wb, self.p))
+        self.assertEqual(g[0][:2], ["Sản phẩm", "Thép"])
+        self.assertEqual(g[2][1], "Nhãn Cột")
+        self.assertEqual([g[3][c] for c in (1, 3, 5)], ["Tháng 01/2026", "Tháng 02/2026", "Tổng Cuối"])
+        self.assertEqual(g[4][:3], ["Nhãn Hàng", "Tổng của Doanh thu", "Trung bình của Số lượng"])
+        self.assertEqual(g[5], ["Bắc", 1000, 10, 400, 4, 1400, 7])
+        self.assertEqual(g[7], ["Tổng Cuối", 1800, 9, 600, 3, 2400, 6])
+
+    def test_tabular_percentages_counts_and_sorting(self):
+        self.p.update(rows=["Khu vực", "Sản phẩm"], layout="tabular", sort={"Khu vực": "desc"},
+                      values=[{"field": "Doanh thu", "func": "sum", "show": "pct_total"},
+                              {"field": "Khu vực", "func": "count"}])
+        rep = self.pv.compute(self.wb, self.p)
+        g = self.grid(rep)
+        self.assertEqual(g[0], ["Khu vực", "Sản phẩm", "Tổng của Doanh thu", "Đếm của Khu vực"])
+        self.assertEqual([row[0] for row in g[1:]], ["Trung", "Trung Tổng", "Nam", "Nam Tổng", "Bắc", None,
+                                                    "Bắc Tổng", "Tổng Cuối"])
+        self.assertAlmostEqual(g[-1][2], 1.0)
+        self.assertAlmostEqual(g[5][2], 1400 / 2950)
+        self.assertEqual(g[5][3], 2)
+        self.assertEqual(rep.formats[(1, 2)]["num"], "0.00%")
+
+    def test_column_subtotals_and_no_rows(self):
+        self.p.update(cols=["Khu vực", "Sản phẩm"], values=[{"field": "Số lượng", "func": "sum"}])
+        g = self.grid(self.pv.compute(self.wb, self.p))
+        self.assertEqual(g[1][1:], ["Bắc", None, "Bắc Tổng", "Nam", "Nam Tổng", "Trung", "Trung Tổng", "Tổng Cuối"])
+        self.assertEqual(g[2][1:3], ["Thép", "Xi măng"])
+        self.assertEqual(g[3][1:], [14, 5, 19, 10, 10, 6, 6, 35])
+
+    def test_place_refresh_drill_and_placeholder(self):
+        pv = self.pv
+        report = pv.refresh(self.wb, "Pivot", self.p)  # nothing chosen yet: the placeholder box
+        self.assertEqual(self.wb.get_raw("Pivot", 3, 0), "PivotTable1")
+        self.p.update(rows=["Sản phẩm"], values=[{"field": "Doanh thu", "func": "sum"}])
+        report = pv.refresh(self.wb, "Pivot", self.p)
+        self.assertEqual(self.p["rect"], (2, 0, 5, 1))
+        self.assertEqual(self.wb.get_raw("Pivot", 3, 0), "Thép")  # the placeholder is gone
+        self.assertEqual(self.wb.get_value("Pivot", 5, 1), 2950)
+        self.assertIs(pv.pivot_at(self.wb, "Pivot", 4, 1), self.p)
+        self.assertIsNone(pv.pivot_at(self.wb, "Pivot", 7, 0))
+        self.wb.set_raw("Data", 1, 4, "2000")  # the report is static until refreshed, like Excel's
+        self.assertEqual(self.wb.get_value("Pivot", 5, 1), 2950)
+        pv.refresh(self.wb, "Pivot", self.p)
+        self.assertEqual(self.wb.get_value("Pivot", 5, 1), 3950)
+        names, records = pv.drill_down(self.wb, self.p, *report.sources[(1, 1)])  # the "Thép" cell
+        self.assertEqual(names[0], "Khu vực")
+        self.assertEqual([rec[0][1] for rec in records], ["Bắc", "Nam", "Nam", "Bắc"])
+        self.wb.set_raw("Pivot", 20, 0, "x")
+        self.p["anchor"] = (19, 0)
+        self.assertTrue(pv.overlaps(self.wb, "Pivot", self.p, report))
+
+    def test_source_follows_rows_renames_and_files(self):
+        self.p.update(rows=["Sản phẩm"], values=[{"field": "Doanh thu", "func": "sum"}], items={"Sản phẩm": {"Thép"}})
+        self.pv.refresh(self.wb, "Pivot", self.p)
+        self.wb.insert_rows("Data", 0, 2)
+        self.assertEqual(self.p["source"]["range"], (2, 0, 9, 4))
+        self.wb.insert_rows("Pivot", 0)
+        self.assertEqual((self.p["anchor"], self.p["rect"]), ((3, 0), (3, 0, 5, 1)))
+        self.wb.rename_sheet("Data", "Dữ liệu")
+        self.assertEqual(self.p["source"]["sheet"], "Dữ liệu")
+        self.assertEqual(self.pv.compute(self.wb, self.p).cells[(1, 1)], 2400)
+        for ext in (".pyxl",) + ((".xlsx",) if fe.HAS_XLSX else ()):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "pivot" + ext)
+                fe.save_workbook(self.wb, path)
+                wb = fe.load_workbook(path)
+            self.assertEqual(list(wb.sheets), ["Dữ liệu", "Pivot"])  # the store sheet stays hidden
+            loaded = wb.sheets["Pivot"].pivots[0]
+            self.assertEqual(loaded, self.p)
+            self.assertEqual(wb.get_value("Pivot", 4, 1), 2400)
+
+
 class LayoutFileTests(unittest.TestCase):
     def build(self):
         wb = make({"A1": "Báo cáo", "A2": "10", "A3": "20", "B2": "=A2*2", "A4": "x", "A5": "y"})

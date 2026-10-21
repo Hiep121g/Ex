@@ -118,6 +118,8 @@ paste_special
 paste_transpose
 paste_values
 percent
+pivot
+pivot_fields
 rank_above
 rank_below
 rank_bottom
@@ -125,6 +127,7 @@ rank_bottom_pct
 rank_top
 rank_top_pct
 redo
+refresh
 remove_dup
 replace
 row_autofit
