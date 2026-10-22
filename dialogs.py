@@ -2233,3 +2233,68 @@ class ProtectSheetDialog(Dialog):
             messagebox.showerror("Bảo vệ Trang tính", "Hai lần nhập mật khẩu không khớp.", parent=self)
             return None
         return self.pw.get(), [k for k, v in self.allow.items() if v.get()]
+
+
+class TextImportDialog(Dialog):
+    """Data > From Text/CSV: choose the encoding, delimiter and number style with a live preview.
+    collect() gives the options for formula_engine.read_text_table."""
+
+    DELIMS = [("auto", "Tự động nhận"), (",", "Dấu phẩy ,"), (";", "Dấu chấm phẩy ;"), ("\t", "Tab"),
+              (" ", "Dấu cách"), ("|", "Dấu |")]
+    DECIMALS = [("auto", "Tự động nhận"), (False, "1,234.5 (dấu chấm thập phân)"), (True, "1.234,5 (dấu phẩy thập phân)")]
+
+    def __init__(self, master, data, name):
+        super().__init__(master, f"Nhập văn bản: {name}")
+        self.data = data[:400000]  # the preview reads the beginning of the file
+        f = self.body
+        self.boxes = {}
+        for row, (key, label, choices) in enumerate((("encoding", "Bảng mã:", fe.TEXT_ENCODINGS),
+                                                     ("delimiter", "Dấu phân cách:", self.DELIMS),
+                                                     ("decimal", "Kiểu số:", self.DECIMALS))):
+            ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            box = ttk.Combobox(f, values=[text for _, text in choices], state="readonly", width=34)
+            box.current(0)
+            box.grid(row=row, column=1, sticky="w", padx=6, pady=2)
+            box.bind("<<ComboboxSelected>>", lambda e: self.update())
+            self.boxes[key] = (box, choices)
+        self.found = ttk.Label(f, foreground="#666")
+        self.found.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 6))
+        box = ttk.Frame(f, width=760, height=290)  # a fixed window on the preview: wide files scroll
+        box.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        box.grid_propagate(False)
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+        self.preview = ttk.Treeview(box, show="headings", height=12)
+        bar = ttk.Scrollbar(box, orient="horizontal", command=self.preview.xview)
+        self.preview.configure(xscrollcommand=bar.set)
+        self.preview.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=1, column=0, sticky="ew")
+        ttk.Label(f, text="Dữ liệu sẽ được đưa vào một trang tính mới.", foreground="#666").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.add_buttons("Nhập")
+        self.update()
+
+    def options(self):
+        out = {}
+        for key, (box, choices) in self.boxes.items():
+            out[key] = choices[box.current()][0]
+        return {"encoding": out["encoding"], "delimiter": out["delimiter"], "decimal_comma": out["decimal"]}
+
+    def update(self):
+        rows, encoding, delimiter, decimal_comma = fe.read_text_table(self.data, **self.options())
+        self.found.configure(text=f"Đang đọc: {fe.ENCODING_NAMES.get(encoding, encoding)}, "
+                                  f"{fe.DELIMITER_NAMES.get(delimiter, repr(delimiter))}, "
+                                  f"số kiểu {'1.234,5' if decimal_comma else '1,234.5'}")
+        rows = rows[:30]
+        width = min(40, max((len(r) for r in rows), default=1))
+        cols = [f"c{i}" for i in range(width)]
+        self.preview.configure(columns=cols)
+        for i, col in enumerate(cols):
+            self.preview.heading(col, text=fe.col_name(i))
+            self.preview.column(col, width=110, anchor="w", stretch=False)
+        self.preview.delete(*self.preview.get_children())
+        for row in rows:
+            self.preview.insert("", "end", values=[v.replace("\n", " ") for v in row[:width]])
+
+    def collect(self):
+        return self.options()

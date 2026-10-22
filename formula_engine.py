@@ -12,14 +12,18 @@ from __future__ import annotations
 
 import base64
 import calendar
+import contextlib
 import copy
+import functools
 import csv
 import datetime as dt
+import gc
 import importlib.util
 import io
 import json
 import math
 import operator
+from operator import itemgetter
 import os
 import random
 import re
@@ -32,8 +36,8 @@ from fractions import Fraction
 
 sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
 
-MAX_ROWS = 10000
-MAX_COLS = 200
+MAX_ROWS = 1048576  # as Excel
+MAX_COLS = 16384   # column XFD, as Excel
 DEFAULT_COL_WIDTH = 80   # pixels at 96 DPI
 DEFAULT_ROW_HEIGHT = 20  # pixels at 96 DPI
 MIN_COL_WIDTH = 12
@@ -182,7 +186,8 @@ def cell_locked(fmt):
 
 def protection_problem(before, after, allow=()):
     """Why a change to a protected sheet is not allowed, or None. before/after: Sheet.copy_state()."""
-    for key in set(before["cells"]) | set(after["cells"]):
+    changed = () if before["cells"] == after["cells"] else set(before["cells"].items()) ^ set(after["cells"].items())
+    for key in {k for k, _ in changed}:
         if before["cells"].get(key) != after["cells"].get(key) and (
                 cell_locked(before["formats"].get(key)) or cell_locked(after["formats"].get(key))):
             return "cells"
@@ -2614,6 +2619,121 @@ def outline_groups(levels):
     return groups
 
 
+@contextlib.contextmanager
+def bulk():
+    """Pause Python's cyclic garbage collector while millions of cell keys are built or moved: it would
+    rescan them all again and again (cells hold no reference cycles; reference counting frees them)."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def _bulky(func):
+    """Run func with bulk() in effect."""
+    @functools.wraps(func)
+    def wrapper(*args, **kw):
+        with bulk():
+            return func(*args, **kw)
+    return wrapper
+
+
+class TrackedDict(dict):
+    """A dict that counts its changes, so an undo copy can be reused while nothing changed (copying or
+    comparing millions of cells on every command is what made big sheets slow)."""
+
+    __slots__ = ("version", "_copy", "_copy_version")
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.version, self._copy, self._copy_version = 0, None, -1
+
+    def frozen(self):
+        """A plain-dict copy of the contents, the same object until the dict changes."""
+        if self._copy is None or self._copy_version != self.version:
+            self._copy, self._copy_version = dict(self), self.version
+        return self._copy
+
+    def _changed(self):
+        self.version += 1
+
+    def __setitem__(self, key, value):
+        self.version += 1
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self.version += 1
+        super().__delitem__(key)
+
+    def pop(self, key, *default):
+        if key in self:  # popping what isn't there (very common: "no format here") changes nothing
+            self._changed()
+        return super().pop(key, *default)
+
+    def popitem(self):
+        self._changed()
+        return super().popitem()
+
+    def clear(self):
+        self._changed()
+        super().clear()
+
+    def update(self, *args, **kw):
+        self._changed()
+        super().update(*args, **kw)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def __reduce__(self):  # copies are plain dicts (snapshots); Sheet wraps them again
+        return dict, (dict(self),)
+
+
+class CellStore(TrackedDict):
+    """A sheet's {(row, col): raw text} that also knows how far its data reaches without scanning every
+    cell (used_extent runs on every scroll). Adding cells grows the remembered extent; removing one makes
+    it unknown until next asked."""
+
+    __slots__ = ("_extent",)
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self._extent = None
+
+    def extent(self):
+        """(rows, cols) spanned by the cells."""
+        if self._extent is None:
+            if not self:
+                self._extent = (0, 0)
+            else:
+                self._extent = (max(self)[0] + 1, max(map(itemgetter(1), self)) + 1)
+        return self._extent
+
+    def _changed(self):
+        self.version += 1
+        self._extent = None
+
+    def __setitem__(self, key, value):
+        ext = self._extent
+        if ext is not None and (key[0] >= ext[0] or key[1] >= ext[1]):
+            self._extent = (max(ext[0], key[0] + 1), max(ext[1], key[1] + 1))
+        self.version += 1
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        self._changed()
+        dict.__delitem__(self, key)
+
+
 class Sheet:
     """One worksheet. Format dicts are never mutated in place, only replaced."""
 
@@ -2621,7 +2741,10 @@ class Sheet:
               "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
               "charts", "pivots", "page_setup", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols",
               "links", "hidden", "protection")
-    __slots__ = ("name", "_merge_map") + _STATE
+    __slots__ = ("name", "_merge_map", "_cells", "_formats") + tuple(k for k in _STATE if k not in ("cells", "formats"))
+    # dicts whose values are never changed in place (only replaced): copied shallowly for undo snapshots
+    _FLAT = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows", "hidden_cols", "notes",
+             "links", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols")
 
     def __init__(self, name):
         self.name = name
@@ -2676,14 +2799,44 @@ class Sheet:
     def row_hidden(self, r):
         return r in self.hidden_rows or (self.filter is not None and r in self.filter["hidden"])
 
+    cells = property(operator.attrgetter("_cells"))  # a C-level getter: cells are read very often
+
+    @cells.setter
+    def cells(self, value):
+        self._cells = value if isinstance(value, CellStore) else CellStore(value)
+
+    formats = property(operator.attrgetter("_formats"))
+
+    @formats.setter
+    def formats(self, value):
+        self._formats = value if isinstance(value, TrackedDict) else TrackedDict(value)
+
     def copy_state(self):
-        return {key: copy.deepcopy(getattr(self, key)) for key in self._STATE}
+        """The sheet's data for undo; big dicts of immutable values are copied shallowly - cells and
+        formats only when they changed since the last copy."""
+        state = {}
+        for key in self._STATE:
+            v = getattr(self, key)
+            if isinstance(v, TrackedDict):
+                state[key] = v.frozen()
+            elif key in self._FLAT:
+                state[key] = dict(v) if isinstance(v, dict) else set(v)
+            else:
+                state[key] = copy.deepcopy(v)
+        return state
 
     @classmethod
     def from_state(cls, name, state):
         sheet = cls(name)
         for key, value in state.items():
-            setattr(sheet, key, copy.deepcopy(value))
+            if key in cls._FLAT:
+                value = value if key in ("cells", "formats") else type(value)(value)  # cells/formats: wrapped
+            else:                                                                    # (a copy) by the setters
+                value = copy.deepcopy(value)
+            setattr(sheet, key, value)
+            if key in ("cells", "formats"):  # the snapshot is this content: reuse it as the next undo copy
+                store = getattr(sheet, key)
+                store._copy, store._copy_version = value, store.version
         sheet.set_merges(sheet.merges)
         return sheet
 
@@ -2699,6 +2852,7 @@ class Workbook:
         self._evaluating = set()
         self._stack = []
         self.names = {}        # NAME (upper case) -> {"name": as typed, "ref": "=Sheet1!$A$1:$B$4", "comment": ""}
+        self.import_info = None  # how a text file was read: {"encoding", "delimiter", "decimal_comma", "truncated"}
         self._names_ast = {}
         for name in sheet_names:
             self.add_sheet(name)
@@ -2806,6 +2960,23 @@ class Workbook:
     def get_format(self, sheet, r, c):
         return self.sheets[sheet].formats.get((r, c))
 
+    @_bulky
+    def write_cells(self, items):
+        """Set many cells at once - [(sheet, row, col, raw, fmt)], None clearing - with the caches cleared
+        once instead of after every cell."""
+        for sheet, r, c, raw, fmt in items:
+            sh = self.sheets[sheet]
+            if raw:
+                sh.cells[(r, c)] = raw
+            else:
+                sh.cells.pop((r, c), None)
+            if fmt:
+                sh.formats[(r, c)] = fmt  # format dicts are shared, never edited in place
+            else:
+                sh.formats.pop((r, c), None)
+            self._ast.pop((sheet, r, c), None)
+        self.invalidate()
+
     def set_format(self, sheet, r, c, fmt):
         formats = self.sheets[sheet].formats
         old = formats.get((r, c)) or {}
@@ -2823,10 +2994,7 @@ class Workbook:
 
     def used_extent(self, sheet):
         """(rows, cols) spanned by non-empty cells."""
-        cells = self.sheets[sheet].cells
-        if not cells:
-            return 0, 0
-        return max(r for r, _ in cells) + 1, max(c for _, c in cells) + 1
+        return self.sheets[sheet].cells.extent()
 
     # evaluation
     def _parsed(self, key, raw):
@@ -3322,6 +3490,7 @@ class Workbook:
     def delete_cols(self, sheet, at, count=1):
         self._shift(sheet, 1, at, -count)
 
+    @_bulky
     def _shift(self, sheet, axis, at, delta, band=None):
         """Insert (delta > 0) or delete (delta < 0) rows (axis 0) or columns (axis 1).
 
@@ -3350,14 +3519,24 @@ class Workbook:
 
         target = sheet.lower()
         for sh in self.sheets.values():
-            for key, raw in list(sh.cells.items()):
-                if is_formula(raw):
-                    sh.cells[key] = _rewrite_axis(raw, sh.name, target, axis, move, move_span, band)
+            formulas = [(key, raw) for key, raw in sh.cells.items() if raw[:1] == "=" and len(raw) > 1]
+            for key, raw in formulas:
+                sh.cells[key] = _rewrite_axis(raw, sh.name, target, axis, move, move_span, band)
         for d in self.names.values():
             d["ref"] = _rewrite_axis(d["ref"], sheet, target, axis, move, move_span, band)
         self._names_ast.clear()
 
         def remap(d):
+            if band is None and axis == 0:  # whole rows: one pass in a comprehension (millions of cells)
+                if delta > 0:
+                    return {((r + delta, c) if r >= at else (r, c)): v for (r, c), v in d.items()
+                            if r < at or r + delta < limit}
+                return {((r + delta, c) if r >= end else (r, c)): v for (r, c), v in d.items() if not at <= r < end}
+            if band is None:
+                if delta > 0:
+                    return {((r, c + delta) if c >= at else (r, c)): v for (r, c), v in d.items()
+                            if c < at or c + delta < limit}
+                return {((r, c + delta) if c >= end else (r, c)): v for (r, c), v in d.items() if not at <= c < end}
             out = {}
             for (r, c), v in d.items():
                 idx, other = (r, c) if axis == 0 else (c, r)
@@ -3609,9 +3788,11 @@ class Workbook:
             return [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) not in sh.cells]
         raise ValueError(kind)
 
+    @_bulky
     def snapshot(self):
         return [(s.name, s.copy_state()) for s in self.sheets.values()], copy.deepcopy(self.names)
 
+    @_bulky
     def restore(self, snap):
         sheets, names = snap
         self.sheets = {name: Sheet.from_state(name, state) for name, state in sheets}
@@ -3858,6 +4039,7 @@ PIVOT_STORE = "_PyExcelPivots"  # very hidden sheet keeping pivot definitions in
 
 # ------------------------------------------------------------------ files
 
+@_bulky
 def load_workbook(path):
     ext = os.path.splitext(path)[1].lower()
     if ext in (".xlsx", ".xlsm"):
@@ -3868,6 +4050,7 @@ def load_workbook(path):
         return Workbook.from_dict(json.load(f))
 
 
+@_bulky
 def save_workbook(wb, path, active=None):
     """Write the workbook; CSV keeps only the `active` sheet's displayed values."""
     ext = os.path.splitext(path)[1].lower()
@@ -3880,28 +4063,162 @@ def save_workbook(wb, path, active=None):
             json.dump(wb.to_dict(active), f, ensure_ascii=False, indent=1)
 
 
-def _load_csv(path):
-    with open(path, "rb") as f:
-        data = f.read()
-    for enc in ("utf-8-sig", "cp1258", "latin-1"):
+# text files (.csv, .txt): reading them as Excel does
+TEXT_ENCODINGS = [("auto", "Tự động nhận"), ("utf-8", "UTF-8"), ("utf-16", "UTF-16 (Unicode)"),
+                  ("cp1258", "Windows-1258 (Tiếng Việt)"), ("cp1252", "Windows-1252 (Tây Âu)"),
+                  ("tcvn3", "TCVN3 (ABC, phông .Vn...)"), ("vni", "VNI (phông VNI-...)")]
+_VN_TONE_MARKS = re.compile("[a-zA-Z\u00c0-\u01b0][\u0300\u0301\u0303\u0309\u0323]")
+_COMBINING = re.compile("[\u0300-\u036f]")
+
+
+def ansi_code_page():
+    """Windows' ANSI code page (what Excel reads a CSV without BOM with), e.g. 'cp1258' or 'cp1252'."""
+    if sys.platform == "win32":
         try:
-            text = data.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    try:
-        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
-    except csv.Error:
-        dialect = csv.excel
+            import ctypes
+            return f"cp{ctypes.windll.kernel32.GetACP()}"
+        except (AttributeError, OSError):
+            pass
+    return "cp1252"
+
+
+def decode_text(data, encoding="auto"):
+    """(text, encoding) of a text file's bytes. Automatic detection follows Excel: a byte-order mark
+    decides (UTF-8, UTF-16); UTF-16 without one shows by its zero bytes; text that is valid UTF-8 is
+    UTF-8; anything else is in the Windows ANSI code page - Windows-1258 when it reads as Vietnamese.
+    Vietnamese written with separate tone marks (Windows-1258, "Unicode tổ hợp") is composed into the
+    usual precomposed letters, which is how Excel shows it."""
+    if encoding in ("tcvn3", "vni"):
+        text = legacy_vietnamese(data.decode("latin-1"), encoding)
+    elif encoding not in (None, "", "auto"):
+        text = data.decode("utf-8-sig" if encoding == "utf-8" else encoding, errors="replace")
+    elif data.startswith(b"\xef\xbb\xbf"):
+        encoding, text = "utf-8", data[3:].decode("utf-8", errors="replace")
+    elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding, text = "utf-16", data.decode("utf-16", errors="replace")
+    else:
+        head = data[:4096]
+        odd, even = head[1::2].count(0), head[0::2].count(0)
+        if len(head) >= 4 and max(odd, even) > len(head) // 6:  # UTF-16 without BOM: every other byte is 0
+            encoding = "utf-16-le" if odd > even else "utf-16-be"
+            text = data.decode(encoding, errors="replace")
+        else:
+            try:
+                encoding, text = "utf-8", data.decode("utf-8")
+            except UnicodeDecodeError:
+                vietnamese = data.decode("cp1258", errors="replace")
+                ansi = ansi_code_page()
+                encoding = "cp1258" if _VN_TONE_MARKS.search(vietnamese) or ansi == "cp1258" else ansi
+                try:
+                    text = vietnamese if encoding == "cp1258" else data.decode(encoding)
+                except (UnicodeDecodeError, LookupError):
+                    encoding, text = "cp1252", data.decode("cp1252", errors="replace")
+    if _COMBINING.search(text):
+        text = unicodedata.normalize("NFC", text)
+    return text, encoding
+
+
+_TCVN3_FROM = "¸µ¶·¹¨¾»¼½Æ©ÊÇÈÉË®ÐÌÎÏÑªÕÒÓÔÖÝ×ØÜÞãßáâä«èåæçé¬íêëìîóïñòô­øõö÷ùýúûüþ¡¢§£¤¥¦"
+_TCVN3_TO = "áàảãạăắằẳẵặâấầẩẫậđéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵĂÂĐÊÔƠƯ"
+_TCVN3 = dict(zip(_TCVN3_FROM, _TCVN3_TO))
+_VNI_LOWER = {
+    "aù": "á", "aø": "à", "aû": "ả", "aõ": "ã", "aï": "ạ",
+    "aâ": "â", "aá": "ấ", "aà": "ầ", "aå": "ẩ", "aã": "ẫ", "aä": "ậ",
+    "aê": "ă", "aé": "ắ", "aè": "ằ", "aú": "ẳ", "aü": "ẵ", "aë": "ặ",
+    "eù": "é", "eø": "è", "eû": "ẻ", "eõ": "ẽ", "eï": "ẹ",
+    "eâ": "ê", "eá": "ế", "eà": "ề", "eå": "ể", "eã": "ễ", "eä": "ệ",
+    "í": "í", "ì": "ì", "æ": "ỉ", "ó": "ĩ", "ò": "ị",
+    "où": "ó", "oø": "ò", "oû": "ỏ", "oõ": "õ", "oï": "ọ",
+    "oâ": "ô", "oá": "ố", "oà": "ồ", "oå": "ổ", "oã": "ỗ", "oä": "ộ",
+    "ô": "ơ", "ôù": "ớ", "ôø": "ờ", "ôû": "ở", "ôõ": "ỡ", "ôï": "ợ",
+    "uù": "ú", "uø": "ù", "uû": "ủ", "uõ": "ũ", "uï": "ụ",
+    "ö": "ư", "öù": "ứ", "öø": "ừ", "öû": "ử", "öõ": "ữ", "öï": "ự",
+    "yù": "ý", "yø": "ỳ", "yû": "ỷ", "yõ": "ỹ", "î": "ỵ", "ñ": "đ"}
+_VNI = {**_VNI_LOWER, **{k.upper(): v.upper() for k, v in _VNI_LOWER.items()}}
+
+
+def legacy_vietnamese(text, kind):
+    """Text in the old 8-bit Vietnamese encodings - TCVN3 (ABC, .Vn... fonts) or VNI (VNI-... fonts), read
+    byte for byte as Latin-1 - in Unicode."""
+    if kind == "tcvn3":
+        return "".join(_TCVN3.get(ch, ch) for ch in text)
+    out, i = [], 0
+    while i < len(text):  # VNI: a letter followed by mark characters; the longest match wins
+        pair = text[i:i + 2]
+        if len(pair) == 2 and pair in _VNI:
+            out.append(_VNI[pair])
+            i += 2
+        else:
+            out.append(_VNI.get(text[i], text[i]))
+            i += 1
+    return "".join(out)
+
+
+_NUM_COMMA_DECIMAL = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d+)?")
+_NUM_DOT_DECIMAL = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
+
+
+def comma_decimals(values):
+    """True when numbers in these texts are written the Vietnamese / European way (1.234,5)."""
+    comma = dot = 0
+    for v in values:
+        v = v.strip()
+        if _NUM_COMMA_DECIMAL.fullmatch(v) and not _NUM_DOT_DECIMAL.fullmatch(v):
+            comma += 1   # 1.234,5 / 12,5 / 1.234.567
+        elif _NUM_DOT_DECIMAL.fullmatch(v) and not _NUM_COMMA_DECIMAL.fullmatch(v):
+            dot += 1     # 1,234.5 / 12.50 / 1,234,567
+    return comma > dot
+
+
+def read_text_table(data, encoding="auto", delimiter="auto", decimal_comma="auto"):
+    """Rows of a delimited text file plus what was used: (rows, encoding, delimiter, decimal_comma).
+    Numbers written as 1.234,5 become 1234.5 when the file uses decimal commas."""
+    text, encoding = decode_text(data, encoding)
+    if delimiter in (None, "", "auto"):
+        sample = text[:20000]
+        lines = [line for line in sample.splitlines()[:50] if line.strip()]
+        counts = {d: [line.count(d) for line in lines] for d in ("\t", ";", ",", "|")}
+        # the delimiter found the same number of times on most lines (Excel's list separator wins ties)
+        def score(d):
+            seen = [n for n in counts[d] if n]
+            return (min(seen) if seen and max(seen) == min(seen) else 0, len(seen)) if seen else (0, 0)
+        delimiter = max(("\t", ";", ",", "|"), key=score)
+        if score(delimiter) == (0, 0):
+            try:
+                delimiter = csv.Sniffer().sniff(sample[:4096], delimiters=",;\t|").delimiter
+            except csv.Error:
+                delimiter = ","
+    rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
+    if decimal_comma == "auto":
+        decimal_comma = delimiter != "," and comma_decimals(v for row in rows[:500] for v in row)
+    if decimal_comma:
+        for row in rows:
+            for i, v in enumerate(row):
+                s = v.strip()
+                if s and s[0] in "-0123456789" and _NUM_COMMA_DECIMAL.fullmatch(s) and ("," in s or "." in s):
+                    row[i] = s.replace(".", "").replace(",", ".")
+    return rows, encoding, delimiter, bool(decimal_comma)
+
+
+def _load_csv(path, **options):
+    with open(path, "rb") as f:
+        rows, encoding, delimiter, decimal_comma = read_text_table(f.read(), **options)
     wb = Workbook()
-    sh = wb.sheets["Sheet1"]
-    for r, row in enumerate(csv.reader(io.StringIO(text), dialect)):
-        if r >= MAX_ROWS:
-            break
-        for c, val in enumerate(row[:MAX_COLS]):
-            if val != "":
-                sh.cells[(r, c)] = val
+    wb.sheets["Sheet1"].cells = table_cells(rows)
+    wb.import_info = {"encoding": encoding, "delimiter": delimiter, "decimal_comma": decimal_comma,
+                      "truncated": len(rows) > MAX_ROWS or any(len(row) > MAX_COLS for row in rows)}
     return wb
+
+
+ENCODING_NAMES = {"utf-8": "UTF-8", "utf-16": "UTF-16", "utf-16-le": "UTF-16", "utf-16-be": "UTF-16",
+                  "cp1258": "Windows-1258 (Tiếng Việt)", "cp1252": "Windows-1252", "tcvn3": "TCVN3", "vni": "VNI"}
+DELIMITER_NAMES = {",": "dấu phẩy", ";": "dấu chấm phẩy", "\t": "Tab", " ": "dấu cách", "|": "dấu |"}
+
+
+def table_cells(rows, r0=0, c0=0):
+    """{(row, col): text} of a table's non-empty values (a CellStore, built in one go)."""
+    return CellStore(((r, c), val) for r, row in enumerate(rows[:MAX_ROWS - r0], r0)
+                     for c, val in enumerate(row[:MAX_COLS - c0], c0) if val != "")
 
 
 def _save_csv(wb, sheet, path):
@@ -3951,6 +4268,9 @@ def _numfmt_from_xlsx(cell):
     return None
 
 
+_MAYBE_LITERAL = re.compile(r"\d|^\s*(?:true|false|#)|^[='+-]", re.I)
+
+
 def _raw_from_xlsx(cell):
     v = cell.value
     if v is None:
@@ -3966,7 +4286,7 @@ def _raw_from_xlsx(cell):
     text = str(getattr(v, "text", v))  # ArrayFormula objects keep the formula in .text
     if cell.data_type == "f" and is_formula(text):
         return normalize_formula(text.replace("_xlfn.", "").replace("_xlws.", ""))
-    return text if parse_literal(text) == (text, None) else "'" + text
+    return _raw_text(text)
 
 
 def _format_from_xlsx(cell):
@@ -4511,10 +4831,242 @@ def _xl_names(book, wb):
             book.defined_names.append(item)
 
 
+# ------------------------------------------------------------------ fast .xlsx cell reading
+
+_XML_ATTR = re.compile(r'([\w:]+)="([^"]*)"')
+_XML_ESC = re.compile(r"&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);")
+_XML_NAMED = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+_OOXML_ESC = re.compile(r"_x([0-9A-Fa-f]{4})_")
+_SHEET_ITEM = re.compile(r'<row\b([^>]*)>'
+                         r'|<c r="([A-Z]{1,3})(\d+)"(?: s="(\d+)")?(?: t="(\w+)")?\s*(?:/>|>(.*?)</c>)'
+                         r'|<c\b([^>]*?)(?:/>|>(.*?)</c>)', re.S)
+_CELL_F = re.compile(r"<f\b([^>]*?)(?:/>|>(.*?)</f>)", re.S)
+_CELL_V = re.compile(r"<v>(.*?)</v>", re.S)
+_CELL_IS = re.compile(r"<is>(.*?)</is>", re.S)
+_TEXT_RUNS = re.compile(r"<t\b[^>]*?(?:/>|>(.*?)</t>)", re.S)
+_PHONETIC = re.compile(r"<rPh\b.*?</rPh>", re.S)
+RowDim = namedtuple("RowDim", "height hidden outlineLevel collapsed")
+
+
+def _xml_text(s):
+    """XML character data as text: entities and Excel's _xHHHH_ escapes undone."""
+    if "&" in s:
+        s = _XML_ESC.sub(lambda m: _XML_NAMED.get(m.group(1)) or chr(
+            int(m.group(1)[2:], 16) if m.group(1)[1] == "x" else int(m.group(1)[1:])), s)
+    if "_x" in s:
+        s = _OOXML_ESC.sub(lambda m: chr(int(m.group(1), 16)), s)
+    return s
+
+
+def _rich_text(xml):
+    """The text of a shared or inline string (rich-text runs joined, phonetic hints left out)."""
+    if "<rPh" in xml:
+        xml = _PHONETIC.sub("", xml)
+    return "".join(_xml_text(m.group(1) or "") for m in _TEXT_RUNS.finditer(xml))
+
+
+def _raw_text(text):
+    """A string read from a file as raw cell text (quoted when PyExcel would read it as something else)."""
+    if not _MAYBE_LITERAL.search(text):
+        return text
+    if text[:1] in "='":
+        return "'" + text
+    return text if parse_literal(text) == (text, None) else "'" + text
+
+
+class XlsxCells:
+    """The cell data of an .xlsx read straight from its XML (openpyxl builds an object per cell, which takes
+    long on big sheets), plus a copy of the file without it (`stripped`) for openpyxl to read everything else."""
+
+    def __init__(self, path):
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            book = z.read("xl/workbook.xml").decode("utf-8")
+            rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+            targets, shared = {}, None
+            for m in re.finditer(r"<Relationship\b([^>]*)/?>", rels):
+                a = dict(_XML_ATTR.findall(m.group(1)))
+                target = a.get("Target", "")
+                target = target[1:] if target.startswith("/") else "xl/" + target
+                targets[a.get("Id")] = target
+                if a.get("Type", "").endswith("/sharedStrings"):
+                    shared = target
+            self.sheets = {}
+            for m in re.finditer(r"<sheet\b([^>]*)/?>", book):
+                a = dict(_XML_ATTR.findall(m.group(1)))
+                part = targets.get(a.get("r:id"))
+                if part in names:
+                    self.sheets[_xml_text(a.get("name", ""))] = part
+            self.strings = []
+            if shared in names:
+                xml = z.read(shared).decode("utf-8")
+                self.strings = [_rich_text(si) for si in re.findall(r"<si>(.*?)</si>|<si/>", xml, re.S)]
+            self.raw_strings = None
+            self.data = {}
+            out = io.BytesIO()
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as dst:
+                parts = {part: title for title, part in self.sheets.items() if title != PIVOT_STORE}
+                for info in z.infolist():
+                    raw = z.read(info.filename)
+                    if info.filename in parts:
+                        xml = raw.decode("utf-8")
+                        m = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>(.*?)</sheetData>", xml, re.S)
+                        if m:
+                            self.data[parts[info.filename]] = m.group(1) or ""
+                            raw = (xml[:m.start()] + "<sheetData/>" + xml[m.end():]).encode("utf-8")
+                    dst.writestr(info.filename, raw)
+            out.seek(0)
+            self.stripped = out
+
+    def read(self, title, style_fmt):
+        """(cells, formats, [(row, RowDim)]) of a sheet; style_fmt(style index, numeric) gives the format of
+        a style (cells of one style share one format dict). Written for speed: the usual
+        <c r="B2" s="3" t="s"><v>7</v></c> takes the short way, anything else the general one."""
+        body = self.data.get(title)
+        cells, formats, rows = {}, {}, []
+        if not body:
+            return cells, formats, rows
+        if self.raw_strings is None:
+            self.raw_strings = [_raw_text(s) for s in self.strings]
+        strings, raw_strings = self.strings, self.raw_strings
+        letters, shared, texts, fmts = {}, {}, {}, {}
+        row = col = 0
+        for m in _SHEET_ITEM.finditer(body):
+            row_attrs, key, row_text, s, kind, inner, attrs, inner2 = m.groups()
+            if row_attrs is not None:  # <row r="5" ht="20" customHeight="1" hidden="1" outlineLevel="1">
+                a = dict(_XML_ATTR.findall(row_attrs))
+                row, col = int(a.get("r", row + 1)), 0
+                height = float(a["ht"]) if "ht" in a and a.get("customHeight") in ("1", "true") else None
+                if height is not None or "hidden" in a or "outlineLevel" in a or "collapsed" in a:
+                    rows.append((row, RowDim(height, a.get("hidden") in ("1", "true"),
+                                             int(a.get("outlineLevel", 0)), a.get("collapsed") in ("1", "true"))))
+                continue
+            if key is not None:  # the usual attribute order
+                row, kind, inner = int(row_text), kind or "n", inner or ""
+            else:
+                a = dict(_XML_ATTR.findall(attrs))
+                s, kind, inner, ref = a.get("s"), a.get("t", "n"), inner2 or "", a.get("r")
+                key = None
+                if ref:
+                    i = len(ref.rstrip("0123456789"))
+                    key, row = ref[:i], int(ref[i:])
+            if key is not None:
+                c = letters.get(key)
+                if c is None:
+                    c = letters[key] = col_index(key)
+                col = c + 1
+            else:
+                col += 1
+            if row > MAX_ROWS or col > MAX_COLS:
+                continue
+            pos = (row - 1, col - 1)
+            raw = None
+            try:  # a damaged value (a shared string that isn't there...) leaves the cell empty
+                if not inner:
+                    pass
+                elif inner[:3] == "<v>" and inner[-4:] == "</v>" and "<" not in inner[3:-4]:  # a value, no formula
+                    value = inner[3:-4]
+                    if kind == "s":
+                        raw = raw_strings[int(value)]
+                    elif kind == "n":
+                        if value.isdigit() and len(value) < 16 and (value[0] != "0" or value == "0"):
+                            raw = value
+                        else:
+                            number = float(value)
+                            raw = number_text(int(number) if number.is_integer() and abs(number) < 1e15 else number)
+                    else:
+                        raw = self._value(kind, value, None, strings)
+                elif inner[-9:] == "</t></is>" and (inner[:7] == "<is><t>" or inner[:28] == '<is><t xml:space="preserve">') \
+                        and "<" not in inner[7 if inner[6] == ">" else 28:-9]:
+                    text = inner[7 if inner[6] == ">" else 28:-9]
+                    raw = texts.get(text)
+                    if raw is None:
+                        raw = _raw_text(_xml_text(text))
+                        if len(texts) < 200000:  # repeated words ("Kho A") are worked out once
+                            texts[text] = raw
+                else:
+                    raw = self._general(inner, kind, pos, shared, strings)
+            except (IndexError, KeyError, ValueError, OverflowError):
+                raw = None
+            if raw:
+                cells[pos] = raw
+            if s and s != "0":
+                fk = (s, kind)
+                fmt = fmts.get(fk, False)
+                if fmt is False:
+                    fmt = fmts[fk] = style_fmt(int(s), kind in ("n", "d"))
+                if fmt:
+                    formats[pos] = fmt
+        return cells, formats, rows
+
+    @staticmethod
+    def _value(kind, value, inner, strings):
+        if kind == "s":
+            return _raw_text(strings[int(value)])
+        if kind == "inlineStr":
+            s = _CELL_IS.search(inner or "")
+            return _raw_text(_rich_text(s.group(1))) if s else None
+        if value is None:
+            return None
+        if kind == "b":
+            return "TRUE" if value.strip() in ("1", "true") else "FALSE"
+        if kind in ("str", "e"):
+            return _raw_text(_xml_text(value))
+        if kind == "d":
+            return number_text(date_to_serial(dt.datetime.fromisoformat(value.strip())))
+        number = float(value)
+        return number_text(int(number) if number.is_integer() and abs(number) < 1e15 else number)
+
+    def _general(self, inner, kind, pos, shared, strings):
+        """A cell with a formula, rich text or other less usual content."""
+        f = _CELL_F.search(inner) if "<f" in inner else None
+        if f is not None:
+            fa = dict(_XML_ATTR.findall(f.group(1)))
+            text = _xml_text(f.group(2) or "")
+            if fa.get("t") == "shared" and "si" in fa:
+                if text:
+                    shared[fa["si"]] = (pos, text)
+                elif fa["si"] in shared:
+                    (r0, c0), master = shared[fa["si"]]
+                    text = shift_formula("=" + master, pos[0] - r0, pos[1] - c0)[1:]
+            if text:
+                return normalize_formula("=" + text.replace("_xlfn.", "").replace("_xlws.", ""))
+        v = _CELL_V.search(inner) if "<v" in inner else None
+        return self._value(kind, v.group(1) if v else None, inner, strings)
+
+
+def _style_formatter(book, ws):
+    """style_fmt for XlsxCells.read: the format of cell style `index` from openpyxl's stylesheet."""
+    from openpyxl.cell.cell import Cell
+    from openpyxl.styles.cell_style import StyleArray
+
+    cache = {}
+
+    def style_fmt(index, numeric):
+        key = (index, numeric)
+        if key not in cache:
+            fmt = None
+            if 0 <= index < len(book._cell_styles):
+                cell = Cell(ws, row=1, column=1, style_array=StyleArray(book._cell_styles[index]))
+                cell._value, cell.data_type = (0, "n") if numeric else ("", "s")
+                try:
+                    fmt = _format_from_xlsx(cell) or None
+                except (AttributeError, TypeError, ValueError, IndexError):
+                    fmt = None
+            cache[key] = fmt
+        return cache[key]
+    return style_fmt
+
+
 def _load_xlsx(path):
     import openpyxl
 
-    book = openpyxl.load_workbook(path)  # formulas are kept as text
+    try:
+        fast = XlsxCells(path)
+    except Exception:  # an unusual file: openpyxl reads all of it
+        fast = None
+    book = openpyxl.load_workbook(fast.stripped if fast else path)  # formulas are kept as text
     wb = Workbook(())
     store = book[PIVOT_STORE] if PIVOT_STORE in book.sheetnames else None
     for ws in book.worksheets:
@@ -4522,24 +5074,51 @@ def _load_xlsx(path):
             continue
         name = wb.add_sheet(ws.title if wb.check_sheet_name(ws.title) is None else None)
         sh = wb.sheets[name]
-        for row in ws.iter_rows(max_row=min(ws.max_row, MAX_ROWS), max_col=min(ws.max_column, MAX_COLS)):
-            for cell in row:
-                try:
-                    pos = (cell.row - 1, cell.column - 1)
-                    raw = _raw_from_xlsx(cell)
-                    fmt = _format_from_xlsx(cell)
-                except (AttributeError, TypeError, ValueError):
-                    continue  # exotic styles
-                if raw:
-                    sh.cells[pos] = raw
-                if fmt:
-                    sh.formats[pos] = fmt
+        row_dims = ws.row_dimensions.items()
+        stored = getattr(ws, "_cells", None)  # only the cells the file has (iter_rows also makes the gaps)
+        if fast is not None and ws.title in fast.data:
+            cells, formats, row_dims = fast.read(ws.title, _style_formatter(book, ws))
+            items = stored.items() if isinstance(stored, dict) else ()  # just cells with comments and links
+            cells_from_book = False
+        elif isinstance(stored, dict):
+            items = stored.items()
+        else:
+            items = (((cell.row, cell.column), cell) for row in ws.iter_rows(
+                max_row=min(ws.max_row, MAX_ROWS), max_col=min(ws.max_column, MAX_COLS)) for cell in row)
+        if fast is None or ws.title not in fast.data:
+            cells, formats, cells_from_book = {}, {}, True
+        styles = {}
+        for (row, col), cell in items:
+            if row > MAX_ROWS or col > MAX_COLS:
+                continue
+            pos = (row - 1, col - 1)
+            if not cells_from_book:
                 if cell.comment is not None and cell.comment.text:
                     sh.notes[pos] = cell.comment.text.strip()
-                if cell.hyperlink is not None:
-                    link = _link_from_xlsx(cell.hyperlink)
-                    if link:
-                        sh.links[pos] = link
+                if cell.hyperlink is not None and (link := _link_from_xlsx(cell.hyperlink)):
+                    sh.links[pos] = link
+                continue
+            try:
+                raw = _raw_from_xlsx(cell)
+                fmt = None
+                if cell.has_style:  # cells sharing a style share one format dict (formats are never edited in place)
+                    key = (tuple(cell._style), cell.data_type)
+                    fmt = styles.get(key)
+                    if fmt is None:
+                        fmt = styles[key] = _format_from_xlsx(cell)
+            except (AttributeError, TypeError, ValueError):
+                continue  # exotic styles
+            if raw:
+                cells[pos] = raw
+            if fmt:
+                formats[pos] = fmt
+            if cell.comment is not None and cell.comment.text:
+                sh.notes[pos] = cell.comment.text.strip()
+            if cell.hyperlink is not None:
+                link = _link_from_xlsx(cell.hyperlink)
+                if link:
+                    sh.links[pos] = link
+        sh.cells, sh.formats = cells, formats
         for key, dim in ws.column_dimensions.items():
             lo = dim.min or (col_index(key) + 1 if re.fullmatch(r"[A-Z]{1,3}", key) else None)
             if lo is None:
@@ -4553,7 +5132,7 @@ def _load_xlsx(path):
                     sh.col_levels[c] = min(MAX_OUTLINE, int(dim.outlineLevel))
                 if dim.collapsed:
                     sh.collapsed_cols.add(c)
-        for idx, dim in ws.row_dimensions.items():
+        for idx, dim in row_dims:
             r = idx - 1
             if r >= MAX_ROWS:
                 continue
@@ -4568,6 +5147,10 @@ def _load_xlsx(path):
                 sh.collapsed_rows.add(r)
         sh.set_merges((rg.min_row - 1, rg.min_col - 1, rg.max_row - 1, rg.max_col - 1)
                       for rg in ws.merged_cells.ranges if rg.max_row <= MAX_ROWS and rg.max_col <= MAX_COLS)
+        for r1, c1, r2, c2 in sh.merges:  # as in Excel, only the first cell of a merged block keeps a value
+            if (r2 - r1 + 1) * (c2 - c1 + 1) <= 100000:
+                for key in [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) != (r1, c1)]:
+                    sh.cells.pop(key, None)
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
         sh.hidden = ws.sheet_state in ("hidden", "veryHidden")
         sh.protection = _protection_from_xlsx(ws.protection)
@@ -4701,13 +5284,182 @@ def _xl_cf_rule(rule):
     return None
 
 
+FAST_SAVE_CELLS = 20000  # sheets with more cells than this get their cell XML written by PyExcel itself
+_XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def _xl_cell_value(raw, fmt):
+    """(value for openpyxl, implied number format, written as text?) of a cell's raw text. Control
+    characters XML can't hold are written as Excel's _xHHHH_ escapes."""
+    if raw is None:
+        return None, None, False
+    if _XML_BAD.search(raw):
+        raw = _XML_BAD.sub(lambda m: f"_x{ord(m.group()):04X}_", raw)
+    if fmt.get("num") == "@":
+        return (raw[1:] if raw.startswith("'") else raw), None, True
+    if raw[:1] == "=" and len(raw) > 1:
+        return raw, None, False
+    if not _MAYBE_LITERAL.search(raw):  # words: nothing to read as a number or date
+        return raw, None, True
+    if raw.isdigit() and raw.isascii() and (raw[0] != "0" or raw == "0") and len(raw) < 16:
+        return int(raw), None, False
+    value, implied = parse_literal(raw)
+    return value, implied, isinstance(value, str)
+
+
+def _xl_apply_style(cell, fmt, numfmt):
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
+
+    if numfmt:
+        cell.number_format = _xl_number_format(numfmt)
+    if any(fmt.get(k) for k in ("font", "size", "bold", "italic", "underline", "strike", "fg")):
+        underline = fmt.get("underline")
+        cell.font = Font(name=fmt.get("font") or "Calibri", size=fmt.get("size") or 11,
+                         bold=bool(fmt.get("bold")), italic=bool(fmt.get("italic")),
+                         underline="double" if underline == "double" else ("single" if underline else None),
+                         strike=bool(fmt.get("strike")), color=_xl_hex(fmt.get("fg")))
+    if fmt.get("bg"):
+        cell.fill = PatternFill("solid", fgColor=_xl_hex(fmt["bg"]))
+    if any(fmt.get(k) for k in ("align", "valign", "wrap", "indent", "rotate")):
+        rot = fmt.get("rotate") or 0
+        cell.alignment = Alignment(horizontal=fmt.get("align"), vertical=fmt.get("valign"),
+                                   wrap_text=bool(fmt.get("wrap")), indent=int(fmt.get("indent") or 0),
+                                   text_rotation=rot if rot >= 0 else 90 - rot)
+    if any(fmt.get(k) for k in BORDER_KEYS):
+        sides = [Side(style=v[0], color=_xl_hex(v[1])) if v else Side() for v in map(fmt.get, BORDER_KEYS)]
+        cell.border = Border(top=sides[0], bottom=sides[1], left=sides[2], right=sides[3])
+    if fmt.get("unlocked") or fmt.get("hide_formula"):
+        cell.protection = Protection(locked=not fmt.get("unlocked"), hidden=bool(fmt.get("hide_formula")))
+
+
+
+
+def _xml_escape(s):
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if _XML_BAD.search(s):
+        s = _XML_BAD.sub(lambda m: f"_x{ord(m.group()):04X}_", s)
+    return s
+
+
+def _sheet_data_xml(sh, ws, book):
+    """(<sheetData> XML, dimension ref) of a sheet's cells and row settings, with the styles registered in
+    the openpyxl book so they land in styles.xml (openpyxl would build an object for every cell)."""
+    from openpyxl.cell.cell import Cell
+
+    style_ids, letters, numbers, values = {}, {}, {}, {}
+    cells, formats = sh.cells, sh.formats
+
+    def style_id(fmt, numfmt):
+        key = (id(fmt), numfmt)
+        index = style_ids.get(key)
+        if index is None:
+            cell = Cell(ws, row=1, column=1)
+            _xl_apply_style(cell, fmt, numfmt)
+            index = style_ids[key] = book._cell_styles.add(cell._style) if cell.has_style else 0
+        return index
+
+    rows = {}
+    for key in set(cells) | set(formats):
+        rows.setdefault(key[0], []).append(key[1])
+    hidden = sh.hidden_rows | (sh.filter["hidden"] if sh.filter else set())
+    dim_rows = set(sh.row_heights) | hidden | set(sh.row_levels) | sh.collapsed_rows
+    out = []
+    empty = {}
+    for r in sorted(set(rows) | dim_rows):
+        attrs = f'<row r="{r + 1}"'
+        if r in sh.row_heights:
+            attrs += f' ht="{round(sh.row_heights[r] * 0.75, 2)}" customHeight="1"'
+        if r in hidden:
+            attrs += ' hidden="1"'
+        if r in sh.row_levels:
+            attrs += f' outlineLevel="{sh.row_levels[r]}"'
+        if r in sh.collapsed_rows:
+            attrs += ' collapsed="1"'
+        out.append(attrs + ">")
+        for c in sorted(rows.get(r, ())):
+            letter = letters.get(c)
+            if letter is None:
+                letter = letters[c] = col_name(c)
+            ref = f"{letter}{r + 1}"
+            fmt = formats.get((r, c)) or empty
+            raw = cells.get((r, c))
+            if fmt is empty and raw is not None:
+                found = values.get(raw)  # unformatted cells: the same text reads the same way
+                if found is None:
+                    found = _xl_cell_value(raw, fmt)
+                    if len(values) < 200000:
+                        values[raw] = found
+                value, implied, text = found
+            else:
+                value, implied, text = _xl_cell_value(raw, fmt)
+            index = style_id(fmt, fmt.get("num") or implied) if fmt or implied else 0
+            s = f' s="{index}"' if index else ""
+            if value is None:
+                out.append(f'<c r="{ref}"{s}/>')
+            elif text:
+                out.append(f'<c r="{ref}"{s} t="inlineStr"><is><t xml:space="preserve">{_xml_escape(value)}</t></is></c>')
+            elif isinstance(value, bool):
+                out.append(f'<c r="{ref}"{s} t="b"><v>{int(value)}</v></c>')
+            elif isinstance(value, str):  # a formula
+                out.append(f'<c r="{ref}"{s}><f>{_xml_escape(value[1:])}</f></c>')
+            else:
+                v = numbers.get(value)
+                if v is None:
+                    v = str(int(value)) if float(value).is_integer() and abs(value) < 1e15 else repr(float(value))
+                    if len(numbers) < 100000:
+                        numbers[value] = v
+                out.append(f'<c r="{ref}"{s}><v>{v}</v></c>')
+        out.append("</row>")
+    rows_used, cols_used = cells.extent()
+    dimension = range_name(0, 0, max(rows_used, 1) - 1, max(cols_used, 1) - 1)
+    return "<sheetData>" + "".join(out) + "</sheetData>", dimension
+
+
+def _put_sheet_data(buffer, path, sheets):
+    """Write the .xlsx openpyxl made (in buffer) to path with the cell XML of `sheets` put in."""
+    import zipfile
+
+    with zipfile.ZipFile(buffer) as src:
+        parts = _sheet_parts(src)
+        wanted = {parts[title]: xml for title, xml in sheets.items() if title in parts}
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as dst:
+            for info in src.infolist():
+                data = src.read(info.filename)
+                if info.filename in wanted:
+                    body, dimension = wanted[info.filename]
+                    xml = data.decode("utf-8")
+                    m = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>.*?</sheetData>", xml, re.S)
+                    xml = xml[:m.start()] + body + xml[m.end():]
+                    xml = re.sub(r'<dimension ref="[^"]*"\s*/>', f'<dimension ref="{dimension}"/>', xml, count=1)
+                    data = xml.encode("utf-8")
+                dst.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+
+
+def _sheet_parts(z):
+    """{sheet name: worksheet part path} of an open .xlsx zip."""
+    book = z.read("xl/workbook.xml").decode("utf-8")
+    rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    targets = {}
+    for m in re.finditer(r"<Relationship\b([^>]*)/?>", rels):
+        a = dict(_XML_ATTR.findall(m.group(1)))
+        target = a.get("Target", "")
+        targets[a.get("Id")] = target[1:] if target.startswith("/") else "xl/" + target
+    out = {}
+    for m in re.finditer(r"<sheet\b([^>]*)/?>", book):
+        a = dict(_XML_ATTR.findall(m.group(1)))
+        if a.get("r:id") in targets:
+            out[_xml_text(a.get("name", ""))] = targets[a["r:id"]]
+    return out
+
+
 def _save_xlsx(wb, path, active=None):
     import openpyxl
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 
     book = openpyxl.Workbook()
     book.remove(book.active)
     from openpyxl.comments import Comment
+
+    fast_sheets = {}
 
     for sh in wb.sheets.values():
         ws = book.create_sheet(sh.name)
@@ -4717,55 +5469,31 @@ def _save_xlsx(wb, path, active=None):
             ws.cell(row=r + 1, column=c + 1).comment = comment
         for (r, c), link in sh.links.items():
             _xl_link(ws.cell(row=r + 1, column=c + 1), link)
-        for r, c in set(sh.cells) | set(sh.formats):
-            cell = ws.cell(row=r + 1, column=c + 1)
-            raw = sh.cells.get((r, c))
-            fmt = sh.formats.get((r, c)) or {}
-            implied = None
-            if raw is not None:
-                as_text = fmt.get("num") == "@"
-                if as_text:
-                    value = raw[1:] if raw.startswith("'") else raw
-                elif is_formula(raw):
-                    value = raw
-                else:
-                    value, implied = parse_literal(raw)
-                cell.value = value
-                if isinstance(value, str) and (as_text or not is_formula(raw)):
-                    cell.data_type = "s"
-            numfmt = fmt.get("num") or implied
-            if numfmt:
-                cell.number_format = _xl_number_format(numfmt)
-            if any(fmt.get(k) for k in ("font", "size", "bold", "italic", "underline", "strike", "fg")):
-                underline = fmt.get("underline")
-                cell.font = Font(name=fmt.get("font") or "Calibri", size=fmt.get("size") or 11,
-                                 bold=bool(fmt.get("bold")), italic=bool(fmt.get("italic")),
-                                 underline="double" if underline == "double" else ("single" if underline else None),
-                                 strike=bool(fmt.get("strike")), color=_xl_hex(fmt.get("fg")))
-            if fmt.get("bg"):
-                cell.fill = PatternFill("solid", fgColor=_xl_hex(fmt["bg"]))
-            if any(fmt.get(k) for k in ("align", "valign", "wrap", "indent", "rotate")):
-                rot = fmt.get("rotate") or 0
-                cell.alignment = Alignment(horizontal=fmt.get("align"), vertical=fmt.get("valign"),
-                                           wrap_text=bool(fmt.get("wrap")), indent=int(fmt.get("indent") or 0),
-                                           text_rotation=rot if rot >= 0 else 90 - rot)
-            if any(fmt.get(k) for k in BORDER_KEYS):
-                sides = [Side(style=v[0], color=_xl_hex(v[1])) if v else Side() for v in map(fmt.get, BORDER_KEYS)]
-                cell.border = Border(top=sides[0], bottom=sides[1], left=sides[2], right=sides[3])
-            if fmt.get("unlocked") or fmt.get("hide_formula"):
-                cell.protection = Protection(locked=not fmt.get("unlocked"), hidden=bool(fmt.get("hide_formula")))
+        if len(sh.cells) + len(sh.formats) > FAST_SAVE_CELLS:  # big sheet: cell XML written directly
+            fast_sheets[ws.title] = _sheet_data_xml(sh, ws, book)
+        else:
+            for r, c in set(sh.cells) | set(sh.formats):
+                cell = ws.cell(row=r + 1, column=c + 1)
+                fmt = sh.formats.get((r, c)) or {}
+                value, implied, text = _xl_cell_value(sh.cells.get((r, c)), fmt)
+                if value is not None:
+                    cell.value = value
+                    if text:
+                        cell.data_type = "s"
+                _xl_apply_style(cell, fmt, fmt.get("num") or implied)
         for c, width in sh.col_widths.items():
             ws.column_dimensions[col_name(c)].width = max(1.0, (width - 5) / 7)
         for c in sh.hidden_cols:
             ws.column_dimensions[col_name(c)].hidden = True
-        for r, height in sh.row_heights.items():
-            ws.row_dimensions[r + 1].height = round(height * 0.75, 2)
-        for r in sh.hidden_rows | (sh.filter["hidden"] if sh.filter else set()):
-            ws.row_dimensions[r + 1].hidden = True
-        for r, level in sh.row_levels.items():
-            ws.row_dimensions[r + 1].outlineLevel = level
-        for r in sh.collapsed_rows:
-            ws.row_dimensions[r + 1].collapsed = True
+        if ws.title not in fast_sheets:  # (the fast writer puts these on its <row> elements)
+            for r, height in sh.row_heights.items():
+                ws.row_dimensions[r + 1].height = round(height * 0.75, 2)
+            for r in sh.hidden_rows | (sh.filter["hidden"] if sh.filter else set()):
+                ws.row_dimensions[r + 1].hidden = True
+            for r, level in sh.row_levels.items():
+                ws.row_dimensions[r + 1].outlineLevel = level
+            for r in sh.collapsed_rows:
+                ws.row_dimensions[r + 1].collapsed = True
         for c, level in sh.col_levels.items():
             ws.column_dimensions[col_name(c)].outlineLevel = level
         for c in sh.collapsed_cols:
@@ -4820,4 +5548,9 @@ def _save_xlsx(wb, path, active=None):
     book.active = list(wb.sheets).index(active)
     for ws in book.worksheets:  # Excel opens on the active sheet; others must not look selected
         ws.sheet_view.tabSelected = ws is book.active
-    book.save(path)
+    if not fast_sheets:
+        book.save(path)
+        return
+    buffer = io.BytesIO()
+    book.save(buffer)
+    _put_sheet_data(buffer, path, fast_sheets)

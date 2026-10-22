@@ -89,6 +89,7 @@ help
 hide_col
 hide_detail
 hide_row
+import_text
 indent_dec
 indent_inc
 info

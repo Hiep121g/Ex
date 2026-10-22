@@ -8,6 +8,7 @@ at 96 DPI are converted with PT (0.75).
 
 import datetime as dt
 import os
+from operator import itemgetter
 
 import base64
 
@@ -96,8 +97,15 @@ def wrap(text, width, measure):
 def used_rect(wb, sheet):
     """The block that holds anything printable: values, fills, borders, merges and charts."""
     sh = wb.sheets[sheet]
-    keys = set(sh.cells) | {k for k, f in sh.formats.items() if f.get("bg") or any(f.get(b) for b in fe.BORDER_KEYS)}
-    rects = [(r, c, r, c) for r, c in keys] + [tuple(m) for m in sh.merges]
+    rects = [tuple(m) for m in sh.merges]
+    if sh.cells:  # min/max over the keys in C: a big sheet has millions of cells
+        rows, cols = sh.cells.extent()
+        rects.append((min(sh.cells)[0], min(map(itemgetter(1), sh.cells)), rows - 1, cols - 1))
+    printable = {}  # formats are shared between cells: judge each one once
+    keys = [k for k, f in sh.formats.items()
+            if printable.setdefault(id(f), bool(f.get("bg") or any(f.get(b) for b in fe.BORDER_KEYS)))]
+    if keys:
+        rects.append((min(keys)[0], min(map(itemgetter(1), keys)), max(keys)[0], max(map(itemgetter(1), keys))))
     for chart in sh.charts:
         r, c = chart["anchor"][:2]
         w, h = chart["size"]

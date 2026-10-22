@@ -989,6 +989,14 @@ def _icon_lock_cell(cv, P, k, c):
     _padlock(cv, P, k, 7, 9, 0.9)
 
 
+def _icon_import_text(cv, P, k, c):
+    _page(cv, P, 1, 1, 10, 14)
+    _glyph(cv, P, k, 5.5, 6, "CSV", 4.5, GREEN, "bold")
+    _lines(cv, P, k, [(2.5, 9.5, 8.5), (2.5, 11.5, 7.5)], GRAY)
+    _grid(cv, P, k, 9, 7, 15, 15, 2, GRAY, "#ffffff")
+    _arrow(cv, P, k, 6, 13, 11, 13, BLUE, 1.2)
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -1083,7 +1091,7 @@ ICONS.update({
     "show_detail": lambda *a: _icon_detail(*a, True), "hide_detail": lambda *a: _icon_detail(*a, False),
 })
 ICONS.update({"picture": _icon_picture, "link": _icon_link, "text_columns": _icon_text_columns,
-              "protect": _icon_protect, "lock_cell": _icon_lock_cell})
+              "protect": _icon_protect, "lock_cell": _icon_lock_cell, "import_text": _icon_import_text})
 ICONS.update({f"name_{kind}": (lambda kind: lambda *a: _icon_name(*a, kind))(kind)
               for kind in ("manager", "define", "use", "create")})
 

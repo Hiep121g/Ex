@@ -6,6 +6,7 @@ Run:  python excel_app.py [file.xlsx | file.pyxl | file.csv]
 import base64
 import csv
 import datetime as dt
+import heapq
 import io
 import itertools
 import math
@@ -268,6 +269,16 @@ TỆP
   bộ lọc); .pyxl là định dạng riêng (JSON); .csv chỉ lưu giá trị của trang tính đang mở.
   Tệp → Mở gần đây: 10 tệp mở gần nhất. PyExcel tự lưu bản khôi phục mỗi 5 phút khi có thay đổi chưa lưu
   (Tệp → Lưu tự động bản khôi phục để đổi số phút); nếu máy tắt đột ngột, lần mở sau sẽ hỏi khôi phục.
+  Mỗi trang tính rộng như Excel: 1.048.576 hàng × 16.384 cột (A → XFD).
+
+TỆP CSV / VĂN BẢN
+  • Mở tệp .csv tự nhận bảng mã như Excel: UTF-8 (có hoặc không có BOM), UTF-16 ("Văn bản Unicode"),
+    còn lại là bảng mã ANSI của Windows - Windows-1258 khi tệp là tiếng Việt. Dấu thanh viết tách rời
+    (kiểu "Unicode tổ hợp" / Windows-1258) được ghép lại để hiển thị đúng.
+  • Tự nhận dấu phân cách (phẩy, chấm phẩy, Tab, |); tệp dùng dấu chấm phẩy với số kiểu 1.234,5 được đọc
+    thành số. Thanh trạng thái cho biết bảng mã và dấu phân cách đã dùng.
+  • Nếu chữ vẫn sai: Dữ liệu → Từ Văn bản/CSV để tự chọn bảng mã (kể cả TCVN3 / ABC và VNI của các
+    phông .Vn..., VNI-...), dấu phân cách và kiểu số, có xem trước; dữ liệu vào một trang tính mới.
 
 IN VÀ XUẤT PDF
   • Tệp → In... (Ctrl+P): xem trước từng trang; chọn in trang tính hiện hành, cả sổ làm việc hoặc vùng chọn,
@@ -333,6 +344,7 @@ class SpreadsheetApp:
         self.views = {}                # sheet -> (top, left, cur, ext)
         self.undo_stack, self.redo_stack = [], []
         self.edit_serial = 0           # counts changes, for caches of derived data
+        self._stats_key = self._stats_job = self._autosave_thread = None
         self.settings = session.Settings()
         self.recovery = session.Recovery(self.settings.folder)
         self._font_library, self._layout_cache = None, (None, None)
@@ -942,6 +954,10 @@ class SpreadsheetApp:
         col = g.column()
         self._btn(g, col, side="top", icon="show_detail", text="Hiện chi tiết", command=lambda: self.outline_detail(True))
         self._btn(g, col, side="top", icon="hide_detail", text="Ẩn chi tiết", command=lambda: self.outline_detail(False))
+        g = rb.group(page, "Lấy dữ liệu")
+        self._btn(g, large=True, icon="import_text", text="Từ Văn\nbản/CSV", command=self.import_text,
+                  tooltip="Từ Văn bản/CSV\nNhập tệp .csv/.txt, tự chọn bảng mã (UTF-8, Windows-1258, TCVN3, VNI...)\n"
+                          "và dấu phân cách, có xem trước")
         g = rb.group(page, "Công cụ dữ liệu")
         self._btn(g, large=True, icon="text_columns", text="Văn bản\nthành Cột", command=self.text_to_columns,
                   tooltip="Văn bản thành Cột\nTách nội dung một cột thành nhiều cột theo dấu phẩy, dấu cách...")
@@ -1704,6 +1720,8 @@ class SpreadsheetApp:
                 text, align, is_num = self.fit_number(value, numfmt, font, avail), "right", True
             else:
                 text, align = str(value), "left"
+            if fe._COMBINING.search(text):  # "Unicode tổ hợp" (separate tone marks): Tk draws the marks apart
+                text = unicodedata.normalize("NFC", text)
             align = fmt.get("align") or align
             valign = fmt.get("valign") or "bottom"
             fg = eff.get("fg") or "#000000"
@@ -2215,26 +2233,72 @@ class SpreadsheetApp:
                                  "Tùy chỉnh"))
 
     def update_status(self):
-        r1, c1, r2, c2 = self.sel_rect()
-        if (r1, c1, r2, c2) == self._cell_box(*self.cur):
+        """Average / Count / Sum of the selection in the status bar. Large selections are added up a piece
+        at a time between events, so moving around never waits for them; an unchanged selection is not
+        added up again."""
+        rects = [self.sel_rect()] + self.areas
+        if len(rects) == 1 and rects[0] == self._cell_box(*self.cur):
+            self._stats_key = None
+            if self._stats_job:
+                self.root.after_cancel(self._stats_job)
+                self._stats_job = None
             self.stats_label.config(text="")
             return
-        cells = self.sh.cells
-        if (r2 - r1 + 1) * (c2 - c1 + 1) > len(cells):
-            keys = [k for k in cells if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
-        else:
-            keys = [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) in cells]
-        count, nums, total = 0, 0, 0.0
-        for r, c in keys:
-            if self.sh.row_hidden(r):
+        rows, cols = self.wb.used_extent(self.sheet)
+        rects = [(r1, c1, min(r2, rows - 1), min(c2, cols - 1)) for r1, c1, r2, c2 in rects]
+        key = (id(self.wb), self.sheet, tuple(rects), self.edit_serial)
+        if key == self._stats_key:
+            return
+        self._stats_key = key
+        if self._stats_job:
+            self.root.after_cancel(self._stats_job)
+        work = self._stats_work(rects)
+        if sum(max(0, r2 - r1 + 1) * max(0, c2 - c1 + 1) for r1, c1, r2, c2 in rects) > 5000:
+            self.stats_label.config(text="")
+        self._stats_job = None
+        self._stats_step(work)
+
+    def _stats_work(self, rects):
+        """Generator adding up the selected cells; yields now and then so the work can pause, and
+        finally yields (count, numbers, total)."""
+        cells, sh, get = self.sh.cells, self.sh, self.wb.get_value
+        sheet, seen = self.sheet, set()
+        count = nums = 0
+        total = 0.0
+        for r1, c1, r2, c2 in rects:
+            if r2 < r1 or c2 < c1:
                 continue
-            v = self.wb.get_value(self.sheet, r, c)
-            if v is None or v == "":
-                continue
-            count += 1
-            if fe.is_number(v):
-                nums += 1
-                total += v
+            if (r2 - r1 + 1) * (c2 - c1 + 1) > len(cells):
+                keys = sorted(k for k in cells if r1 <= k[0] <= r2 and c1 <= k[1] <= c2)
+            else:
+                keys = ((r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) in cells)
+            for i, (r, c) in enumerate(keys):
+                if i % 4000 == 3999:
+                    yield None
+                if (r, c) in seen or sh.row_hidden(r):
+                    continue
+                if len(rects) > 1:
+                    seen.add((r, c))
+                v = get(sheet, r, c)
+                if v is None or v == "":
+                    continue
+                count += 1
+                if fe.is_number(v):
+                    nums += 1
+                    total += v
+        yield count, nums, total
+
+    def _stats_step(self, work):
+        """Run the adding up for a moment, then let events through and carry on."""
+        end = time.perf_counter() + 0.04
+        result = None
+        while result is None and time.perf_counter() < end:
+            result = next(work)
+        if result is None:
+            self._stats_job = self.root.after(1, lambda: self._stats_step(work))
+            return
+        self._stats_job = None
+        count, nums, total = result
         parts = []
         if nums:
             parts.append(f"Trung bình: {fe.format_general(total / nums)}")
@@ -2997,9 +3061,11 @@ class SpreadsheetApp:
 
     def _apply_changes(self, changes, forward):
         rows = {}
-        for (sheet, r, c), raw0, raw1, fmt0, fmt1 in changes:
-            self.wb.set_raw(sheet, r, c, raw1 if forward else raw0)
-            self.wb.set_format(sheet, r, c, fmt1 if forward else fmt0)
+        if forward:
+            self.wb.write_cells((sheet, r, c, raw1, fmt1) for (sheet, r, c), raw0, raw1, fmt0, fmt1 in changes)
+        else:
+            self.wb.write_cells((sheet, r, c, raw0, fmt0) for (sheet, r, c), raw0, raw1, fmt0, fmt1 in changes)
+        for (sheet, r, c), *_ in changes:
             rows.setdefault(sheet, set()).add(r)
         for sheet, changed in rows.items():
             self.autofit_rows(changed, sheet)
@@ -3014,7 +3080,44 @@ class SpreadsheetApp:
     def _push_snapshot(self, before, sel):
         after = self.wb.snapshot()
         if after != before:
+            self._share_snapshots(before, after)
             self._push_undo(("snap", before, after, sel))
+            self._trim_undo()
+
+    def _share_snapshots(self, before, after):
+        """Let snapshot parts with the same content be one object: before/after of this change, and this
+        change's before with the previous change's after (big sheets would otherwise be copied each time)."""
+        prev = next((a for a in reversed(self.undo_stack) if a[0] == "snap"), None)
+        previous = dict(prev[2][0]) if prev else {}
+        old = dict(before[0])
+        for name, state in after[0]:
+            b, p = old.get(name), previous.get(name)
+            if b is None:
+                continue
+            for key in fe.Sheet._FLAT:
+                if p is not None and b[key] is not p[key] and b[key] == p[key]:
+                    b[key] = p[key]
+                if state[key] is not b[key] and state[key] == b[key]:
+                    state[key] = b[key]
+
+    UNDO_BUDGET = 6_000_000  # cells and formats kept in undo copies of whole sheets
+
+    def _trim_undo(self):
+        """Forget the oldest whole-sheet undo copies when they hold more than UNDO_BUDGET cells."""
+        seen, size = set(), 0
+        for i in range(len(self.undo_stack) - 1, -1, -1):
+            action = self.undo_stack[i]
+            if action[0] != "snap":
+                continue
+            for _, state in action[1][0] + action[2][0]:
+                for key in ("cells", "formats"):
+                    obj = state[key]
+                    if id(obj) not in seen:
+                        seen.add(id(obj))
+                        size += len(obj)
+            if size > self.UNDO_BUDGET and i < len(self.undo_stack) - 1:
+                del self.undo_stack[:i]
+                return
 
     def _structural(self, func):
         """Run a change to sheets, rows, columns, merges or rules with whole-workbook undo."""
@@ -3210,12 +3313,14 @@ class SpreadsheetApp:
         r1, c1, r2, c2 = self._copy_rect()
         if r2 < r1 or c2 < c1:
             return
-        sh = self.sh
-        block = [[(sh.cells.get((r, c)), sh.formats.get((r, c))) for c in range(c1, c2 + 1)] for r in range(r1, r2 + 1)]
-        values = [[fe.value_to_raw(self.wb.get_value(self.sheet, r, c)) for c in range(c1, c2 + 1)]
-                  for r in range(r1, r2 + 1)]
-        text = "\n".join("\t".join(self._tsv_field(self.wb.display_text(self.sheet, r, c)) for c in range(c1, c2 + 1))
-                         for r in range(r1, r2 + 1))
+        sh, cols = self.sh, range(c1, c2 + 1)
+        block = [[(sh.cells.get((r, c)), sh.formats.get((r, c))) for c in cols] for r in range(r1, r2 + 1)]
+        values, lines = [], []
+        for r in range(r1, r2 + 1):  # each value once, for both the paste-values copy and the text
+            shown = [self.wb.cell_display(self.sheet, r, c) if (r, c) in sh.cells else (None, None) for c in cols]
+            values.append([fe.value_to_raw(v) for v, _ in shown])
+            lines.append("\t".join(self._tsv_field(fe.format_value(*vf)) for vf in shown))
+        text = "\n".join(lines)
         try:  # on Windows, also as HTML/RTF tables and a picture, like Excel (AutoCAD needs those)
             rich = (r2 - r1 + 1) * (c2 - c1 + 1) <= BIG_AREA and richclip.copy_to_clipboard(
                 self.root.winfo_id(), text, self._clip_table(r1, c1, r2, c2))
@@ -3362,6 +3467,10 @@ class SpreadsheetApp:
         r1, c1, r2, c2 = self.sel_rect()
         if (r1, c1, r2, c2) == self._cell_box(*self.cur):
             r2, c2 = min(MAX_ROWS - 1, r1 + h - 1), min(MAX_COLS - 1, c1 + w - 1)
+        elif self._is_huge(r1, c1, r2, c2):
+            rows, cols = self.wb.used_extent(self.sheet)
+            r2 = min(r2, max(rows, self.top + self._visible_rows()) - 1)
+            c2 = min(c2, max(cols, self.left + len(self.vis_cols)) - 1)
         cs = ChangeSet(self.wb)
         for r in range(r1, r2 + 1):
             for c in range(c1, c2 + 1):
@@ -3374,19 +3483,38 @@ class SpreadsheetApp:
     # ------------------------------------------------------------------ cell formatting
 
     def apply_format(self, update):
-        """Merge `update` into the format of every selected cell (None/False removes a key)."""
+        """Merge `update` into the format of every selected cell (None/False removes a key). Cells that had
+        the same format get one shared new format; very large selections are written in one go."""
         self.commit_edit()
         formats = self.sh.formats
-        cs = ChangeSet(self.wb)
-        for r, c in self._format_targets():
-            fmt = dict(formats.get((r, c)) or {})
-            for key, value in update.items():
-                if value in (None, False, ""):
-                    fmt.pop(key, None)
-                else:
-                    fmt[key] = value
-            cs.set(self.sheet, r, c, fmt=fmt)
-        self.commit(cs)
+        made = {}
+
+        def merged(old):
+            entry = made.get(id(old))
+            if entry is None:
+                fmt = dict(old or {})
+                for key, value in update.items():
+                    if value in (None, False, ""):
+                        fmt.pop(key, None)
+                    else:
+                        fmt[key] = value
+                entry = made[id(old)] = (old, fmt or None)  # (old kept alive: its id stays its own)
+            return entry[1]
+        targets = self._format_targets()
+        if len(targets) <= 50000:
+            cs = ChangeSet(self.wb)
+            for r, c in targets:
+                cs.set(self.sheet, r, c, fmt=merged(formats.get((r, c))))
+            self.commit(cs)
+        else:
+            def change():
+                with fe.bulk():
+                    new = {key: merged(formats.get(key)) for key in targets}
+                    kept = {k: v for k, v in formats.items() if k not in new}
+                    self.sh.formats = {**kept, **{k: v for k, v in new.items() if v}}
+                if any(k in update for k in ("size", "wrap", "rotate", "font")):
+                    self.autofit_rows({r for r, _ in targets})
+            self._structural(change)
         self.refresh()
         self.canvas.focus_set()
 
@@ -3768,8 +3896,8 @@ class SpreadsheetApp:
         if any(self._pivot_guard(*rect) for rect in rects):
             return
         cs = ChangeSet(self.wb)
-        for r, c in list(self.sh.cells):
-            if any(r1 <= r <= r2 and c1 <= c <= c2 for r1, c1, r2, c2 in rects):
+        for r1, c1, r2, c2 in rects:
+            for r, c in [(r, c) for r, c in self.sh.cells if r1 <= r <= r2 and c1 <= c <= c2]:
                 cs.set(self.sheet, r, c, raw=None)
         self.commit(cs)
         self.refresh()
@@ -4065,6 +4193,44 @@ class SpreadsheetApp:
             self.cur, self.ext = (r1, c1), (r2, c2)
             self.refresh()
 
+    def import_text(self):
+        """Data > From Text/CSV: read a text file with the encoding and delimiter the user picks, into a new sheet."""
+        self.commit_edit()
+        path = filedialog.askopenfilename(parent=self.root, title="Nhập từ Văn bản/CSV", filetypes=[
+            ("Văn bản / CSV", "*.csv *.txt *.tsv *.prn"), ("Tất cả các tệp", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as err:
+            messagebox.showerror(APP_NAME, f"Không mở được tệp:\n{path}\n\n{err}", parent=self.root)
+            return
+        name = os.path.splitext(os.path.basename(path))[0]
+        options = dialogs.TextImportDialog(self.root, data, os.path.basename(path)).show()
+        if options is None:
+            return
+        self._busy(f"Đang nhập {os.path.basename(path)}...")
+        rows = fe.read_text_table(data, **options)[0]
+        created = []
+
+        def add():
+            title, i = name[:31] or "Nhập", 2
+            while self.wb.resolve_sheet(title) or self.wb.check_sheet_name(title):
+                title = f"{name[:26]} ({i})"
+                i += 1
+                if i > 999:
+                    title = None
+                    break
+            sheet = self.wb.add_sheet(title)
+            self.wb.sheets[sheet].cells = fe.table_cells(rows)
+            created.append(sheet)
+        if self._structural(add):
+            self.switch_sheet(created[0])
+            self.autofit_columns(0, min(fe.MAX_COLS - 1, max((len(r) for r in rows[:200]), default=1) - 1))
+        self._not_busy()
+        self.set_mode(f"Đã nhập {len(rows):,} hàng")
+
     def text_to_columns(self):
         """Data > Text to Columns: split the text of one column into the columns to its right."""
         self.commit_edit()
@@ -4132,24 +4298,27 @@ class SpreadsheetApp:
 
     # sorting and filtering
     def current_region(self, r, c):
-        """Bounding box of the block of filled cells around (r, c), like Excel's Ctrl+*."""
+        """Bounding box of the block of filled cells around (r, c), like Excel's Ctrl+*.
+
+        Rows are grown first, a row at a time (cheap: one row is a few lookups), then the columns are
+        checked once along the whole height; repeated until nothing grows, so tall tables stay fast."""
         cells = self.sh.cells
         r1 = r2 = r
         c1 = c2 = c
-        grew = True
-        while grew:
-            grew = False
+        while True:
             cols = range(max(0, c1 - 1), min(MAX_COLS, c2 + 2))
-            if r1 > 0 and any((r1 - 1, k) in cells for k in cols):
-                r1, grew = r1 - 1, True
-            if r2 < MAX_ROWS - 1 and any((r2 + 1, k) in cells for k in cols):
-                r2, grew = r2 + 1, True
+            while r1 > 0 and any((r1 - 1, k) in cells for k in cols):
+                r1 -= 1
+            while r2 < MAX_ROWS - 1 and any((r2 + 1, k) in cells for k in cols):
+                r2 += 1
             rows = range(max(0, r1 - 1), min(MAX_ROWS, r2 + 2))
-            if c1 > 0 and any((k, c1 - 1) in cells for k in rows):
+            grew = False
+            while c1 > 0 and any((k, c1 - 1) in cells for k in rows):
                 c1, grew = c1 - 1, True
-            if c2 < MAX_COLS - 1 and any((k, c2 + 1) in cells for k in rows):
+            while c2 < MAX_COLS - 1 and any((k, c2 + 1) in cells for k in rows):
                 c2, grew = c2 + 1, True
-        return r1, c1, r2, c2
+            if not grew:
+                return r1, c1, r2, c2
 
     def _has_header(self, r1, c1, r2, c2):
         """Guess, like Excel, whether the first row of a block holds column titles: all text, and
@@ -4208,9 +4377,11 @@ class SpreadsheetApp:
         start = r1 + 1 if header else r1
         if r2 <= start or c2 < c1:
             return
-        sh = self.sh
-        items = [(r, [self.wb.get_value(self.sheet, r, k) for k, _ in keys],
-                  [(sh.cells.get((r, c)), sh.formats.get((r, c))) for c in range(c1, c2 + 1)])
+        sh, get = self.sh, self.wb.get_value
+        big = (r2 - start + 1) * (c2 - c1 + 1) > 20000
+        cells, formats = sh.cells, sh.formats
+        items = [(r, [get(self.sheet, r, k) for k, _ in keys],
+                  None if big else [(cells.get((r, c)), formats.get((r, c))) for c in range(c1, c2 + 1)])
                  for r in range(start, r2 + 1)]
         for i in reversed(range(len(keys))):  # stable passes, most significant key last
             filled = [it for it in items if it[1][i] is not None and it[1][i] != ""]
@@ -4221,14 +4392,33 @@ class SpreadsheetApp:
             col, what, color = first
             hits = {it[0] for it in items if self.wb.cell_color(self.sheet, it[0], col, what) == color}
             items = [it for it in items if it[0] in hits] + [it for it in items if it[0] not in hits]
-        cs = ChangeSet(self.wb)
-        for new_r, (old_r, _, cells) in zip(range(start, r2 + 1), items):
-            for j, (raw, fmt) in enumerate(cells):
-                cs.set(self.sheet, new_r, c1 + j, raw=fe.shift_formula(raw, new_r - old_r, 0) if raw else None, fmt=fmt)
-        self.commit(cs)
-        if sh.filter:
-            self.wb.apply_filter(self.sheet)
-        self.refresh()
+        if not big:
+            cs = ChangeSet(self.wb)
+            for new_r, (old_r, _, cells) in zip(range(start, r2 + 1), items):
+                for j, (raw, fmt) in enumerate(cells):
+                    cs.set(self.sheet, new_r, c1 + j, raw=fe.shift_formula(raw, new_r - old_r, 0) if raw else None,
+                           fmt=fmt)
+            self.commit(cs)
+            if sh.filter:
+                self.wb.apply_filter(self.sheet)
+            self.refresh()
+            return
+
+        def move():  # big tables: renumber the rows in one pass (undo keeps a copy of the sheet, not each cell)
+            new_row = {old: new for new, (old, _, _) in zip(range(start, r2 + 1), items)}
+            with fe.bulk():
+                for name in ("cells", "formats"):
+                    d = getattr(sh, name)
+                    setattr(sh, name, {((new_row[r], c) if start <= r <= r2 and c1 <= c <= c2 else (r, c)): v
+                                       for (r, c), v in d.items()})
+                cells, old_row = sh.cells, {n: o for o, n in new_row.items()}
+                formulas = [(k, v) for k, v in cells.items() if v[:1] == "=" and start <= k[0] <= r2 and c1 <= k[1] <= c2]
+                for (r, c), raw in formulas:  # a formula's relative references move with its row
+                    cells[(r, c)] = fe.shift_formula(raw, r - old_row[r], 0)
+            self.wb._ast.clear()
+            if sh.filter:
+                self.wb.apply_filter(self.sheet)
+        self._structural(move)
 
     def _filter_rect(self):
         r1, c1, r2, c2 = self.sel_rect()
@@ -4998,10 +5188,20 @@ class SpreadsheetApp:
     def _content_widths(self, sheet, c1, c2, rows=None):
         """{column: pixels at 96 DPI} its widest text needs (only rows r1..r2 when rows = (r1, r2))."""
         sh = self.wb.sheets[sheet]
+        cells, formats = sh.cells, sh.formats
+        by_col = {}
+        for key in cells:
+            if c1 <= key[1] <= c2 and (rows is None or rows[0] <= key[0] <= rows[1]):
+                by_col.setdefault(key[1], []).append(key)
         widest = {}
-        for r, c in sh.cells:
-            if c1 <= c <= c2 and not sh.merge_at(r, c) and (rows is None or rows[0] <= r <= rows[1]):
-                fmt = sh.formats.get((r, c))
+        for c, keys in by_col.items():
+            if len(keys) > 400:  # long columns: measure the longest texts and every cell in a larger font
+                keys = set(heapq.nlargest(150, keys, key=lambda k: len(cells[k]))) | {
+                    k for k in keys if k in formats and ((formats[k].get("size") or 11) > 11 or formats[k].get("indent"))}
+            for r, c in keys:
+                if sh.merge_at(r, c):
+                    continue
+                fmt = formats.get((r, c))
                 text = self.wb.display_text(sheet, r, c)
                 indent = ((fmt or {}).get("indent") or 0) * round(9 * self.px)
                 widest[c] = max(widest.get(c, 0), self.text_width(self.font_for(fmt), text) + indent)
@@ -5684,13 +5884,37 @@ class SpreadsheetApp:
         if path:
             self.open_path(path)
 
+    def _busy(self, text):
+        """Show what is going on (and a busy pointer) before a long job that holds up the window."""
+        self.set_mode(text)
+        self.root.config(cursor="watch")
+        self.canvas.config(cursor="watch")
+        self.root.update_idletasks()
+
+    def _not_busy(self):
+        self.root.config(cursor="")
+        self._cursor = None  # the next pointer move sets the canvas cursor again
+        self.canvas.config(cursor="")
+
     def open_path(self, path):
+        self._busy(f"Đang mở {os.path.basename(path)}...")
         try:
             wb = fe.load_workbook(path)
         except Exception as err:  # any I/O or format problem is reported, not fatal
+            self._not_busy()
+            self.set_mode("Sẵn sàng")
             messagebox.showerror(APP_NAME, f"Không mở được tệp:\n{path}\n\n{err}", parent=self.root)
             return
         self._load(wb, path)
+        self._not_busy()
+        info = wb.import_info
+        if info:  # tell how a text file was read (Data > From Text/CSV chooses otherwise)
+            self.set_mode(f"Đã đọc {os.path.basename(path)}: {fe.ENCODING_NAMES.get(info['encoding'], info['encoding'])}"
+                          f", {fe.DELIMITER_NAMES.get(info['delimiter'], info['delimiter'])}")
+        if info and info.get("truncated"):
+            messagebox.showwarning(APP_NAME, f"Tệp có nhiều hơn {MAX_ROWS:,} hàng hoặc {MAX_COLS:,} cột; phần vượt "
+                                   "quá giới hạn của một trang tính không được mở (Excel cũng giới hạn như vậy).",
+                                   parent=self.root)
 
     def _load(self, wb, path):
         self._end_edit()
@@ -5730,11 +5954,15 @@ class SpreadsheetApp:
                 APP_NAME, "CSV chỉ lưu giá trị của trang tính đang mở (không có công thức, định dạng "
                           "và các trang tính khác). Tiếp tục?", parent=self.root):
             return False
+        self._busy(f"Đang lưu {os.path.basename(path)}...")
         try:
             fe.save_workbook(self.wb, path, active=self.sheet)
         except Exception as err:  # e.g. the file is open in Excel
+            self._not_busy()
+            self.set_mode("Sẵn sàng")
             messagebox.showerror(APP_NAME, f"Không lưu được tệp:\n{path}\n\n{err}", parent=self.root)
             return False
+        self._not_busy()
         self.path = path
         self.dirty = False
         self.settings.add_recent(path)
@@ -5785,12 +6013,22 @@ class SpreadsheetApp:
             minutes = self.settings.autosave_minutes
             self.recovery.beat(path=self.path)
             last = self.recovery.saved_at
-            if (self.dirty and minutes and not self.is_editing() and not self.drag
+            busy = self._autosave_thread is not None and self._autosave_thread.is_alive()
+            if (self.dirty and minutes and not busy and not self.is_editing() and not self.drag
                     and (last is None or time.time() - last >= minutes * 60)):
-                if self.recovery.save(self.wb, self.sheet) and self.mode_label.cget("text") == "Sẵn sàng":
-                    self.set_mode(f"Đã lưu bản khôi phục lúc {dt.datetime.now():%H:%M}")
+                # copy the workbook now (fast), write it out on another thread
+                self._autosave_thread = self.recovery.save_in_background(self.wb.snapshot(), self.sheet)
+                self.root.after(500, self._autosave_done)
         finally:
             self.root.after(60_000, self._autosave_tick)
+
+    def _autosave_done(self):
+        if self._autosave_thread is not None and self._autosave_thread.is_alive():
+            self.root.after(500, self._autosave_done)
+            return
+        self._autosave_thread = None
+        if self.recovery.saved_at and self.mode_label.cget("text") == "Sẵn sàng":
+            self.set_mode(f"Đã lưu bản khôi phục lúc {dt.datetime.now():%H:%M}")
 
     def _offer_recovery(self):
         """After a crash: offer the AutoRecover copies the previous sessions left behind."""

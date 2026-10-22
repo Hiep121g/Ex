@@ -9,6 +9,7 @@ saving (a crash or power cut) and is offered when PyExcel starts again.
 import json
 import os
 import sys
+import threading
 import time
 
 import formula_engine as fe
@@ -120,6 +121,17 @@ class Recovery:
         self.beat()
         return True
 
+    def save_in_background(self, snapshot, active=None):
+        """Write the recovery copy from a workbook snapshot (Workbook.snapshot()) on another thread, so a big
+        workbook doesn't stop the program while it is written. Returns the thread; saved_at is set when done."""
+        def work():
+            copy = fe.Workbook(())
+            copy.restore(snapshot)
+            self.save(copy, active)
+        thread = threading.Thread(target=work, name="PyExcel AutoRecover", daemon=True)
+        thread.start()
+        return thread
+
     def discard(self):
         """The work is saved (or deliberately dropped): no recovery copy is needed any more."""
         for path in (self.file, self.file + ".tmp.pyxl"):
@@ -141,7 +153,7 @@ class Recovery:
         """Recovery copies of sessions that stopped without closing: [{"file", "meta", "path", "saved"}],
         newest first. Heartbeats of dead sessions without a copy are cleaned up."""
         now = now or time.time()
-        found = []
+        found, alive = [], {self.id}
         try:
             names = os.listdir(self.dir)
         except OSError:
@@ -152,6 +164,7 @@ class Recovery:
             meta = os.path.join(self.dir, name)
             info = _read_json(meta, {})
             if not isinstance(info, dict) or now - float(info.get("alive") or 0) < self.STALE:
+                alive.add(name[:-5])
                 continue
             copy = meta[:-5] + ".pyxl"
             if os.path.exists(copy):
@@ -159,6 +172,9 @@ class Recovery:
                               "saved": info.get("saved") or os.path.getmtime(copy)})
             else:
                 self.forget({"meta": meta})
+        for name in names:  # copies a dead session was still writing are of no use
+            if name.endswith(".tmp.pyxl") and name.split(".", 1)[0] not in alive:
+                self.forget({"file": os.path.join(self.dir, name)})
         return sorted(found, key=lambda e: e["saved"], reverse=True)
 
     @staticmethod

@@ -1502,14 +1502,210 @@ class SessionTests(unittest.TestCase):
             crashed.beat(path="D:/bang.xlsx")
             self.assertTrue(crashed.save(wb))
             now = session.Recovery(tmp)
+            half_written = crashed.file + ".tmp.pyxl"  # the next copy was being written when it crashed
+            open(half_written, "w").close()
             self.assertEqual(now.orphans(), [])  # still beating: another PyExcel, not a crash
+            self.assertTrue(os.path.exists(half_written))
             found = now.orphans(now=time.time() + 600)
+            self.assertFalse(os.path.exists(half_written))
             self.assertEqual([e["path"] for e in found], ["D:/bang.xlsx"])
             self.assertEqual(fe.load_workbook(found[0]["file"]).get_raw("Sheet1", 0, 0), "chưa lưu")
             now.forget(found[0])
             crashed.discard()
             self.assertEqual(now.orphans(now=time.time() + 600), [])
 
+
+def cp1258(text):
+    """Text as Windows writes it in code page 1258: letters it has as they are, the others as a letter
+    plus a separate tone mark."""
+    import unicodedata
+    out = b""
+    for ch in text:
+        try:
+            out += ch.encode("cp1258")
+        except UnicodeEncodeError:
+            parts = unicodedata.normalize("NFD", ch)
+            out += unicodedata.normalize("NFC", parts[:-1]).encode("cp1258") + parts[-1].encode("cp1258")
+    return out
+
+
+class TextImportTests(unittest.TestCase):
+    VN = "Họ tên;Số tiền\nNguyễn Văn Ánh;1.234,5\nTrần Thị Bích Ngọc;-12,75\n"
+
+    def test_encodings_found_like_excel(self):
+        cases = [(b"\xef\xbb\xbf" + self.VN.encode("utf-8"), "utf-8"), (self.VN.encode("utf-8"), "utf-8"),
+                 (self.VN.encode("utf-16"), "utf-16"), (self.VN.encode("utf-16-le"), "utf-16-le"),
+                 (cp1258(self.VN), "cp1258")]
+        for data, encoding in cases:
+            self.assertEqual(fe.decode_text(data), (self.VN, encoding), encoding)
+        self.assertEqual(fe.decode_text("Café;12\n".encode("cp1252"))[0], "Café;12\n")
+
+    def test_separate_tone_marks_are_composed(self):
+        self.assertEqual(fe.decode_text("Nguyễn".encode("utf-8"))[0], "Nguyễn")
+
+    def test_old_vietnamese_encodings(self):
+        self.assertEqual(len(fe._TCVN3_FROM), len(fe._TCVN3_TO))
+        self.assertEqual(len(set(fe._TCVN3_FROM)), len(fe._TCVN3_FROM))
+        self.assertEqual(fe.decode_text(b"H\xb5 N\xe9i, Ti\xd5ng Vi\xd6t \xa7\xb7", "tcvn3")[0], "Hà Nội, Tiếng Việt Đã")
+        self.assertEqual(fe.decode_text("Haø Noäi, Ñaø Naüng, Vieät Nam".encode("latin-1"), "vni")[0],
+                         "Hà Nội, Đà Nẵng, Việt Nam")
+
+    def test_delimiter_and_decimal_comma(self):
+        rows, encoding, delimiter, comma = fe.read_text_table(cp1258(self.VN))
+        self.assertEqual((encoding, delimiter, comma), ("cp1258", ";", True))
+        self.assertEqual(rows[1:], [["Nguyễn Văn Ánh", "1234.5"], ["Trần Thị Bích Ngọc", "-12.75"]])
+        rows = fe.read_text_table(self.VN.encode("utf-8"), decimal_comma=False)[0]
+        self.assertEqual(rows[1][1], "1.234,5")
+        rows, _, delimiter, comma = fe.read_text_table(b'x,y\n"1,234.5",2.5\n')
+        self.assertEqual((rows[1], delimiter, comma), (["1,234.5", "2.5"], ",", False))
+        rows, _, delimiter, _ = fe.read_text_table("Tên\tTuổi\nAn\t30\n".encode("utf-16"))
+        self.assertEqual((rows, delimiter), ([["Tên", "Tuổi"], ["An", "30"]], "\t"))
+
+    def test_load_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ansi.csv")
+            with open(path, "wb") as f:
+                f.write(cp1258(self.VN))
+            wb = fe.load_workbook(path)
+        self.assertEqual((val(wb, "A2"), val(wb, "B2"), val(wb, "B3")), ("Nguyễn Văn Ánh", 1234.5, -12.75))
+        self.assertEqual(wb.import_info["encoding"], "cp1258")
+        self.assertFalse(wb.import_info["truncated"])
+
+
+class BigSheetTests(unittest.TestCase):
+    def test_excel_size(self):
+        self.assertEqual((fe.MAX_ROWS, fe.col_name(fe.MAX_COLS - 1)), (1048576, "XFD"))
+        wb = make({"XFD1048576": "góc"})
+        self.assertEqual(wb.used_extent("Sheet1"), (fe.MAX_ROWS, fe.MAX_COLS))
+
+    def test_cell_store(self):
+        cells = fe.CellStore({(0, 0): "a", (5, 2): "b"})
+        self.assertEqual(cells.extent(), (6, 3))
+        cells[(9, 1)] = "c"
+        self.assertEqual(cells.extent(), (10, 3))
+        del cells[(9, 1)]
+        self.assertEqual(cells.extent(), (6, 3))
+        copy = cells.frozen()
+        self.assertIs(cells.frozen(), copy)  # unchanged: undo reuses the copy
+        cells.pop((7, 7), None)
+        self.assertIs(cells.frozen(), copy)
+        cells[(0, 1)] = "x"
+        self.assertIsNot(cells.frozen(), copy)
+        self.assertNotIn((0, 1), copy)
+        sh = fe.Sheet("S")
+        sh.cells = {(1, 1): "y"}
+        self.assertIsInstance(sh.cells, fe.CellStore)
+        self.assertEqual(sh.cells.extent(), (2, 2))
+
+    def test_snapshots_share_unchanged_cells(self):
+        wb = make({"A1": "1", "B1": "2"})
+        first = wb.snapshot()[0][0][1]
+        second = wb.snapshot()[0][0][1]
+        self.assertIs(first["cells"], second["cells"])
+        wb.set_raw("Sheet1", 0, 0, "5")
+        third = wb.snapshot()[0][0][1]
+        self.assertIsNot(third["cells"], first["cells"])
+        self.assertEqual(first["cells"][(0, 0)], "1")
+
+    def test_write_cells(self):
+        wb = make({"A1": "1", "C1": "old"})
+        wb.write_cells([("Sheet1", 0, 0, "5", None), ("Sheet1", 0, 1, "=A1*2", {"bold": True}),
+                        ("Sheet1", 0, 2, None, None)])
+        self.assertEqual((val(wb, "B1"), wb.get_format("Sheet1", 0, 1)["bold"]), (10, True))
+        self.assertEqual(wb.used_extent("Sheet1"), (1, 2))
+
+    def test_text_table_cells(self):
+        cells = fe.table_cells([["a", "", "b"], [], ["", "c"]], 2, 1)
+        self.assertEqual(dict(cells), {(2, 1): "a", (2, 3): "b", (4, 2): "c"})
+
+
+@unittest.skipUnless(fe.HAS_XLSX, "openpyxl not installed")
+class FastXlsxTests(unittest.TestCase):
+    """Big sheets are read and written by PyExcel's own XML code; it must give what openpyxl gives."""
+
+    SHEET_DATA = (
+        '<sheetData>'
+        '<row r="1" spans="1:3" ht="30" customHeight="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c>'
+        '<c r="C1" t="inlineStr"><is><t xml:space="preserve"> nội tuyến </t></is></c></row>'
+        '<row r="2"><c r="A2"><v>1.5</v></c><c r="B2"><f t="shared" ref="B2:B4" si="0">A2*2</f><v>3</v></c>'
+        '<c r="C2" t="b"><v>1</v></c></row>'
+        '<row r="3" hidden="1"><c r="A3"><v>2</v></c><c r="B3"><f t="shared" si="0"/><v>4</v></c>'
+        '<c r="C3" t="e"><v>#DIV/0!</v></c></row>'
+        '<row r="4"><c r="A4"><v>3</v></c><c r="B4"><f t="shared" si="0"/><v>6</v></c>'
+        '<c r="C4" t="str"><f>"a"&amp;"b"</f><v>ab</v></c><c r="D4" t="s"><v>0</v></c></row>'
+        '</sheetData>')
+    STRINGS = ('<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="2">'
+               '<si><t>Tên</t></si><si><r><t>đậm</t></r><r><rPr><b/></rPr><t xml:space="preserve"> thường</t></r>'
+               '<rPh sb="0" eb="1"><t>x</t></rPh></si></sst>')
+
+    @staticmethod
+    def load_with_openpyxl(path):
+        from unittest import mock
+        with mock.patch.object(fe, "XlsxCells", side_effect=ValueError):
+            return fe.load_workbook(path)
+
+    def assertSameSheets(self, a, b):
+        self.assertEqual(list(a.sheets), list(b.sheets))
+        for name in a.sheets:
+            for key in fe.Sheet._STATE:
+                self.assertEqual(getattr(a.sheets[name], key), getattr(b.sheets[name], key), f"{name}.{key}")
+
+    def test_reads_excel_cell_xml(self):
+        import re
+        import zipfile
+        import openpyxl
+        with tempfile.TemporaryDirectory() as tmp:
+            plain, path = os.path.join(tmp, "plain.xlsx"), os.path.join(tmp, "excel.xlsx")
+            book = openpyxl.Workbook()
+            book.active["A1"] = "x"
+            book.save(plain)
+            with zipfile.ZipFile(plain) as src, zipfile.ZipFile(path, "w") as dst:  # as Excel writes it
+                for item in src.infolist():
+                    data = src.read(item.filename).decode("utf-8")
+                    if item.filename == "xl/worksheets/sheet1.xml":
+                        data = re.sub(r"<sheetData>.*</sheetData>|<sheetData/>", self.SHEET_DATA, data, flags=re.S)
+                    elif item.filename == "xl/_rels/workbook.xml.rels":
+                        data = data.replace("</Relationships>", '<Relationship Id="rId9" Target="sharedStrings.xml" Type='
+                                            '"http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+                                            'sharedStrings"/></Relationships>')
+                    elif item.filename == "[Content_Types].xml":
+                        data = data.replace("</Types>", '<Override PartName="/xl/sharedStrings.xml" ContentType="appl'
+                                            'ication/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"'
+                                            '/></Types>')
+                    dst.writestr(item, data)
+                dst.writestr("xl/sharedStrings.xml", self.STRINGS)
+            fast, slow = fe.load_workbook(path), self.load_with_openpyxl(path)
+        self.assertSameSheets(fast, slow)
+        cells = fast.sheets["Sheet"].cells
+        self.assertEqual([cells.get((0, c)) for c in range(3)], ["Tên", "đậm thường", " nội tuyến "])
+        self.assertEqual([cells.get((r, 1)) for r in range(1, 4)], ["=A2*2", "=A3*2", "=A4*2"])
+        self.assertEqual([cells.get((r, 2)) for r in range(1, 4)], ["TRUE", "#DIV/0!", '="a"&"b"'])
+        self.assertEqual((fast.sheets["Sheet"].row_heights, fast.sheets["Sheet"].hidden_rows), ({0: 40}, {2}))
+
+    def test_writes_like_openpyxl(self):
+        from unittest import mock
+        wb = make({"A1": "Tên", "B1": "12.5", "C1": "=B1*2", "D1": "TRUE", "E1": "21/10/2026", "F1": "'007",
+                   "A2": "dòng 1\ndòng 2", "B2": "a\x01b", "C2": "<&>", "D2": " cách ", "A3": "1e5", "B3": "#N/A"})
+        wb.set_format("Sheet1", 0, 0, {"bold": True, "bg": "#ffff00", "num": "#,##0", "wrap": True})
+        wb.set_format("Sheet1", 2, 0, {"num": "@"})
+        wb.set_format("Sheet1", 5, 5, {"bt": ["thin", "#000000"]})
+        sh = wb.sheets["Sheet1"]
+        sh.row_heights, sh.custom_rows, sh.hidden_rows = {1: 50}, {1}, {2}
+        sh.row_levels = {3: 1, 4: 2}
+        with tempfile.TemporaryDirectory() as tmp:
+            slow_path, fast_path = os.path.join(tmp, "slow.xlsx"), os.path.join(tmp, "fast.xlsx")
+            fe.save_workbook(wb, slow_path)
+            with mock.patch.object(fe, "FAST_SAVE_CELLS", 0):
+                fe.save_workbook(wb, fast_path)
+            slow, fast = fe.load_workbook(slow_path), fe.load_workbook(fast_path)
+            self.assertSameSheets(fast, slow)
+            other = self.load_with_openpyxl(fast_path)
+        self.assertEqual(fast.get_raw("Sheet1", 1, 1), "a\x01b")
+        for wb_ in (fast, other):  # openpyxl leaves Excel's escape for control characters (_x0001_) as it is
+            wb_.sheets["Sheet1"].cells.pop((1, 1))
+        self.assertSameSheets(fast, other)
+        self.assertEqual(val(fast, "C1"), 25)
+        self.assertEqual(fast.sheets["Sheet1"].hidden_rows, {2})
 
 if __name__ == "__main__":
     unittest.main()
