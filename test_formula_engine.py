@@ -1838,5 +1838,252 @@ class ThreeDReferenceTests(unittest.TestCase):
         self.assertEqual(val(wb, "U3", "BH"), 6)
         self.assertEqual(fe.shift_formula("=SUM(BH:ボルト!Q5:Q50000)", 1, 0), "=SUM(BH:ボルト!Q6:Q50001)")
 
+
+def spilled(wb, addr, sheet="Sheet1"):
+    """The values a formula's dynamic array fills, row by row (just its value when it doesn't spill)."""
+    r, c = fe.parse_address(addr)
+    area = wb.spill_range(sheet, r, c)
+    if area is None or area[:2] == area[2:]:
+        return wb.get_value(sheet, r, c)
+    r1, c1, r2, c2 = area
+    return [[wb.get_value(sheet, i, j) for j in range(c1, c2 + 1)] for i in range(r1, r2 + 1)]
+
+
+class DynamicArrayTests(unittest.TestCase):
+    """Excel 365's dynamic arrays: formulas giving several values spill them into the cells around."""
+
+    TABLE = {"A1": "Tên", "B1": "Nhóm", "C1": "Điểm",
+             "A2": "An", "B2": "X", "C2": "7", "A3": "Bình", "B3": "Y", "C3": "9",
+             "A4": "Chi", "B4": "X", "C4": "5", "A5": "Dũng", "B5": "Y", "C5": "9", "A6": "An", "B6": "X", "C6": "4"}
+
+    def check(self, cases, cells=None):
+        for formula, expected in cases:
+            wb = make(dict(cells if cells is not None else self.TABLE, H1=formula))
+            self.assertEqual(spilled(wb, "H1"), expected, formula)
+
+    def test_spill_and_blocked_spill(self):
+        wb = make({"A1": "=SEQUENCE(3,2)"})
+        self.assertEqual(spilled(wb, "A1"), [[1, 2], [3, 4], [5, 6]])
+        self.assertEqual((wb.get_raw("Sheet1", 2, 1), wb.spill_anchor("Sheet1", 2, 1)), ("", (0, 0)))
+        self.assertEqual(wb.spill_areas("Sheet1"), {(0, 0): (0, 0, 2, 1)})
+        make({"B2": "chặn"}, wb=wb)
+        self.assertEqual(val(wb, "A1"), CellError(fe.SPILL))
+        self.assertIsNone(val(wb, "A2"))
+        wb.set_raw("Sheet1", 1, 1, None)
+        self.assertEqual(val(wb, "B3"), 6)
+        wb.sheets["Sheet1"].set_merges([(5, 0, 5, 1)])
+        wb.invalidate()
+        make({"A5": "=SEQUENCE(2)"}, wb=wb)
+        self.assertEqual(val(wb, "A5"), CellError(fe.SPILL))  # merged cells block too
+
+    def test_spill_reference_and_dependents(self):
+        wb = make({"A1": "3", "B1": "=SEQUENCE(A1)", "C1": "=SUM(B1#)", "D1": "=ROWS(B1#)", "E1": "=B1#*10",
+                   "F1": "=A1#"})
+        self.assertEqual((val(wb, "C1"), val(wb, "D1"), spilled(wb, "E1")), (6, 3, [[10], [20], [30]]))
+        self.assertEqual(val(wb, "F1"), CellError(fe.REF))  # A1 doesn't spill
+        make({"A1": "5"}, wb=wb)
+        self.assertEqual((val(wb, "C1"), val(wb, "D1"), val(wb, "E5")), (15, 5, 50))
+        make({"B4": "x"}, wb=wb)
+        self.assertEqual((val(wb, "B1"), val(wb, "C1")), (CellError(fe.SPILL), CellError(fe.SPILL)))
+
+    def test_formulas_reading_spilled_cells(self):
+        wb = make({"A1": "=SEQUENCE(4)", "B1": "=SUM(A1:A4)", "B2": "=A3*2", "C1": "=COUNT(A1:A9)"})
+        self.assertEqual((val(wb, "B1"), val(wb, "B2"), val(wb, "C1")), (10, 6, 4))
+        wb = make({"A2": "=A1+1", "A1": "=SEQUENCE(1,3)", "B5": "=SUM(A1:C1)+B1"})
+        self.assertEqual((val(wb, "A2"), val(wb, "B5")), (2, 8))
+
+    def test_arrays_and_elementwise_operators(self):
+        self.check([("={1,2;3,4}", [[1, 2], [3, 4]]), ('={"a",TRUE;-1.5,#N/A}', [["a", True], [-1.5, CellError(fe.NA)]]),
+                    ("=C2:C4*2", [[14], [18], [10]]), ('=A2:A3&"!"', [["An!"], ["Bình!"]]),
+                    ("=C2:C4>6", [[True], [True], [False]]), ("={1,2,3}+{10;20}", [[11, 12, 13], [21, 22, 23]]),
+                    ("=SUM(C2:C6*(B2:B6=\"X\"))", 16), ("=LEN(A2:A4)", [[2], [4], [3]]),
+                    ("=-{1,2}", [[-1, -2]]), ("=ROUND({1.25,2.75},1)", [[1.3, 2.8]]),
+                    ("=SUMPRODUCT((B2:B6=\"Y\")*C2:C6)", 18), ("=IF(C2:C4>6,\"đạt\",\"chưa\")", [["đạt"], ["đạt"], ["chưa"]]),
+                    ("=IFERROR(1/{1,0},\"-\")", [[1, "-"]]), ("=INDEX(A2:C6,0,3)", [[7], [9], [5], [9], [4]]),
+                    ("=TRANSPOSE(A2:B3)", [["An", "Bình"], ["X", "Y"]]), ("=MMULT({1,2},{3;4})", 11)])
+
+    def test_filter_sort_unique(self):
+        self.check([('=FILTER(A2:A6,B2:B6="Y")', [["Bình"], ["Dũng"]]),
+                    ('=FILTER(A2:C6,(B2:B6="X")*(C2:C6>4))', [["An", "X", 7], ["Chi", "X", 5]]),
+                    ('=FILTER(A2:A6,C2:C6>100,"không có")', "không có"),
+                    ('=FILTER(A2:A6,C2:C6>100)', CellError(fe.CALC)),
+                    ("=SORT(C2:C6)", [[4], [5], [7], [9], [9]]), ("=SORT(A2:C3,3,-1)", [["Bình", "Y", 9], ["An", "X", 7]]),
+                    ("=SORT({3,1,2},1,1,TRUE)", [[1, 2, 3]]),
+                    ("=SORTBY(A2:A6,C2:C6,-1,A2:A6,1)", [["Bình"], ["Dũng"], ["An"], ["Chi"], ["An"]]),
+                    ("=UNIQUE(A2:A6)", [["An"], ["Bình"], ["Chi"], ["Dũng"]]),
+                    ("=UNIQUE(A2:A6,FALSE,TRUE)", [["Bình"], ["Chi"], ["Dũng"]]),
+                    ("=UNIQUE(B2:C6)", [["X", 7], ["Y", 9], ["X", 5], ["X", 4]]),
+                    ("=UNIQUE({1,1,2},TRUE)", [[1, 2]]),
+                    ("=COUNTA(UNIQUE(B2:B6))", 2), ('=SORT(UNIQUE(FILTER(C2:C6,B2:B6="Y")))', 9)])
+
+    def test_sequence_and_randarray(self):
+        self.check([("=SEQUENCE(2,3,10,-2)", [[10, 8, 6], [4, 2, 0]]), ("=SEQUENCE(1)", 1),
+                    ("=SEQUENCE(0)", CellError(fe.CALC)), ("=SUM(SEQUENCE(100))", 5050)], {})
+        wb = make({"A1": "=RANDARRAY(3,2,5,9,TRUE)"})
+        values = [v for row in spilled(wb, "A1") for v in row]
+        self.assertEqual(len(values), 6)
+        self.assertTrue(all(5 <= v <= 9 and v == int(v) for v in values))
+        self.assertTrue(0 <= val(make({"A1": "=RANDARRAY()"}), "A1") < 1)
+
+    def test_xlookup_and_xmatch(self):
+        self.check([('=XLOOKUP("Chi",A2:A6,C2:C6)', 5), ('=XLOOKUP("Ai",A2:A6,C2:C6,"?")', "?"),
+                    ('=XLOOKUP("Ai",A2:A6,C2:C6)', CellError(fe.NA)), ('=XLOOKUP("An",A2:A6,C2:C6,,0,-1)', 4),
+                    ('=XLOOKUP("Bình",A2:A6,B2:C6)', [["Y", 9]]), ('=XLOOKUP("B*",A2:A6,C2:C6,,2)', 9),
+                    ("=XLOOKUP(8,C2:C6,A2:A6,,1)", "Bình"), ("=XLOOKUP(8,C2:C6,A2:A6,,-1)", "An"),
+                    ('=XLOOKUP("Điểm",A1:C1,A2:C3)', [[7], [9]]), ('=XLOOKUP({"Chi";"An"},A2:A6,C2:C6)', [[5], [7]]),
+                    ('=XMATCH("Chi",A2:A6)', 3), ('=XMATCH("An",A2:A6,0,-1)', 5), ("=XMATCH(6,{2,4,6,8},0,2)", 3),
+                    ("=XMATCH(5,{2,4,6,8},1)", 3), ("=XMATCH(5,{2,4,6,8},-1)", 2), ('=XMATCH("x",A2:A6)', CellError(fe.NA))])
+
+    def test_reshaping(self):
+        grid = {"A1": "1", "B1": "2", "C1": "3", "A2": "4", "C2": "6"}
+        self.check([("=TOCOL(A1:C2)", [[1], [2], [3], [4], [0], [6]]), ("=TOCOL(A1:C2,1)", [[1], [2], [3], [4], [6]]),
+                    ("=TOCOL(A1:C2,1,TRUE)", [[1], [4], [2], [3], [6]]), ("=TOROW(A1:C2,1)", [[1, 2, 3, 4, 6]]),
+                    ("=WRAPROWS(SEQUENCE(5),2)", [[1, 2], [3, 4], [5, CellError(fe.NA)]]),
+                    ("=WRAPCOLS(SEQUENCE(5),2,0)", [[1, 3, 5], [2, 4, 0]]),
+                    ("=CHOOSECOLS(A1:C2,3,1)", [[3, 1], [6, 4]]), ("=CHOOSECOLS(A1:C2,-1)", [[3], [6]]),
+                    ("=CHOOSEROWS(A1:C2,2)", [[4, 0, 6]]), ("=CHOOSECOLS(A1:C2,4)", CellError(fe.VALUE)),
+                    ("=TAKE(SEQUENCE(4,3),2,-1)", [[3], [6]]), ("=TAKE(SEQUENCE(4),-2)", [[3], [4]]),
+                    ("=DROP(SEQUENCE(4,3),3,1)", [[11, 12]]), ("=DROP(SEQUENCE(3),5)", CellError(fe.CALC)),
+                    ("=EXPAND({1,2},2,3,0)", [[1, 2, 0], [0, 0, 0]]), ("=HSTACK({1;2},{3,4;5,6})", [[1, 3, 4], [2, 5, 6]]),
+                    ("=VSTACK({1,2},3)", [[1, 2], [3, CellError(fe.NA)]])], grid)
+
+    def test_text_functions(self):
+        self.check([('=TEXTSPLIT("a,b,,c",",")', [["a", "b", "", "c"]]), ('=TEXTSPLIT("a,b,,c",",",,TRUE)', [["a", "b", "c"]]),
+                    ('=TEXTSPLIT("a=1;b=2","=",";")', [["a", "1"], ["b", "2"]]),
+                    ('=TEXTSPLIT("x-y z",{"-"," "})', [["x", "y", "z"]]), ('=TEXTSPLIT("a;b,c",",",";")', [["a", CellError(fe.NA)], ["b", "c"]]),
+                    ('=TEXTBEFORE("Nguyễn Văn A"," ")', "Nguyễn"), ('=TEXTBEFORE("Nguyễn Văn A"," ",-1)', "Nguyễn Văn"),
+                    ('=TEXTAFTER("Nguyễn Văn A"," ",2)', "A"), ('=TEXTAFTER("a.B.c","b",1,1)', ".c"),
+                    ('=TEXTAFTER("abc","x")', CellError(fe.NA)), ('=TEXTAFTER("abc","x",1,0,0,"-")', "-"),
+                    ('=TEXTBEFORE("abc","x",1,0,1)', "abc"), ('=TEXTBEFORE({"a-b";"c-d"},"-")', [["a"], ["c"]])], {})
+
+    def test_lambda_family(self):
+        self.check([("=LAMBDA(x,x*2)(21)", 42), ("=LAMBDA(x,y,x+y)(1,2)", 3), ("=LAMBDA(x,x)", CellError(fe.CALC)),
+                    ("=LAMBDA(x,x)(1,2)", CellError(fe.VALUE)), ("=LET(a,2,b,a*3,a+b)", 8),
+                    ("=LET(f,LAMBDA(n,n*n),f(4)+f(3))", 25), ("=MAP({1,2;3,4},LAMBDA(v,v*10))", [[10, 20], [30, 40]]),
+                    ("=MAP({1,2},{10,20},LAMBDA(a,b,a+b))", [[11, 22]]), ("=REDUCE(0,SEQUENCE(4),LAMBDA(s,v,s+v))", 10),
+                    ("=REDUCE(1,{2,3,4},LAMBDA(acc,v,acc*v))", 24), ("=SCAN(0,{1,2,3},LAMBDA(s,v,s+v))", [[1, 3, 6]]),
+                    ("=BYROW({1,2;3,4},LAMBDA(r,SUM(r)))", [[3], [7]]), ("=BYCOL({1,2;3,4},LAMBDA(c,MAX(c)))", [[3, 4]]),
+                    ("=MAKEARRAY(2,3,LAMBDA(r,c,r*c))", [[1, 2, 3], [2, 4, 6]]),
+                    ('=MAP(B2:B4,C2:C4,LAMBDA(g,d,IF(g="X",d,-d)))', [[7], [-9], [5]]),
+                    ('=BYROW(C2:C3,LAMBDA(r,r))', [[7], [9]]), ("=SUM(MAP(SEQUENCE(3),LAMBDA(x,x^2)))", 14)])
+        wb = make({"A1": "5", "B1": "=LET(x,A1,y,x+1,x*y)"})
+        self.assertEqual(val(wb, "B1"), 30)
+
+    def test_single_and_names(self):
+        wb = make({"A1": "1", "A2": "2", "A3": "3", "B2": "=SINGLE(A1:A3)", "B5": "=SINGLE(A1:A3)",
+                   "C1": "=SINGLE(SEQUENCE(3)+5)"})
+        self.assertEqual((val(wb, "B2"), val(wb, "B5"), val(wb, "C1")), (2, CellError(fe.VALUE), 6))
+        wb.define_name("Diem", "=Sheet1!$A$1:$A$3")
+        make({"D1": "=Diem*2", "E1": "=SORT(Diem,,-1)"}, wb=wb)
+        self.assertEqual((spilled(wb, "D1"), spilled(wb, "E1")), ([[2], [4], [6]], [[3], [2], [1]]))
+
+    def test_names_of_dynamic_array_functions_in_files(self):
+        for typed, stored in (("=SORT(FILTER(A2:C6,B2:B6=\"X\"),3,-1)", '=_xlfn._xlws.SORT(_xlfn._xlws.FILTER(A2:C6,B2:B6="X"),3,-1)'),
+                              ("=XLOOKUP(1,A1:A3,B1:B3)+SUM(C1#)", "=_xlfn.XLOOKUP(1,A1:A3,B1:B3)+SUM(_xlfn.ANCHORARRAY(C1))"),
+                              ("=LET(X,2,F,LAMBDA(V,V*X),F(3))", "=_xlfn.LET(_xlpm.X,2,_xlpm.F,_xlfn.LAMBDA(_xlpm.V,_xlpm.V*_xlpm.X),_xlpm.F(3))"),
+                              ("=CONCAT(A1:A3)&TEXTJOIN(\",\",TRUE,B1:B3)", '=_xlfn.CONCAT(A1:A3)&_xlfn.TEXTJOIN(",",TRUE,B1:B3)'),
+                              ('=SUM(A1:A3)&"SORT("', '=SUM(A1:A3)&"SORT("')):
+            self.assertEqual(fe.file_formula(typed), stored)
+            self.assertEqual(fe.formula_from_file(stored[1:]), typed)
+
+    def test_xlsx_round_trip(self):
+        import zipfile
+        wb = make(dict(self.TABLE, H1='=SORT(FILTER(A2:C6,B2:B6="X"),3,-1)', L1="=SUM(H1#)", M1="=SEQUENCE(2)",
+                       N1="=SUM(C2:C6*(B2:B6=\"X\"))", O1="=SUM(C2:C6)", P1="=A2:A3", P2="chặn"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mang.xlsx")
+            fe.save_workbook(wb, path)
+            with zipfile.ZipFile(path) as z:
+                xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+                self.assertIn("xl/metadata.xml", z.namelist())
+                self.assertIn("metadata", z.read("[Content_Types].xml").decode("utf-8"))
+            self.assertRegex(xml, r'<c r="H1"[^>]* cm="1"><f t="array" ref="H1:J3">_xlfn\._xlws\.SORT\(')
+            self.assertRegex(xml, r'<c r="L1"[^>]* cm="1"><f t="array" ref="L1">SUM\(_xlfn\.ANCHORARRAY\(H1\)\)</f>')
+            # Excel before 365 took one value of C2:C6 there: Excel only works it out the same way as an array
+            self.assertRegex(xml, r'<c r="N1"[^>]* cm="1"><f t="array" ref="N1">SUM\(')
+            self.assertRegex(xml, r'<c r="O1"[^>]*><f>SUM\(C2:C6\)</f>')
+            self.assertRegex(xml, r'<c r="P1"[^>]* cm="1"><f t="array" ref="P1">A2:A3</f>')  # a #SPILL! stays one
+            again = fe.load_workbook(path)
+            self.assertEqual(again.get_raw("Sheet1", 0, 7), '=SORT(FILTER(A2:C6,B2:B6="X"),3,-1)')
+            self.assertEqual(spilled(again, "H1"), [["An", "X", 7], ["Chi", "X", 5], ["An", "X", 4]])
+            self.assertEqual((val(again, "L1"), spilled(again, "M1")), (16, [[1], [2]]))  # SUM skips the text
+            self.assertEqual((val(again, "N1"), val(again, "P1")), (16, CellError(fe.SPILL)))
+
+    def test_opening_excel_dynamic_arrays(self):
+        """Excel saves the values a formula spilled in the cells it spilled into; they give way to the spill."""
+        import openpyxl
+        from openpyxl.worksheet.formula import ArrayFormula
+        book = openpyxl.Workbook()
+        ws = book.active
+        ws.title = "Sheet1"
+        for i, v in enumerate([3, 1, 2], start=1):
+            ws.cell(i, 1, v)
+        ws["C1"] = ArrayFormula("C1:C3", "=_xlfn._xlws.SORT(A1:A3)")
+        ws["C2"], ws["C3"] = 2, 3
+        ws["D1"] = ArrayFormula("D1:D3", "=A1:A3*2")  # an old Ctrl+Shift+Enter formula
+        ws["D2"], ws["D3"] = 2, 4
+        ws["E1"] = "=SUM(_xlfn.ANCHORARRAY(C1))"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "excel.xlsx")
+            book.save(path)
+            from unittest import mock
+            for fast in (True, False):
+                with mock.patch.object(fe, "XlsxCells", fe.XlsxCells if fast else None):
+                    wb = fe.load_workbook(path)
+                self.assertEqual([wb.get_raw("Sheet1", r, c) for r, c in ((0, 2), (1, 2), (2, 3), (0, 4))],
+                                 ["=SORT(A1:A3)", "", "", "=SUM(C1#)"])
+                self.assertEqual((spilled(wb, "C1"), spilled(wb, "D1"), val(wb, "E1")), ([[1], [2], [3]], [[6], [2], [4]], 6))
+
+    def test_formula_index_and_native_file(self):
+        wb = make({"A1": "=SEQUENCE(2)", "B1": "1", "C1": "=B1"})
+        cells = wb.sheets["Sheet1"].cells
+        self.assertEqual(cells.formulas(), {(0, 0), (0, 2)})
+        make({"C1": "2", "D4": "=A1#"}, wb=wb)
+        self.assertEqual(cells.formulas(), {(0, 0), (3, 3)})
+        wb.set_raw("Sheet1", 0, 0, None)
+        self.assertEqual(cells.formulas(), {(3, 3)})
+        wb = make({"A1": "=SEQUENCE(2)*3"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.pyxl")
+            fe.save_workbook(wb, path)
+            self.assertEqual(spilled(fe.load_workbook(path), "A1"), [[3], [6]])
+
+
+class ScrollOverFilteredRowsTests(unittest.TestCase):
+    def test_rows_from_skips_hidden_rows(self):
+        import random
+        spec = importlib.util.find_spec("tkinter")
+        if spec is None:
+            self.skipTest("tkinter not installed")
+        import excel_app
+
+        class Grid:
+            _runs_key = None
+            edit_serial = 0
+            _hidden_runs = excel_app.SpreadsheetApp._hidden_runs
+            shown_rows = excel_app.SpreadsheetApp.shown_rows
+            shown_rows_back = excel_app.SpreadsheetApp.shown_rows_back
+            rows_from = excel_app.SpreadsheetApp.rows_from
+
+        rng = random.Random(7)
+        for _ in range(200):
+            g = Grid()
+            hidden = set(rng.sample(range(60), rng.randint(0, 50)))
+            g.sh = type("Sheet", (), {"hidden_rows": hidden, "filter": None})()
+            shown = [r for r in range(100) if r not in hidden]
+            start = rng.choice(shown[:-20])
+            for n in (1, 3, 10, -1, -3, -10):
+                i = max(0, shown.index(start) + n)  # above the topmost shown row it stops there
+                self.assertEqual(g.rows_from(start, n), shown[i], (sorted(hidden), start, n))
+
+    def test_per_monitor_setting(self):
+        import session
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = session.Settings(tmp)
+            self.assertTrue(settings.per_monitor_dpi)
+            settings.per_monitor_dpi = False
+            self.assertFalse(session.Settings(tmp).per_monitor_dpi)
+
+
 if __name__ == "__main__":
     unittest.main()

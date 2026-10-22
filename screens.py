@@ -83,3 +83,45 @@ def center_on(window, parent, width, height, rise=2):
     ax, ay, aw, ah = work_area(top, (top.winfo_rootx() + top.winfo_width() // 2,
                                      top.winfo_rooty() + top.winfo_height() // 2))
     return max(ax, min(x, ax + aw - width)), max(ay, min(y, ay + ah - height))
+
+
+def monitor_scale(widget):
+    """Scale (1.0 = 96 DPI, 1.5 = 150 %) of the monitor showing widget's window; None when not known
+    (only Windows tells it per monitor)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = user32()
+        monitor = u.MonitorFromWindow(u.GetParent(widget.winfo_toplevel().winfo_id()), 2)  # 2: nearest
+        shcore = ctypes.WinDLL("shcore")
+        shcore.GetDpiForMonitor.argtypes = [wintypes.HMONITOR, ctypes.c_int, ctypes.POINTER(wintypes.UINT),
+                                            ctypes.POINTER(wintypes.UINT)]
+        dpi_x, dpi_y = wintypes.UINT(), wintypes.UINT()
+        if monitor and shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y)) == 0:
+            return dpi_x.value / 96  # 0: the effective DPI, which includes the user's scale setting
+    except (AttributeError, OSError, ValueError):
+        pass
+    return None
+
+
+def follow_monitor_dpi(per_monitor=True):
+    """Tell Windows that PyExcel draws itself at each monitor's DPI (before the first window is made). A
+    program that doesn't is drawn at the main monitor's scale and stretched by Windows on a monitor with
+    another scale: blurred, and with many more pixels to draw each time (slow scrolling there). Returns
+    whether it worked; otherwise (or with per_monitor=False) the main monitor's DPI is used."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    if per_monitor:
+        try:
+            if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:  # 2: PROCESS_PER_MONITOR_DPI_AWARE
+                return True
+        except (AttributeError, OSError):
+            pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system DPI: crisp on the main monitor
+    except (AttributeError, OSError):
+        pass
+    return False

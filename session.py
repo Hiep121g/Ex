@@ -17,7 +17,8 @@ import formula_engine as fe
 MAX_RECENT = 10
 QAT_DEFAULT = ["save", "undo", "redo"]  # Excel's Quick Access Toolbar out of the box
 RIBBON_MODES = ("full", "tabs", "auto")  # tabs and commands / tabs only / auto-hide
-DEFAULTS = {"recent": [], "autosave_minutes": 5, "qat": QAT_DEFAULT, "ribbon": "full", "custom_title_bar": None}
+DEFAULTS = {"recent": [], "autosave_minutes": 5, "qat": QAT_DEFAULT, "ribbon": "full", "custom_title_bar": None,
+            "per_monitor_dpi": True}
 
 
 def app_dir():
@@ -116,6 +117,16 @@ class Settings:
     @custom_title_bar.setter
     def custom_title_bar(self, value):
         self.data["custom_title_bar"] = bool(value)
+        self.save()
+
+    @property
+    def per_monitor_dpi(self):
+        """Draw at each monitor's own scale (Windows) instead of being stretched on a second monitor."""
+        return self.data.get("per_monitor_dpi") is not False
+
+    @per_monitor_dpi.setter
+    def per_monitor_dpi(self, value):
+        self.data["per_monitor_dpi"] = bool(value)
         self.save()
 
 

@@ -32,6 +32,7 @@ import images
 import pivot as pv
 import printing
 import richclip
+import screens
 import session
 import ttf
 from formula_assist import FormulaAssist
@@ -60,6 +61,7 @@ RIBBON_MODE_ITEMS = (  # Ribbon Display Options: (mode, name, explanation)
     ("full", "Hiện Tab và Lệnh", "Luôn hiện các tab và lệnh Ribbon."))
 
 ACCENT = "#107c41"
+SPILL_LINE = "#5b9bd5"  # the outline of a dynamic array
 GRID = "#e1e1e1"
 HEADER_BG = "#f3f3f3"
 HEADER_FG = "#555555"
@@ -226,7 +228,8 @@ THANH RIBBON
   • Lọc dữ liệu: quét chọn bảng (kể cả hàng tiêu đề) rồi bấm Dữ liệu → Lọc (Ctrl+Shift+L). Nút ▾ ở tiêu đề
     có: sắp xếp (cả theo màu), lọc theo màu, Bộ lọc số / văn bản / ngày (lớn hơn, nằm giữa, có chứa, 10 mục
     đầu, trên trung bình, tháng này...), Bộ lọc tùy chỉnh (2 điều kiện Và/Hoặc, dùng * và ?) và danh sách
-    giá trị có ô tìm kiếm. Thanh trạng thái cho biết số bản ghi tìm thấy.
+    giá trị có ô tìm kiếm. Thanh trạng thái cho biết số bản ghi tìm thấy. Lăn chuột, Page Up/Down và thanh
+    cuộn bỏ qua các hàng bị lọc ẩn như Excel.
   • Trang chủ → Tìm và Chọn → Đi tới Đặc biệt: chọn ô trống, hằng số, công thức, ô có ghi chú... (ví dụ chọn
     các ô trống rồi gõ giá trị và nhấn Ctrl+Enter để điền vào tất cả). Chuột phải vào tab để Ẩn / Bỏ ẩn trang tính.
   • Xem lại → Bảo vệ Trang tính: không cho sửa các ô bị khóa (mặc định mọi ô đều khóa). Trước khi bảo vệ, chọn
@@ -257,6 +260,19 @@ NHẬP DỮ LIỆU
     chèn, Esc để đóng. Trong dấu ngoặc của hàm có chú thích các đối số, đối số đang nhập được in đậm.
   • F4 khi đang gõ công thức: đổi địa chỉ cạnh con trỏ lần lượt A1 → $A$1 → A$1 → $A1 → A1.
   • Gõ ' ở đầu để giữ nguyên dạng chữ ('007). Ngày nhập dạng 21/10/2026; phần trăm như 15%.
+
+MẢNG ĐỘNG (như Excel 365)
+  • Công thức cho ra nhiều giá trị sẽ tự "tràn" sang các ô bên dưới / bên phải: =SORT(FILTER(A2:C99,B2:B99="Bắc"))
+    =UNIQUE(A2:A99)   =SEQUENCE(10)   =TEXTSPLIT("a,b,c",",")   =A2:A10*B2:B10. Chỉ ô đầu chứa công thức;
+    các ô tràn hiện công thức màu xám trên thanh công thức, chọn vào sẽ thấy viền xanh quanh cả mảng.
+  • Nếu vùng tràn bị chặn (có dữ liệu hoặc ô hợp nhất) ô đầu báo #SPILL!; xóa chỗ chặn là mảng tràn lại.
+    Mảng rỗng (FILTER không tìm thấy gì...) báo #CALC!.
+  • A2# là cả mảng mà ô A2 tràn ra: =SUM(A2#), =ROWS(A2#), =XLOOKUP(x,A2#,...). Hằng mảng: {1,2,3;4,5,6}.
+  • LAMBDA / LET: =LET(giá,B2,sl,C2,giá*sl)   =MAP(A2:A9,LAMBDA(x,x*2))   =REDUCE(0,A2:A9,LAMBDA(t,x,t+x))
+    =BYROW(A2:C9,LAMBDA(h,SUM(h)))   =SCAN(...)   =MAKEARRAY(3,3,LAMBDA(r,c,r*c)). Tab Công thức có nhóm
+    Mảng động và LAMBDA để chèn hàm.
+  • Lưu .xlsx: các công thức này được ghi đúng kiểu mảng động của Excel 365 (_xlfn...), mở bằng Excel vẫn tràn.
+    Chưa hỗ trợ tham chiếu cả cột/hàng (A:A, 1:1) và toán tử @ (dùng hàm SINGLE).
 
 CHUỘT
   • Kéo để chọn vùng; Shift+nhấp mở rộng vùng; nhấp tiêu đề để chọn cả cột/hàng.
@@ -297,6 +313,8 @@ THANH TIÊU ĐỀ VÀ RIBBON
   • Trên Windows: kéo thanh tiêu đề để di chuyển cửa sổ (thả ở mép trên màn hình để phóng to, ở mép trái /
     phải để chiếm nửa màn hình), nhấp đúp để phóng to / khôi phục, kéo các cạnh cửa sổ để đổi kích thước.
     Muốn dùng thanh tiêu đề của Windows: Tùy chọn Hiển thị Ribbon → Dùng thanh tiêu đề của Windows.
+  • Nhiều màn hình (Windows): PyExcel vẽ theo tỉ lệ (Scale) của màn hình đang đứng, kéo sang màn hình khác
+    là tự vẽ lại cho nét và mượt. Tắt ở Tùy chọn Hiển thị Ribbon → Vẽ theo tỉ lệ của từng màn hình (cần mở lại).
 
 TỆP CSV / VĂN BẢN
   • Mở tệp .csv tự nhận bảng mã như Excel: UTF-8 (có hoặc không có BOM), UTF-16 ("Văn bản Unicode"),
@@ -434,6 +452,7 @@ class SpreadsheetApp:
         self.qat_buttons = {}          # key -> Quick Access Toolbar button
         self.ribbon_mode = "full"      # "full", "tabs" (tabs only) or "auto" (auto-hide)
         self._quitting = False
+        self.per_monitor_dpi = False   # drawn at each monitor's own scale (main() turns it on, Windows only)
         self.edit_serial = 0           # counts changes, for caches of derived data
         self._stats_key = self._stats_job = self._autosave_thread = None
         self.settings = session.Settings()
@@ -502,6 +521,8 @@ class SpreadsheetApp:
         self.edit_var.trace_add("write", self._on_edit_text)
         self.fx_var.trace_add("write", self._on_fx_text)
         root.protocol("WM_DELETE_WINDOW", self.quit)
+        self._monitor_job, self._rescaled_at = None, 0
+        root.bind("<Configure>", self._on_window_configure, add="+")
         self._set_ribbon_mode(self.settings.ribbon, save=False)
         if self.titlebar.custom:
             root.bind("<Alt-F4>", lambda e: self.quit())
@@ -519,6 +540,81 @@ class SpreadsheetApp:
         return self.wb.sheets[self.sheet]
 
     # ------------------------------------------------------------------ metrics and fonts
+
+    # ------------------------------------------------------------------ monitors with another scale
+
+    def _on_window_configure(self, e):
+        if e.widget is self.root and self.per_monitor_dpi:  # the window moved or changed size
+            if self._monitor_job is not None:
+                self.root.after_cancel(self._monitor_job)
+            self._monitor_job = self.root.after(300, self._check_monitor_scale)
+
+    def _check_monitor_scale(self):
+        """After the window settled on a monitor whose scale differs from the one PyExcel is drawn for,
+        draw it again at that scale (Windows no longer stretches PyExcel's picture, see follow_monitor_dpi)."""
+        self._monitor_job = None
+        if self.titlebar.busy() or self.drag:
+            self._monitor_job = self.root.after(300, self._check_monitor_scale)
+            return
+        scale = screens.monitor_scale(self.root)
+        if scale and abs(scale - self.scale) > 0.01 and time.time() - self._rescaled_at > 2:
+            self._rescaled_at = time.time()  # (a window resized on a monitor's edge must not flip back and forth)
+            self.rescale(scale)
+
+    def rescale(self, scale):
+        """Build the window's contents again at another scale, keeping the window's physical size: text,
+        icons, ribbon, bars and the sheet. The workbook, selection, undo and settings carry on."""
+        self.commit_edit()
+        old, root = self.scale, self.root
+        tab, mode = self.ribbon.current, self.ribbon_mode
+        shown = {"grid": self.grid_var.get(), "headings": self.headings_var.get(), "fxbar": self.fxbar_var.get()}
+        maximized = self.titlebar.maximized if self.titlebar.custom else root.state() == "zoomed"
+        self._hide_ribbon_peek()
+        for job in ("_refresh_job", "_stats_job", "_autoscroll_job"):
+            if getattr(self, job) is not None:
+                root.after_cancel(getattr(self, job))
+                setattr(self, job, None)
+        for widget in root.winfo_children():
+            if not isinstance(widget, tk.Toplevel) and widget is not self.titlebar:
+                widget.destroy()
+        titlebar = self.titlebar
+        self.scale = scale
+        root.tk.call("tk", "scaling", scale * 96 / 72)
+        self._init_metrics()
+        self.menu_icons = MenuIcons(root, scale, os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons"))
+        self.commands, self.command_icons, self._ribbon_widths, self._ribbon_level = [], {}, {}, 0
+        self._frame = self._pane_key = self._list_button = self._drawn_refs = None
+        self._build_styles()
+        self._build_ribbon()  # a new title bar too, taking over the old one's state
+        titlebar.destroy()
+        self._build_formula_bar()
+        self._build_status_bar()
+        self._build_sheet_bar()
+        self._build_grid()
+        self._build_context_menus()
+        self._bind_keys()
+        self.fx_var.trace_add("write", self._on_fx_text)
+        self._set_ribbon_mode(mode, save=False)
+        if tab in self.ribbon.pages:
+            self.ribbon.select(tab)
+        self.grid_var.set(shown["grid"])
+        self.headings_var.set(shown["headings"])
+        self.fxbar_var.set(shown["fxbar"])
+        if not shown["fxbar"]:
+            self.toggle_formula_bar()
+        self._zoom_busy = True
+        self.zoom_var.set(self.zoom * 100)
+        self._zoom_busy = False
+        self.zoom_label.config(text=f"{round(self.zoom * 100)}%")
+        if maximized:
+            if self.titlebar.custom:
+                x, y, w, h = screens.work_area(root)
+                root.geometry(f"{w}x{h}+{x}+{y}")
+        else:  # the same size on the new monitor as on the old one
+            w, h = root.winfo_width(), root.winfo_height()
+            root.geometry(f"{round(w * scale / old)}x{round(h * scale / old)}")
+        self.refresh_all()
+        self.canvas.focus_set()
 
     def _init_metrics(self):
         """Pixel sizes for the current DPI and zoom."""
@@ -707,7 +803,9 @@ class SpreadsheetApp:
 
     def _build_ribbon(self):
         ui = self.ui = RibbonStyle(self.root, self.scale)
-        tb = self.titlebar = TitleBar(self.root, ui, self.settings.custom_title_bar, self.quit)
+        old = getattr(self, "titlebar", None)
+        tb = self.titlebar = TitleBar(self.root, ui, old.custom if old else self.settings.custom_title_bar, self.quit,
+                                      old.window_state() if old and old.custom else None)
         self._build_qat()
         self.ribbon_more = GlyphButton(tb.tools, ui, "more", lambda b: self._peek_ribbon(), "Hiện Ribbon",
                                        width=ui.px(30))
@@ -874,6 +972,14 @@ class SpreadsheetApp:
                 messagebox.showinfo(APP_NAME, "Thay đổi có hiệu lực khi mở lại PyExcel.", parent=self.root)
             item("Dùng thanh tiêu đề của Windows",
                  "Thay cho thanh tiêu đề kiểu Excel của PyExcel (có hiệu lực khi mở lại).", not custom, switch)
+            per_monitor = self.settings.per_monitor_dpi
+
+            def switch_dpi():
+                self.settings.per_monitor_dpi = not per_monitor
+                messagebox.showinfo(APP_NAME, "Thay đổi có hiệu lực khi mở lại PyExcel.", parent=self.root)
+            item("Vẽ theo tỉ lệ của từng màn hình",
+                 "Sắc nét và mượt trên màn hình phụ có tỉ lệ (Scale) khác (có hiệu lực khi mở lại).", per_monitor,
+                 switch_dpi)
         pop.show(right=True)
 
     def _set_ribbon_mode(self, mode, save=True):
@@ -1189,7 +1295,7 @@ class SpreadsheetApp:
                                         ("Nhỏ nhất", lambda: self.autosum("MIN"))]), split=True)
         labels = {"Toán học & Lượng giác": "Toán học &\nLượng giác", "Thống kê": "Thống\nkê", "Logic": "Logic\n",
                   "Văn bản": "Văn\nbản", "Ngày & Giờ": "Ngày &\nGiờ", "Tra cứu & Tham chiếu": "Tra cứu &\nTham chiếu",
-                  "Thông tin": "Thông\ntin"}
+                  "Thông tin": "Thông\ntin", "Mảng động": "Mảng\nđộng", "LAMBDA": "LAMBDA\n"}
         for cat in CATEGORIES:
             names = sorted(n for n, info in FUNCTION_INFO.items() if info[0] == cat)
             menu = tk.Menu(self.root, tearoff=0)
@@ -1532,7 +1638,7 @@ class SpreadsheetApp:
         self.hbar.pack(side="left", fill="x", expand=True, padx=(16, 0))
 
     def _build_grid(self):
-        frame = ttk.Frame(self.root)
+        frame = self.grid_frame = ttk.Frame(self.root)
         frame.pack(side="top", fill="both", expand=True)
         self.canvas = tk.Canvas(frame, bg="white", highlightthickness=0, bd=0, takefocus=1)
         self.vbar = ttk.Scrollbar(frame, orient="vertical", command=self.on_vscroll)
@@ -1692,6 +1798,14 @@ class SpreadsheetApp:
                 continue
             yield r
             r -= 1
+
+    def rows_from(self, r, n):
+        """The row n rows below r (above for n < 0), counting only rows that are shown: scrolling and
+        paging move over the rows a filter hides as if they were not there."""
+        rows = self.shown_rows(r + 1) if n >= 0 else self.shown_rows_back(r - 1)
+        for r in itertools.islice(rows, abs(n)):
+            pass
+        return r
 
     def frozen(self):
         """(r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 are frozen (empty spans when not)."""
@@ -1900,6 +2014,7 @@ class SpreadsheetApp:
         cv.create_line(0, 0, 0, 0, state="hidden", tags="z_selbg")
         sh = self.sh
         cells, formats = sh.cells, sh.formats
+        spilled = self.wb.spill_map(self.sheet)  # cells dynamic arrays fill (they hold nothing themselves)
         self._outline_metrics()
         hw, hh, pad = self.header_w, self.header_h, self.pad
         self._clamp_view()
@@ -2082,7 +2197,7 @@ class SpreadsheetApp:
                     if spill and align == "left" and isinstance(value, str):
                         needed, end, nc = self.text_width(font, text), x1, c + 1
                         while (needed > end - x0 - 2 * pad - indent and nc in col_pos and (r, nc) not in cells
-                               and (r, nc) not in covered and not sh.merge_at(r, nc)
+                               and (r, nc) not in spilled and (r, nc) not in covered and not sh.merge_at(r, nc)
                                and not (f and r == f["range"][0] and nc in filter_cols)):
                             if self.show_grid:
                                 boundary = col_pos[nc][0] - 1
@@ -2111,7 +2226,7 @@ class SpreadsheetApp:
                 cv.create_line(bx0, base + dy, bx1, base + dy, fill=fg)
 
         texts = []  # most cells' text items, created together after the loop
-        targets = [k for k in visible(cells) if k not in covered]
+        targets = [k for k in itertools.chain(visible(cells), visible(spilled)) if k not in covered]
         seen = set(targets)
         targets += [(m[0], m[1]) for m in merges if (m[0], m[1]) in cells and (m[0], m[1]) not in seen]
         for r, c in targets:
@@ -2234,6 +2349,12 @@ class SpreadsheetApp:
             box = self._clip_box(self._rect_bbox(*area), W, H)
             if box:
                 cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT, tags=tags)
+        spill = self.wb.spill_range(self.sheet, *self.cur)
+        if spill and spill[:2] == spill[2:]:
+            spill = None  # an array of one value looks like any other cell
+        box = self._clip_box(self._rect_bbox(*spill), W, H) if spill else None
+        if box:  # Excel outlines the whole dynamic array the active cell is in
+            cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=SPILL_LINE, tags=tags)
         sel_box = self._rect_bbox(r1, c1, r2, c2)
         box = self._clip_box(sel_box, W, H)
         if box:
@@ -2666,11 +2787,16 @@ class SpreadsheetApp:
         return str(self.root.tk.call("focus")) == str(widget)
 
     def update_formula_bar(self):
+        ghost = False
         if not self.is_editing():
             raw = self.wb.get_raw(self.sheet, *self.cur)
+            anchor = None if raw else self.wb.spill_anchor(self.sheet, *self.cur)
+            if anchor is not None and anchor != self.cur:  # a cell a dynamic array spilled into
+                raw, ghost = self.wb.get_raw(self.sheet, *anchor), True
             if self.sh.protection and (self.sh.formats.get(self.cur) or {}).get("hide_formula"):
                 raw = ""  # Format Cells > Protection > Hidden: the formula is not shown while protected
             self.fx_var.set(raw)
+        self.fx.configure(foreground="#a0a0a0" if ghost else "")
         editing = self.is_editing()
         self.btn_x.config(fg="#c42b1c" if editing else "#c0c0c0")
         self.btn_ok.config(fg="#107c41" if editing else "#c0c0c0")
@@ -2757,7 +2883,8 @@ class SpreadsheetApp:
                 keys = sorted(k for k in cells if r1 <= k[0] <= r2 and c1 <= k[1] <= c2)
             else:
                 keys = ((r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) in cells)
-            for i, (r, c) in enumerate(keys):
+            spilled = [k for k in self.wb.spill_map(sheet) if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
+            for i, (r, c) in enumerate(itertools.chain(keys, spilled)):
                 if i % 4000 == 3999:
                     yield None
                 if (r, c) in seen or sh.row_hidden(r):
@@ -2912,6 +3039,9 @@ class SpreadsheetApp:
         if ks in arrows:
             dr, dc = arrows[ks]
             target = self._jump(base, dr, dc) if ctrl else self._step(base, dr, dc)
+            if dr and self.sh.row_hidden(target[0]):  # Ctrl+arrow into rows a filter hides: the last shown one
+                target = (next(self.shown_rows_back(target[0]) if dr > 0 else self.shown_rows(target[0]),
+                               base[0]), target[1])
             self.select_to(target, extend=shift)
         elif ks in ("Return", "KP_Enter"):
             self.move_active(-1 if shift else 1, 0)
@@ -2921,8 +3051,8 @@ class SpreadsheetApp:
             self.step_sheet(-1 if ks == "Prior" else 1)
         elif ks in ("Prior", "Next"):
             n = self._visible_rows() * (-1 if ks == "Prior" else 1)
-            self.top = max(0, min(MAX_ROWS - 1, self.top + n))
-            self.select_to(self._clamp(base[0] + n, base[1]), extend=shift)
+            self.top = max(self.frozen()[1], self.rows_from(self.top, n))
+            self.select_to((self.rows_from(base[0], n), base[1]), extend=shift)
         elif ks == "Home":
             self.select_to((0, 0) if ctrl else (base[0], 0), extend=shift)
         elif ks == "End" and ctrl:
@@ -3083,9 +3213,9 @@ class SpreadsheetApp:
         mode, moved = self.drag["mode"], False
         _, r1, _, c1 = self.frozen()
         if y > H and self.top < MAX_ROWS - 1:
-            self.top, moved = self.top + 1, True
+            self.top, moved = self.rows_from(self.top, 1), True
         elif y < self.header_h and self.top > r1 and mode != "colsel":
-            self.top, moved = self.top - 1, True
+            self.top, moved = max(r1, self.rows_from(self.top, -1)), True
         if x > W and self.left < MAX_COLS - 1:
             self.left, moved = self.left + 1, True
         elif x < self.header_w and self.left > c1 and mode != "rowsel":
@@ -3202,16 +3332,16 @@ class SpreadsheetApp:
         if horizontal:
             self.left = max(0, min(MAX_COLS - 1, self.left - notches))
         else:
-            self.top = max(0, min(MAX_ROWS - 1, self.top - 3 * notches))
+            self.top = max(self.frozen()[1], self.rows_from(self.top, -3 * notches))
         self.request_refresh(ui=False)
         return "break"
 
     def on_vscroll(self, *args):
         if args[0] == "moveto":
-            self.top = int(float(args[1]) * self._v_total)
+            self.top = max(0, min(int(float(args[1]) * self._v_total), MAX_ROWS - 1))
+            self.top = next(self.shown_rows(self.top), self.top)
         elif args[0] == "scroll":
-            self.top += int(args[1]) * (self._visible_rows() if args[2] == "pages" else 1)
-        self.top = max(0, min(self.top, MAX_ROWS - 1))
+            self.top = self.rows_from(self.top, int(args[1]) * (self._visible_rows() if args[2] == "pages" else 1))
         self.request_refresh(ui=False)
 
     def on_hscroll(self, *args):
@@ -3842,8 +3972,10 @@ class SpreadsheetApp:
         sh, cols = self.sh, range(c1, c2 + 1)
         block = [[(sh.cells.get((r, c)), sh.formats.get((r, c))) for c in cols] for r in range(r1, r2 + 1)]
         values, lines = [], []
+        spilled = self.wb.spill_map(self.sheet)
         for r in range(r1, r2 + 1):  # each value once, for both the paste-values copy and the text
-            shown = [self.wb.cell_display(self.sheet, r, c) if (r, c) in sh.cells else (None, None) for c in cols]
+            shown = [self.wb.cell_display(self.sheet, r, c) if (r, c) in sh.cells or (r, c) in spilled else (None, None)
+                     for c in cols]
             values.append([fe.value_to_raw(v) for v, _ in shown])
             lines.append("\t".join(self._tsv_field(fe.format_value(*vf)) for vf in shown))
         text = "\n".join(lines)
@@ -6028,7 +6160,7 @@ class SpreadsheetApp:
 
     def toggle_formula_bar(self):
         if self.fxbar_var.get():
-            self.formula_bar.pack(side="top", fill="x", after=self.ribbon)
+            self.formula_bar.pack(side="top", fill="x", before=self.grid_frame)
         else:
             self.formula_bar.pack_forget()
 
@@ -6669,12 +6801,7 @@ class SpreadsheetApp:
 
 
 def main():
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
-        except (AttributeError, OSError):
-            pass
+    per_monitor = screens.follow_monitor_dpi(session.Settings().per_monitor_dpi)
     root = tk.Tk()
     scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
     width = min(round(1360 * scale), int(root.winfo_screenwidth() * 0.94))
@@ -6682,6 +6809,7 @@ def main():
     root.geometry(f"{width}x{height}")
     root.minsize(round(720 * scale), round(480 * scale))
     app = SpreadsheetApp(root, sys.argv[1] if len(sys.argv) > 1 else None)
+    app.per_monitor_dpi = per_monitor
     app.titlebar.start(width, height, maximized=sys.platform == "win32")  # Excel opens maximised
     root.mainloop()
 

@@ -20,6 +20,7 @@ import datetime as dt
 import gc
 import importlib.util
 import io
+import itertools
 import json
 import math
 import operator
@@ -54,6 +55,8 @@ NA = "#N/A"
 NUM = "#NUM!"
 CIRC = "#CIRC!"
 SYNTAX = "#ERROR!"
+SPILL = "#SPILL!"  # a dynamic-array result can't spill: a cell it needs is taken
+CALC = "#CALC!"    # a calculation Excel can't do, e.g. an empty array or a LAMBDA left uncalled
 
 
 class CellError(Exception):
@@ -726,15 +729,16 @@ _SHEET_PAT = r"(?:'(?:[^']|'')+'|[^\W\d][\w.]*(?::[^\W\d][\w.]*)?)"  # also Shee
 _TOKEN_RE = re.compile(rf"""
     (?P<ws>\s+)
   | (?P<string>"(?:[^"]|"")*")
-  | (?P<error>\#(?:DIV/0!|REF!|NAME\?|VALUE!|N/A|NUM!|CIRC!|ERROR!))
-  | (?P<ref>(?:(?P<sheet>{_SHEET_PAT})!)?(?P<cabs>\$?)(?P<col>[A-Za-z]{{1,3}})(?P<rabs>\$?)(?P<row>\d+)(?![\w(]))
+  | (?P<error>\#(?:DIV/0!|REF!|NAME\?|VALUE!|N/A|NUM!|CIRC!|ERROR!|SPILL!|CALC!))
+  | (?P<ref>(?:(?P<sheet>{_SHEET_PAT})!)?(?P<cabs>\$?)(?P<col>[A-Za-z]{{1,3}})(?P<rabs>\$?)(?P<row>\d+)(?![\w(])
+      (?P<spill>\#)?)
   | (?P<number>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)
   | (?P<ident>[^\W\d][\w.]*)
-  | (?P<op><>|<=|>=|[-+*/^&=<>%:(),;])
+  | (?P<op><>|<=|>=|[-+*/^&=<>%:(),;{{}}])
 """, re.VERBOSE)
 _TOKEN_KINDS = ("ws", "string", "error", "ref", "number", "ident", "op")
 
-RefParts = namedtuple("RefParts", "sheet_text sheet cabs col rabs row")
+RefParts = namedtuple("RefParts", "sheet_text sheet cabs col rabs row spill", defaults=(False,))  # spill: A1#
 
 
 class Token:
@@ -756,7 +760,7 @@ def tokenize(text):
             st = m.group("sheet")
             sheet = (st[1:-1].replace("''", "'") if st.startswith("'") else st) if st else None
             ref = RefParts(st, sheet, bool(m.group("cabs")), col_index(m.group("col")),
-                           bool(m.group("rabs")), int(m.group("row")) - 1)
+                           bool(m.group("rabs")), int(m.group("row")) - 1, bool(m.group("spill")))
         tokens.append(Token(kind, m.group(0), ref))
         pos = m.end()
     return tokens
@@ -764,7 +768,7 @@ def tokenize(text):
 
 def _format_ref(p):
     prefix = f"{p.sheet_text}!" if p.sheet_text else ""
-    return f"{prefix}{'$' if p.cabs else ''}{col_name(p.col)}{'$' if p.rabs else ''}{p.row + 1}"
+    return f"{prefix}{'$' if p.cabs else ''}{col_name(p.col)}{'$' if p.rabs else ''}{p.row + 1}{'#' if p.spill else ''}"
 
 
 def _ref_items(tokens):
@@ -844,10 +848,54 @@ class _Parser:
         return node
 
     def primary(self):
+        node = self._operand()
+        while self._at("("):  # LAMBDA(x, x + 1)(5): call what the expression gives
+            self.pos += 1
+            node = ("call", node, self._args())
+        return node
+
+    def _array_constant(self):
+        """{1,2,3;4,5,6}: rows separated by ';', items by ','."""
+        rows, row = [], []
+        while True:
+            sign = 1
+            if self._at("-", "+"):
+                sign = -1 if self.toks[self.pos].text == "-" else 1
+                self.pos += 1
+            if self.pos >= len(self.toks):
+                raise CellError(SYNTAX)
+            t = self.toks[self.pos]
+            self.pos += 1
+            if t.kind == "number":
+                row.append(sign * float(t.text))
+            elif sign == 1 and t.kind == "string":
+                row.append(t.text[1:-1].replace('""', '"'))
+            elif sign == 1 and t.kind == "ident" and t.text.upper() in ("TRUE", "FALSE"):
+                row.append(t.text.upper() == "TRUE")
+            elif sign == 1 and t.kind == "error":
+                row.append(CellError(t.text.upper()))
+            else:
+                raise CellError(SYNTAX)
+            if self._at(","):
+                self.pos += 1
+            elif self._at(";"):
+                self.pos += 1
+                rows.append(row)
+                row = []
+            else:
+                self._expect("}")
+                rows.append(row)
+                if len({len(r) for r in rows}) != 1:
+                    raise CellError(VALUE)
+                return ("array", tuple(tuple(r) for r in rows))
+
+    def _operand(self):
         if self.pos >= len(self.toks):
             raise CellError(SYNTAX)
         t = self.toks[self.pos]
         self.pos += 1
+        if t.kind == "op" and t.text == "{":
+            return self._array_constant()
         if t.kind == "number":
             return ("num", float(t.text))
         if t.kind == "string":
@@ -856,6 +904,8 @@ class _Parser:
             return ("err", t.text.upper())
         if t.kind == "ref":
             p = t.ref
+            if p.spill:  # A1#: the whole array A1's formula spills
+                return ("spill", p.sheet, p.row, p.col)
             if self._at(":"):
                 self.pos += 1
                 if self.pos >= len(self.toks) or self.toks[self.pos].kind != "ref":
@@ -912,7 +962,7 @@ def normalize_formula(raw, names=None):
         tokens = tokenize(raw[1:])
     except CellError:
         return raw
-    out, depth = [], 0
+    out, depth, braces = [], 0, 0
     for i, t in enumerate(tokens):
         if t.kind == "ident":
             after = next((n for n in tokens[i + 1:] if n.kind != "ws"), None)
@@ -924,13 +974,79 @@ def normalize_formula(raw, names=None):
                 out.append(upper if called or upper in ("TRUE", "FALSE") or not names else t.text)
         elif t.kind == "ref":
             out.append(_format_ref(t.ref))
-        elif t.kind == "op" and t.text == ";":
+        elif t.kind == "op" and t.text == ";" and not braces:
             out.append(",")
         else:
             out.append(t.text)
             if t.kind == "op":
                 depth += {"(": 1, ")": -1}.get(t.text, 0)
+                braces += {"{": 1, "}": -1}.get(t.text, 0)
     return "=" + "".join(out) + ")" * max(depth, 0)
+
+
+# functions newer than Excel 2007 carry a prefix in .xlsx files (without it Excel shows #NAME?)
+_XLFN = {"AGGREGATE", "ARRAYTOTEXT", "BYCOL", "BYROW", "CEILING.MATH", "CHOOSECOLS", "CHOOSEROWS", "CONCAT", "DAYS",
+         "DROP", "EXPAND", "FLOOR.MATH", "HSTACK", "IFNA", "IFS", "ISFORMULA", "ISOMITTED", "ISOWEEKNUM", "LAMBDA",
+         "LET", "MAKEARRAY", "MAP", "MAXIFS", "MINIFS", "MODE.MULT", "MODE.SNGL", "NUMBERVALUE", "PERCENTILE.EXC",
+         "PERCENTILE.INC", "QUARTILE.EXC", "QUARTILE.INC", "RANDARRAY", "RANK.AVG", "RANK.EQ", "REDUCE", "SCAN",
+         "SEQUENCE", "SINGLE", "SORTBY", "STDEV.P", "STDEV.S", "SWITCH", "TAKE", "TEXTAFTER", "TEXTBEFORE",
+         "TEXTJOIN", "TEXTSPLIT", "TOCOL", "TOROW", "UNICHAR", "UNICODE", "UNIQUE", "VALUETOTEXT", "VAR.P", "VAR.S",
+         "VSTACK", "WRAPCOLS", "WRAPROWS", "XLOOKUP", "XMATCH", "XOR"}
+_XLWS = {"FILTER", "SORT"}  # _xlfn._xlws.
+
+
+def _lambda_names(node, found):
+    """Names LAMBDA parameters and LET give anywhere in a formula's AST."""
+    if isinstance(node, tuple) and node:
+        if node[0] == "func" and node[1] in ("LAMBDA", "LET"):
+            args = node[2]
+            named = args[:-1] if node[1] == "LAMBDA" else args[:-1:2]
+            found.update(n[1] for n in named if n[0] == "name")
+        for part in node[1:]:
+            if isinstance(part, (list, tuple)):
+                for item in (part if isinstance(part, list) else [part]):
+                    _lambda_names(item, found)
+    return found
+
+
+def file_formula(raw):
+    """A formula as Excel writes it in .xlsx files: newer functions prefixed _xlfn. (FILTER and SORT
+    _xlfn._xlws.), LAMBDA and LET names _xlpm., and A1# as _xlfn.ANCHORARRAY(A1)."""
+    try:
+        tokens = tokenize(raw[1:])
+    except CellError:
+        return raw
+    names = _lambda_names(parse_formula(raw), set())
+    out = []
+    for i, t in enumerate(tokens):
+        if t.kind == "ident":
+            after = next((n for n in tokens[i + 1:] if n.kind != "ws"), None)
+            called = after is not None and after.kind == "op" and after.text == "("
+            upper = t.text.upper()
+            if upper in names:
+                out.append("_xlpm." + t.text)
+            elif called and upper in _XLWS:
+                out.append("_xlfn._xlws." + t.text)
+            elif called and upper in _XLFN:
+                out.append("_xlfn." + t.text)
+            else:
+                out.append(t.text)
+        elif t.kind == "ref" and t.ref.spill:
+            out.append(f"_xlfn.ANCHORARRAY({_format_ref(t.ref._replace(spill=False))})")
+        else:
+            out.append(t.text)
+    return "=" + "".join(out)
+
+
+_ANCHORARRAY_RE = re.compile(r"_xlfn\.ANCHORARRAY\(([^()]*)\)", re.I)
+
+
+def formula_from_file(text):
+    """A formula read from an .xlsx file (with or without '=') in PyExcel's form: the prefixes of newer
+    functions and LAMBDA names dropped, _xlfn.ANCHORARRAY(A1) written A1#."""
+    text = _ANCHORARRAY_RE.sub(r"\1#", text)
+    text = text.replace("_xlfn.", "").replace("_xlws.", "").replace("_xlpm.", "")
+    return normalize_formula(text if text.startswith("=") else "=" + text)
 
 
 def shift_formula(raw, dr, dc):
@@ -1071,9 +1187,109 @@ def fill_series(raws):
     return None
 
 
+# ------------------------------------------------------------------ dynamic arrays
+
+_NO_SPILLS = {}
+# functions that give arrays (or may: IF, CHOOSE, INDEX... pass on what they are given)
+_ARRAY_FUNCS = {"FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "TOCOL", "TOROW", "WRAPCOLS",
+                "WRAPROWS", "CHOOSECOLS", "CHOOSEROWS", "TAKE", "DROP", "EXPAND", "TEXTSPLIT", "MAP", "SCAN",
+                "BYROW", "BYCOL", "MAKEARRAY", "HSTACK", "VSTACK", "TRANSPOSE", "MMULT", "XLOOKUP", "OFFSET",
+                "INDEX", "INDIRECT", "IF", "IFS", "SWITCH", "CHOOSE", "LET", "IFERROR", "IFNA", "LAMBDA"}
+# functions of single values that Excel applies to each item of an array argument
+_LIFTED = {"ABS", "ACOS", "ASIN", "ATAN", "CEILING", "CHAR", "CLEAN", "CODE", "COS", "DATE", "DATEVALUE", "DAY",
+           "DEGREES", "EDATE", "EOMONTH", "EVEN", "EXACT", "EXP", "FACT", "FIND", "FLOOR", "HOUR", "INT", "ISBLANK",
+           "ISERR", "ISERROR", "ISEVEN", "ISLOGICAL", "ISNA", "ISNONTEXT", "ISNUMBER", "ISODD", "ISTEXT", "LEFT",
+           "LEN", "LN", "LOG", "LOG10", "LOWER", "MID", "MINUTE", "MOD", "MONTH", "MROUND", "N", "NOT", "ODD",
+           "POWER", "PROPER", "QUOTIENT", "RADIANS", "REPLACE", "REPT", "RIGHT", "ROUND", "ROUNDDOWN", "ROUNDUP",
+           "SEARCH", "SECOND", "SIGN", "SIN", "SQRT", "SUBSTITUTE", "T", "TAN", "TEXT", "TEXTAFTER", "TEXTBEFORE",
+           "TIME", "TRIM", "TRUNC", "UPPER", "VALUE", "WEEKDAY", "WEEKNUM", "YEAR"}
+_MAY_ARRAY = {}  # formula text -> whether it can give an array
+
+
+def _may_array(raw):
+    """Whether a formula can give several values (and so may spill)."""
+    hit = _MAY_ARRAY.get(raw)
+    if hit is None:
+        if len(_MAY_ARRAY) > 50000:
+            _MAY_ARRAY.clear()
+        hit = _MAY_ARRAY[raw] = _node_may_array(parse_formula(raw))
+    return hit
+
+
+def _node_may_array(node):
+    kind = node[0]
+    if kind in ("range", "spill", "array", "name", "call"):
+        return True
+    if kind == "bin":
+        return _node_may_array(node[2]) or _node_may_array(node[3])
+    if kind in ("neg", "pct"):
+        return _node_may_array(node[1])
+    if kind == "func":
+        return node[1] in _ARRAY_FUNCS or node[1] not in _FUNCS and node[1] not in _LAZY_FUNCS or \
+            (node[1] in _LIFTED and any(map(_node_may_array, node[2])))
+    return False
+
+
+# functions of Excel 365 (or ones Excel before it only ran as Ctrl+Shift+Enter formulas): a formula using
+# them is saved as a dynamic-array formula
+_DYNAMIC_FUNCS = _ARRAY_FUNCS - {"INDEX", "INDIRECT", "IF", "IFS", "SWITCH", "CHOOSE", "IFERROR", "IFNA", "OFFSET",
+                                 "XLOOKUP"}
+_DYNAMIC = {}
+
+
+def _dynamic_formula(raw):
+    """Whether a formula works on arrays where Excel before 365 would take one value (=SUM(A1:A3*B1:B3),
+    =LEN(A1:A3), FILTER...): Excel only calculates it the same way when the file marks it as a dynamic array."""
+    hit = _DYNAMIC.get(raw)
+    if hit is None:
+        if len(_DYNAMIC) > 50000:
+            _DYNAMIC.clear()
+        hit = _DYNAMIC[raw] = _node_dynamic(parse_formula(raw))
+    return hit
+
+
+def _node_dynamic(node, native=False):
+    """(native: inside SUMPRODUCT, which always took its arguments as arrays)"""
+    kind = node[0]
+    if kind in ("spill", "call"):
+        return True
+    if kind == "bin":
+        return not native and (_node_may_array(node[2]) or _node_may_array(node[3])) or \
+            _node_dynamic(node[2], native) or _node_dynamic(node[3], native)
+    if kind in ("neg", "pct"):
+        return not native and _node_may_array(node[1]) or _node_dynamic(node[1], native)
+    if kind == "func":
+        if node[1] in _DYNAMIC_FUNCS or (not native and node[1] in _LIFTED and any(map(_node_may_array, node[2]))):
+            return True
+        native = native or node[1] == "SUMPRODUCT"
+        return any(_node_dynamic(n, native) for n in node[2])
+    return False
+
+
 # ------------------------------------------------------------------ ranges
 
-class RangeRef:
+class Block:
+    """A rectangle of values handed to functions: worksheet cells (RangeRef) or values a formula worked
+    out (Array). Subclasses give nrows, ncols and value(i, j)."""
+
+    __slots__ = ()
+
+    def rows(self):
+        return [[self.value(i, j) for j in range(self.ncols)] for i in range(self.nrows)]
+
+    def flat(self):
+        return [v for row in self.rows() for v in row]
+
+    def line(self):
+        """Values of a one-row or one-column block, in order; None for a 2-D block."""
+        if self.ncols == 1:
+            return [self.value(i, 0) for i in range(self.nrows)]
+        if self.nrows == 1:
+            return [self.value(0, j) for j in range(self.ncols)]
+        return None
+
+
+class RangeRef(Block):
     """A rectangular block of cells, handed to functions without being evaluated."""
 
     __slots__ = ("wb", "sheet", "r1", "c1", "r2", "c2")
@@ -1096,24 +1312,22 @@ class RangeRef:
             return None
         return self.wb.get_value(self.sheet, r, c)
 
-    def rows(self):
-        return [[self.value(i, j) for j in range(self.ncols)] for i in range(self.nrows)]
-
-    def flat(self):
-        return [v for row in self.rows() for v in row]
-
     def stored(self):
         """(row, col) of the cells holding something, row by row; only the part of the range within the
         sheet's data is looked at (=SUM(A:A) or A1:A50000 on a sheet of 2000 rows), and on large sparse
-        ranges only stored cells are visited."""
+        ranges only stored cells are visited. Cells a dynamic array spills into count too."""
+        spilled = [k for k in self.wb.spill_map(self.sheet, self.r2, self.c2)
+                   if self.r1 <= k[0] <= self.r2 and self.c1 <= k[1] <= self.c2]
         cells = self.wb.sheets[self.sheet].cells
         rows, cols = cells.extent()
         r2, c2 = min(self.r2, rows - 1), min(self.c2, cols - 1)
         if r2 < self.r1 or c2 < self.c1:
-            return []
-        if (r2 - self.r1 + 1) * (c2 - self.c1 + 1) <= len(cells):
-            return [(r, c) for r in range(self.r1, r2 + 1) for c in range(self.c1, c2 + 1) if (r, c) in cells]
-        return sorted(k for k in cells if self.r1 <= k[0] <= r2 and self.c1 <= k[1] <= c2)
+            found = []
+        elif (r2 - self.r1 + 1) * (c2 - self.c1 + 1) <= len(cells):
+            found = [(r, c) for r in range(self.r1, r2 + 1) for c in range(self.c1, c2 + 1) if (r, c) in cells]
+        else:
+            found = sorted(k for k in cells if self.r1 <= k[0] <= r2 and self.c1 <= k[1] <= c2)
+        return sorted(found + spilled) if spilled else found
 
     def values(self):
         """Non-empty values row by row."""
@@ -1122,19 +1336,132 @@ class RangeRef:
             if v is not None:
                 yield v
 
-    def line(self):
-        """Cells of a one-row or one-column range, in order; None for a 2-D block."""
-        if self.ncols == 1:
-            return [self.value(i, 0) for i in range(self.nrows)]
-        if self.nrows == 1:
-            return [self.value(0, j) for j in range(self.ncols)]
-        return None
-
     def part(self, i, by_row):
         """Row i (by_row) or column i of the range, as a range."""
         if by_row:
             return RangeRef(self.wb, self.sheet, self.r1 + i, self.c1, self.r1 + i, self.c2)
         return RangeRef(self.wb, self.sheet, self.r1, self.c1 + i, self.r2, self.c1 + i)
+
+
+class Array(Block):
+    """Values a formula worked out, in rows of equal length - what a dynamic-array formula spills."""
+
+    __slots__ = ("data",)
+
+    def __init__(self, rows):
+        data = [list(row) for row in rows]
+        if not data or not data[0]:
+            raise CellError(CALC)  # Excel's "empty array"
+        width = max(map(len, data))
+        for row in data:
+            row.extend([CellError(NA)] * (width - len(row)))
+        self.data = data
+
+    @property
+    def nrows(self):
+        return len(self.data)
+
+    @property
+    def ncols(self):
+        return len(self.data[0])
+
+    def value(self, i, j):
+        return self.data[i][j]
+
+    def rows(self):
+        return self.data
+
+    def values(self):
+        return (v for row in self.data for v in row if v is not None)
+
+    def part(self, i, by_row):
+        return Array([self.data[i]]) if by_row else Array([[row[i]] for row in self.data])
+
+
+class Lambda:
+    """A LAMBDA: parameter names, the body to calculate and the names it was made among (LET, outer
+    LAMBDAs). Calling it calculates the body with the parameters set to the arguments."""
+
+    __slots__ = ("wb", "params", "body", "scope", "sheet")
+
+    def __init__(self, wb, params, body, scope, sheet):
+        self.wb, self.params, self.body, self.scope, self.sheet = wb, params, body, scope, sheet
+
+    def __call__(self, *args):
+        if len(args) != len(self.params):
+            raise CellError(VALUE)
+        wb = self.wb
+        wb._scopes.append({**self.scope, **dict(zip(self.params, args))})
+        try:
+            return wb._eval(self.body, self.sheet)
+        finally:
+            wb._scopes.pop()
+
+
+def is_array(x):
+    """True for a value holding several values: a worked-out array or a range of two or more cells."""
+    return isinstance(x, Array) or (isinstance(x, RangeRef) and (x.nrows > 1 or x.ncols > 1))
+
+
+def as_block(x):
+    """x as a Block: ranges and arrays as they are, a single value as a 1x1 array."""
+    if isinstance(x, Block):
+        return x
+    if isinstance(x, (RangeAreas, Lambda)):
+        raise CellError(VALUE)
+    return Array([[x]])
+
+
+def _safely(func, args):
+    """func(*args) with Python's errors turned into Excel's."""
+    try:
+        result = func(*args)
+    except CellError:
+        raise
+    except TypeError:  # wrong number of arguments
+        raise CellError(VALUE) from None
+    except ZeroDivisionError:
+        raise CellError(DIV0) from None
+    except (ValueError, OverflowError, InvalidOperation, statistics.StatisticsError):
+        raise CellError(NUM) from None
+    return _finite(result)
+
+
+def _elementwise(func, *args, errors=False):
+    """func applied item by item across array arguments, as Excel calculates =A1:A5*2 or =LEN(B2:B9): a
+    single value, row or column is repeated to the size of the others, and positions beyond a smaller
+    array get #N/A. An error item gives that error in its place (with errors=True func gets it itself)."""
+    blocks = [as_block(a) if is_array(a) else None for a in args]
+    rows = max(b.nrows for b in blocks if b)
+    cols = max(b.ncols for b in blocks if b)
+    grids = [b.rows() if b else None for b in blocks]
+    singles = []
+    for a, b in zip(args, blocks):
+        try:
+            singles.append(None if b else scalar(a))
+        except CellError as err:
+            singles.append(CellError(err.code))
+    out = []
+    for i in range(rows):
+        row = []
+        for j in range(cols):
+            items = []
+            for g, single in zip(grids, singles):
+                if g is None:
+                    items.append(single)
+                else:
+                    ii, jj = (0 if len(g) == 1 else i), (0 if len(g[0]) == 1 else j)
+                    items.append(g[ii][jj] if ii < len(g) and jj < len(g[0]) else CellError(NA))
+            bad = None if errors else next((v for v in items if isinstance(v, CellError)), None)
+            if bad is not None:
+                row.append(CellError(bad.code))
+                continue
+            try:
+                row.append(_safely(func, items))
+            except CellError as err:
+                row.append(CellError(err.code))
+        out.append(row)
+    return Array(out)
 
 
 class RangeAreas(tuple):
@@ -1143,10 +1470,12 @@ class RangeAreas(tuple):
 
 
 def scalar(x):
-    """Single value of an argument: a one-cell range is dereferenced, larger ones are an error."""
+    """Single value of an argument: a one-cell range or array is dereferenced, larger ones are an error."""
     if isinstance(x, RangeAreas):
         raise CellError(VALUE)
-    if isinstance(x, RangeRef):
+    if isinstance(x, Lambda):
+        raise CellError(CALC)
+    if isinstance(x, Block):
         if x.nrows == 1 and x.ncols == 1:
             v = x.value(0, 0)
             if isinstance(v, CellError):
@@ -1205,9 +1534,14 @@ def _raise_if_error(v):
     return v
 
 
+def _block_arg(x):
+    """A table or list argument: a range, an array or (as a 1x1 array) a single value."""
+    return as_block(x)
+
+
 def _peek(x):
     """Value of a one-cell argument without raising the error it may hold."""
-    if isinstance(x, RangeRef) and x.nrows == 1 and x.ncols == 1:
+    if isinstance(x, Block) and x.nrows == 1 and x.ncols == 1:
         return x.value(0, 0)
     return x
 
@@ -1215,7 +1549,7 @@ def _peek(x):
 def _numbers(args):
     """Numbers for SUM/AVERAGE/...: ranges contribute numeric cells only, literals are coerced."""
     for a in args:
-        if isinstance(a, RangeRef):
+        if isinstance(a, Block):
             for v in a.values():
                 if is_number(_raise_if_error(v)):
                     yield float(v)
@@ -1225,7 +1559,7 @@ def _numbers(args):
 
 def _flat(args):
     for a in args:
-        if isinstance(a, RangeRef):
+        if isinstance(a, Block):
             for v in a.flat():
                 yield _raise_if_error(v)
         else:
@@ -1386,7 +1720,7 @@ def _f_quartile(array, quart):
 def _f_count(*args):
     n = 0
     for a in args:
-        if isinstance(a, RangeRef):
+        if isinstance(a, Block):
             n += sum(1 for v in a.values() if is_number(v))
         elif is_number(a) or isinstance(a, bool):
             n += 1
@@ -1395,7 +1729,7 @@ def _f_count(*args):
 
 @_register("COUNTA")
 def _f_counta(*args):
-    return sum(sum(1 for _ in a.values()) if isinstance(a, RangeRef) else int(a is not None) for a in args)
+    return sum(sum(1 for _ in a.values()) if isinstance(a, Block) else int(a is not None) for a in args)
 
 
 @_register("COUNTBLANK")
@@ -1518,7 +1852,7 @@ def _f_randbetween(a, b):
 def _f_sumproduct(*ranges):
     if not ranges:
         raise CellError(VALUE)
-    ranges = [_range_arg(r) for r in ranges]
+    ranges = [_block_arg(r) for r in ranges]
     shape = (ranges[0].nrows, ranges[0].ncols)
     if any((r.nrows, r.ncols) != shape for r in ranges):
         raise CellError(VALUE)
@@ -1659,7 +1993,7 @@ def _f_subtotal(kind, *refs):
 # logic
 def _logicals(args):
     for a in args:
-        if isinstance(a, RangeRef):
+        if isinstance(a, Block):
             for v in a.values():
                 v = _raise_if_error(v)
                 if isinstance(v, bool):
@@ -1713,7 +2047,13 @@ def _f_false():
 def _f_if(wb, nodes, sheet):
     if len(nodes) not in (2, 3):
         raise CellError(VALUE)
-    if to_bool(scalar(wb._eval(nodes[0], sheet))):
+    test = wb._eval(nodes[0], sheet)
+    if is_array(test):  # =IF(B2:B9>5, "yes", "no"): one answer per item
+        yes = wb._eval(nodes[1], sheet)
+        no = wb._eval(nodes[2], sheet) if len(nodes) == 3 else False
+        return _elementwise(lambda t, a, b: t if isinstance(t, CellError) else a if to_bool(t) else b,
+                            test, yes, no, errors=True)
+    if to_bool(scalar(test)):
         return wb._eval(nodes[1], sheet)
     return wb._eval(nodes[2], sheet) if len(nodes) == 3 else False
 
@@ -1746,22 +2086,29 @@ def _f_switch(wb, nodes, sheet):
 def _f_iferror(wb, nodes, sheet):
     if len(nodes) != 2:
         raise CellError(VALUE)
+    return _if_error(wb, nodes, sheet, lambda code: True)
+
+
+def _if_error(wb, nodes, sheet, caught):
+    """IFERROR / IFNA: the value, or the fallback for errors `caught(code)` accepts - item by item for an array."""
     try:
-        return scalar(wb._eval(nodes[0], sheet))
-    except CellError:
+        value = wb._eval(nodes[0], sheet)
+        if not is_array(value):
+            return scalar(value)
+    except CellError as err:
+        if not caught(err.code):
+            raise
         return wb._eval(nodes[1], sheet)
+    fallback = wb._eval(nodes[1], sheet)
+    return _elementwise(lambda v, f: f if isinstance(v, CellError) and caught(v.code) else v, value, fallback,
+                        errors=True)
 
 
 @_register("IFNA", lazy=True)
 def _f_ifna(wb, nodes, sheet):
     if len(nodes) != 2:
         raise CellError(VALUE)
-    try:
-        return scalar(wb._eval(nodes[0], sheet))
-    except CellError as err:
-        if err.code != NA:
-            raise
-        return wb._eval(nodes[1], sheet)
+    return _if_error(wb, nodes, sheet, lambda code: code == NA)
 
 
 def _error_code(wb, nodes, sheet):
@@ -1857,14 +2204,37 @@ def _f_column(wb, nodes, sheet):
     return float(_range_arg(ref).c1 + 1)
 
 
+@_register("SINGLE", lazy=True)
+def _f_single(wb, nodes, sheet):
+    """Excel's implicit intersection (shown as @ in Excel): the cell of a range in the formula's own row
+    or column, or the first value of an array."""
+    if len(nodes) != 1:
+        raise CellError(VALUE)
+    x = wb._eval(nodes[0], sheet)
+    if isinstance(x, RangeRef):
+        _, row, col = wb._stack[-1]
+        if x.nrows == 1 and x.ncols == 1:
+            v = x.value(0, 0)
+        elif x.ncols == 1 and x.r1 <= row <= x.r2:
+            v = x.value(row - x.r1, 0)
+        elif x.nrows == 1 and x.c1 <= col <= x.c2:
+            v = x.value(0, col - x.c1)
+        else:
+            raise CellError(VALUE)
+        return 0.0 if v is None else _raise_if_error(v)
+    if isinstance(x, Block):
+        return _raise_if_error(x.value(0, 0))
+    return x
+
+
 @_register("ROWS")
 def _f_rows(rng):
-    return _range_arg(rng).nrows
+    return _block_arg(rng).nrows
 
 
 @_register("COLUMNS")
 def _f_columns(rng):
-    return _range_arg(rng).ncols
+    return _block_arg(rng).ncols
 
 
 @_register("CHOOSE")
@@ -2024,31 +2394,40 @@ def _f_code(x):
     return ord(s[0])
 
 
-def _split_at(x, delimiter, instance):
-    """Text before and after the n-th delimiter (counting from the end when n < 0)."""
-    s, d, n = _text(x), _text(delimiter), _int(instance)
-    if n == 0 or not d:
+def _split_at(x, delimiter, instance, match_mode, match_end):
+    """Text before and after the n-th delimiter (counting from the end when n < 0). `delimiter` may be
+    several (an array); match_mode 1 ignores case; with match_end the text's end counts as a delimiter."""
+    s = _text(x)
+    n = 1 if instance is None else _int(instance)
+    if n == 0 or abs(n) > len(s) + 1:
         raise CellError(VALUE)
-    pos, end = -1, len(s)
-    for _ in range(abs(n)):
-        if n > 0:
-            pos = s.find(d, pos + 1)
-        else:
-            pos = s.rfind(d, 0, end)
-            end = pos + len(d) - 1
-        if pos < 0:
-            raise CellError(NA)
-    return s[:pos], s[pos + len(d):]
+    found = [(m.start(), m.end()) for m in _delimiters(delimiter, re.I if match_mode and _int(match_mode) == 1 else 0)
+             .finditer(s)]
+    if match_end is not None and _bool(match_end):
+        found = [(0, 0)] + found + [(len(s), len(s))] if n < 0 else found + [(len(s), len(s))]
+    if abs(n) > len(found):
+        raise CellError(NA)
+    start, end = found[n - 1] if n > 0 else found[n]
+    return s[:start], s[end:]
+
+
+def _text_part(x, delimiter, instance, match_mode, match_end, if_not_found, which):
+    try:
+        return _split_at(x, delimiter, instance, match_mode, match_end)[which]
+    except CellError as err:
+        if err.code != NA or if_not_found is None:
+            raise
+        return scalar(if_not_found)
 
 
 @_register("TEXTBEFORE")
-def _f_textbefore(x, delimiter, instance=1):
-    return _split_at(x, delimiter, instance)[0]
+def _f_textbefore(x, delimiter, instance=None, match_mode=None, match_end=None, if_not_found=None):
+    return _text_part(x, delimiter, instance, match_mode, match_end, if_not_found, 0)
 
 
 @_register("TEXTAFTER")
-def _f_textafter(x, delimiter, instance=1):
-    return _split_at(x, delimiter, instance)[1]
+def _f_textafter(x, delimiter, instance=None, match_mode=None, match_end=None, if_not_found=None):
+    return _text_part(x, delimiter, instance, match_mode, match_end, if_not_found, 1)
 
 
 # dates
@@ -2252,7 +2631,7 @@ def _match_index(items, key, mode):
 
 @_register("VLOOKUP")
 def _f_vlookup(key, table, col, approx=True):
-    table, ci = _range_arg(table), _int(col)
+    table, ci = _block_arg(table), _int(col)
     if ci < 1:
         raise CellError(VALUE)
     if ci > table.ncols:
@@ -2263,7 +2642,7 @@ def _f_vlookup(key, table, col, approx=True):
 
 @_register("HLOOKUP")
 def _f_hlookup(key, table, row, approx=True):
-    table, ri = _range_arg(table), _int(row)
+    table, ri = _block_arg(table), _int(row)
     if ri < 1:
         raise CellError(VALUE)
     if ri > table.nrows:
@@ -2274,11 +2653,15 @@ def _f_hlookup(key, table, row, approx=True):
 
 @_register("INDEX")
 def _f_index(table, row, col=None):
-    table, r = _range_arg(table), _int(row)
+    table, r = _block_arg(table), _int(row)
     if col is None:
         r, c = (1, r) if table.nrows == 1 else (r, 1)
     else:
         c = _int(col)
+    if r == 0 and 1 <= c <= table.ncols:  # a whole column (or row, below) of the table
+        return table.part(c - 1, False)
+    if c == 0 and 1 <= r <= table.nrows:
+        return table.part(r - 1, True)
     if not (1 <= r <= table.nrows and 1 <= c <= table.ncols):
         raise CellError(REF)
     return _raise_if_error(table.value(r - 1, c - 1))
@@ -2286,7 +2669,7 @@ def _f_index(table, row, col=None):
 
 @_register("MATCH")
 def _f_match(key, rng, mode=1):
-    rng = _range_arg(rng)
+    rng = _block_arg(rng)
     if rng.nrows != 1 and rng.ncols != 1:
         raise CellError(NA)
     m = _int(mode)
@@ -2337,9 +2720,17 @@ def _optional_int(wb, nodes, i, sheet, default):
 def _f_xlookup(wb, nodes, sheet):
     if not 3 <= len(nodes) <= 6:
         raise CellError(VALUE)
-    key = scalar(wb._eval(nodes[0], sheet))
-    look = _range_arg(wb._eval(nodes[1], sheet))
-    result = _range_arg(wb._eval(nodes[2], sheet))
+    key = wb._eval(nodes[0], sheet)
+    if is_array(key):  # several values looked up at once: an array of what each finds
+        def one(k):
+            if isinstance(k, CellError):
+                return k
+            found = _f_xlookup(wb, [("num", k)] + list(nodes[1:]), sheet)
+            return _blank_zero(_peek(found) if isinstance(found, Block) else found)
+        return _elementwise(one, as_block(key), errors=True)
+    key = scalar(key)
+    look = _block_arg(wb._eval(nodes[1], sheet))
+    result = _block_arg(wb._eval(nodes[2], sheet))
     items = look.line()
     by_row = look.ncols == 1
     if items is None or (result.nrows if by_row else result.ncols) != len(items):
@@ -2357,12 +2748,442 @@ def _f_xlookup(wb, nodes, sheet):
 
 @_register("XMATCH")
 def _f_xmatch(key, rng, match_mode=None, search_mode=None):
-    items = _range_arg(rng).line()
+    items = _block_arg(rng).line()
     if items is None:
         raise CellError(VALUE)
     match_mode = 0 if match_mode is None else _int(match_mode)
     search_mode = 1 if search_mode is None else _int(search_mode)
     return _xmatch_index(items, scalar(key), match_mode, search_mode) + 1
+
+
+# dynamic arrays (Excel 365): functions that give arrays, which spill into the cells around
+def _grid(x):
+    """Rows (lists) of an array argument; a single value is one row of one."""
+    return [list(row) for row in as_block(x).rows()]
+
+
+def _transposed(rows):
+    return [list(col) for col in zip(*rows)]
+
+
+def _blank_zero(v):
+    """An empty cell as dynamic arrays show it: 0."""
+    return 0.0 if v is None else v
+
+
+def _count_arg(x, default, low=1):
+    if x is None:
+        return default
+    n = _int(x)
+    if n < low:
+        raise CellError(VALUE)
+    return n
+
+
+def _flag(x, default=False):
+    return default if x is None else _bool(x)
+
+
+@_register("FILTER", lazy=True)
+def _f_filter(wb, nodes, sheet):
+    if len(nodes) not in (2, 3):
+        raise CellError(VALUE)
+    data = _grid(wb._eval(nodes[0], sheet))
+    include = as_block(wb._eval(nodes[1], sheet))
+    flags = []
+    for v in include.flat():
+        v = _raise_if_error(v)
+        if isinstance(v, str):
+            raise CellError(VALUE)
+        flags.append(bool(v))
+    if include.ncols == 1 and include.nrows == len(data):
+        out = [row for row, keep in zip(data, flags) if keep]
+    elif include.nrows == 1 and include.ncols == len(data[0]):
+        keep = [j for j, f in enumerate(flags) if f]
+        out = [[row[j] for j in keep] for row in data] if keep else []
+    else:
+        raise CellError(VALUE)
+    if not out or not out[0]:
+        if len(nodes) == 3 and nodes[2][0] != "empty":
+            return wb._eval(nodes[2], sheet)
+        raise CellError(CALC)
+    return Array(out)
+
+
+def _sorted_rows(rows, keys):
+    """rows sorted by [(index, descending)] keys, the first key first (blanks sort as 0, as in Excel)."""
+    for index, descending in reversed(keys):
+        rows = sorted(rows, key=lambda row: sort_key(_blank_zero(row[index])), reverse=descending)
+    return rows
+
+
+def _sort_orders(order, count):
+    orders = [1] if order is None else [_int(v) for v in as_block(order).flat()]
+    if any(o not in (1, -1) for o in orders) or len(orders) not in (1, count):
+        raise CellError(VALUE)
+    return orders * count if len(orders) == 1 else orders
+
+
+@_register("SORT")
+def _f_sort(array, sort_index=None, sort_order=None, by_col=None):
+    data = _grid(array)
+    by_col = _flag(by_col)
+    if by_col:
+        data = _transposed(data)
+    indexes = [1] if sort_index is None else [_int(v) for v in as_block(sort_index).flat()]
+    if any(not 1 <= i <= len(data[0]) for i in indexes):
+        raise CellError(VALUE)
+    orders = _sort_orders(sort_order, len(indexes))
+    out = _sorted_rows(data, [(i - 1, o < 0) for i, o in zip(indexes, orders)])
+    return Array(_transposed(out) if by_col else out)
+
+
+@_register("SORTBY")
+def _f_sortby(array, *by):
+    data = _grid(array)
+    if not by:
+        raise CellError(VALUE)
+    keys, columns = [], None
+    for k in range(0, len(by), 2):
+        values = as_block(by[k])
+        order = _sort_orders(by[k + 1] if k + 1 < len(by) else None, 1)[0]
+        line = values.line()
+        if line is None:
+            raise CellError(VALUE)
+        by_rows = values.ncols == 1 and len(line) == len(data)
+        if not by_rows and not (values.nrows == 1 and len(line) == len(data[0])):
+            raise CellError(VALUE)
+        if columns is None:
+            columns = not by_rows
+        elif columns != (not by_rows):
+            raise CellError(VALUE)
+        keys.append((line, order < 0))
+    items = _transposed(data) if columns else data
+    order = list(range(len(items)))
+    for line, descending in reversed(keys):
+        order.sort(key=lambda i: sort_key(_blank_zero(line[i])), reverse=descending)
+    out = [items[i] for i in order]
+    return Array(_transposed(out) if columns else out)
+
+
+def _unique_key(v):
+    if isinstance(v, str):
+        return (1, v.lower())
+    if isinstance(v, CellError):
+        return (3, v.code)
+    return sort_key(_blank_zero(v))
+
+
+@_register("UNIQUE")
+def _f_unique(array, by_col=None, exactly_once=None):
+    data = _grid(array)
+    by_col = _flag(by_col)
+    if by_col:
+        data = _transposed(data)
+    counts, first = {}, {}
+    for row in data:
+        key = tuple(map(_unique_key, row))
+        counts[key] = counts.get(key, 0) + 1
+        first.setdefault(key, row)
+    out = [row for key, row in first.items() if not _flag(exactly_once) or counts[key] == 1]
+    if not out:
+        raise CellError(CALC)
+    return Array(_transposed(out) if by_col else out)
+
+
+def _array_size(rows, cols):
+    rows, cols = _count_arg(rows, 1, 0), _count_arg(cols, 1, 0)
+    if not rows or not cols:
+        raise CellError(CALC)  # an empty array
+    if rows > MAX_ROWS or cols > MAX_COLS or rows * cols > 5_000_000:
+        raise CellError(NUM)
+    return rows, cols
+
+
+@_register("SEQUENCE")
+def _f_sequence(rows, cols=None, start=None, step=None):
+    rows, cols = _array_size(rows, cols)
+    first = 1.0 if start is None else _num(start)
+    inc = 1.0 if step is None else _num(step)
+    return Array([[first + (i * cols + j) * inc for j in range(cols)] for i in range(rows)])
+
+
+@_register("RANDARRAY")
+def _f_randarray(rows=None, cols=None, low=None, high=None, whole=None):
+    rows, cols = _array_size(rows, cols)
+    low = 0.0 if low is None else _num(low)
+    high = 1.0 if high is None else _num(high)
+    if low > high:
+        raise CellError(VALUE)
+    if _flag(whole):
+        if int(low) != low or int(high) != high:
+            raise CellError(VALUE)
+        return Array([[float(random.randint(int(low), int(high))) for _ in range(cols)] for _ in range(rows)])
+    return Array([[random.uniform(low, high) for _ in range(cols)] for _ in range(rows)])
+
+
+@_register("MMULT")
+def _f_mmult(a, b):
+    a, b = _grid(a), _grid(b)
+    if len(a[0]) != len(b):
+        raise CellError(VALUE)
+    for v in itertools.chain.from_iterable(a + b):
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise CellError(VALUE)
+    cols = _transposed(b)
+    return Array([[math.fsum(x * y for x, y in zip(row, col)) for col in cols] for row in a])
+
+
+@_register("TRANSPOSE")
+def _f_transpose(array):
+    return Array(_transposed(_grid(array)))
+
+
+def _items(array, ignore, scan_by_column):
+    """The values of an array one by one, row by row (column by column), skipping blanks (ignore 1),
+    errors (2) or both (3)."""
+    data = _grid(array)
+    if _flag(scan_by_column):
+        data = _transposed(data)
+    ignore = 0 if ignore is None else _int(ignore)
+    if ignore not in (0, 1, 2, 3):
+        raise CellError(VALUE)
+    out = [v for row in data for v in row
+           if not (ignore & 1 and v is None) and not (ignore & 2 and isinstance(v, CellError))]
+    if not out:
+        raise CellError(CALC)
+    return out
+
+
+@_register("TOCOL")
+def _f_tocol(array, ignore=None, scan_by_column=None):
+    return Array([[v] for v in _items(array, ignore, scan_by_column)])
+
+
+@_register("TOROW")
+def _f_torow(array, ignore=None, scan_by_column=None):
+    return Array([_items(array, ignore, scan_by_column)])
+
+
+def _wrapped(vector, count, pad):
+    items = as_block(vector).line()
+    if items is None:
+        raise CellError(VALUE)
+    count = _count_arg(count, 1)
+    pad = CellError(NA) if pad is None else scalar(pad)
+    chunks = [items[i:i + count] for i in range(0, len(items), count)]
+    chunks[-1] += [pad] * (count - len(chunks[-1]))
+    return chunks
+
+
+@_register("WRAPROWS")
+def _f_wraprows(vector, wrap_count, pad_with=None):
+    return Array(_wrapped(vector, wrap_count, pad_with))
+
+
+@_register("WRAPCOLS")
+def _f_wrapcols(vector, wrap_count, pad_with=None):
+    return Array(_transposed(_wrapped(vector, wrap_count, pad_with)))
+
+
+def _picked(count, numbers):
+    """0-based positions for CHOOSEROWS / CHOOSECOLS numbers (negative ones count from the end)."""
+    out = []
+    for x in numbers:
+        for v in as_block(x).flat():
+            n = int(to_number(_raise_if_error(v)))
+            if n == 0 or abs(n) > count:
+                raise CellError(VALUE)
+            out.append(n - 1 if n > 0 else count + n)
+    if not out:
+        raise CellError(VALUE)
+    return out
+
+
+@_register("CHOOSEROWS")
+def _f_chooserows(array, *numbers):
+    data = _grid(array)
+    return Array([data[i] for i in _picked(len(data), numbers)])
+
+
+@_register("CHOOSECOLS")
+def _f_choosecols(array, *numbers):
+    data = _grid(array)
+    picked = _picked(len(data[0]), numbers)
+    return Array([[row[j] for j in picked] for row in data])
+
+
+def _span(count, n, take):
+    """Slice of `count` items that TAKE (take=True) or DROP keeps for n (None: all for TAKE, none for DROP)."""
+    if n is None:
+        return slice(0, count)
+    n = _int(n)
+    if take:
+        return slice(0, n) if n >= 0 else slice(max(0, count + n), count)
+    return slice(n, count) if n >= 0 else slice(0, max(0, count + n))
+
+
+@_register("TAKE")
+def _f_take(array, rows=None, cols=None):
+    data = _grid(array)
+    out = [row[_span(len(data[0]), cols, True)] for row in data[_span(len(data), rows, True)]]
+    return Array(out)
+
+
+@_register("DROP")
+def _f_drop(array, rows=None, cols=None):
+    data = _grid(array)
+    out = [row[_span(len(data[0]), cols, False)] for row in data[_span(len(data), rows, False)]]
+    return Array(out)
+
+
+@_register("EXPAND")
+def _f_expand(array, rows=None, cols=None, pad_with=None):
+    data = _grid(array)
+    rows = len(data) if rows is None else _int(rows)
+    cols = len(data[0]) if cols is None else _int(cols)
+    if rows < len(data) or cols < len(data[0]):
+        raise CellError(VALUE)
+    pad = CellError(NA) if pad_with is None else scalar(pad_with)
+    out = [row + [pad] * (cols - len(row)) for row in data] + [[pad] * cols for _ in range(rows - len(data))]
+    return Array(out)
+
+
+@_register("HSTACK")
+def _f_hstack(*arrays):
+    grids = [_grid(a) for a in arrays]
+    height = max(map(len, grids))
+    return Array([sum((g[i] if i < len(g) else [CellError(NA)] * len(g[0]) for g in grids), [])
+                  for i in range(height)])
+
+
+@_register("VSTACK")
+def _f_vstack(*arrays):
+    rows = [row for a in arrays for row in _grid(a)]
+    width = max(map(len, rows))
+    return Array([row + [CellError(NA)] * (width - len(row)) for row in rows])
+
+
+def _delimiters(x, flags):
+    """Regex for the delimiters of TEXTSPLIT (one text or an array of them), longest first."""
+    parts = sorted({to_text(_raise_if_error(v)) for v in as_block(x).flat() if v is not None}, key=len, reverse=True)
+    if not parts or not all(parts):
+        raise CellError(VALUE)
+    return re.compile("|".join(map(re.escape, parts)), flags)
+
+
+@_register("TEXTSPLIT")
+def _f_textsplit(text, col_delimiter=None, row_delimiter=None, ignore_empty=None, match_mode=None, pad_with=None):
+    text = _text(text)
+    flags = re.I if match_mode is not None and _int(match_mode) == 1 else 0
+    if col_delimiter is None and row_delimiter is None:
+        raise CellError(VALUE)
+    lines = _delimiters(row_delimiter, flags).split(text) if row_delimiter is not None else [text]
+    if _flag(ignore_empty):
+        lines = [line for line in lines if line]
+    rows = [_delimiters(col_delimiter, flags).split(line) if col_delimiter is not None else [line] for line in lines]
+    if _flag(ignore_empty):
+        rows = [[v for v in row if v] for row in rows]
+        rows = [row for row in rows if row]
+    if not rows:
+        raise CellError(CALC)
+    pad = CellError(NA) if pad_with is None else scalar(pad_with)
+    width = max(map(len, rows))
+    return Array([row + [pad] * (width - len(row)) for row in rows])
+
+
+# LAMBDA and the functions that take one
+@_register("LAMBDA", lazy=True)
+def _f_lambda(wb, nodes, sheet):
+    if not nodes or any(n[0] != "name" for n in nodes[:-1]):
+        raise CellError(VALUE)
+    scope = {}
+    for outer in wb._scopes:
+        scope.update(outer)
+    return Lambda(wb, [n[1] for n in nodes[:-1]], nodes[-1], scope, sheet)
+
+
+@_register("LET", lazy=True)
+def _f_let(wb, nodes, sheet):
+    if len(nodes) < 3 or len(nodes) % 2 == 0 or any(nodes[i][0] != "name" for i in range(0, len(nodes) - 1, 2)):
+        raise CellError(VALUE)
+    scope = {}
+    wb._scopes.append(scope)
+    try:
+        for i in range(0, len(nodes) - 1, 2):
+            scope[nodes[i][1]] = wb._eval(nodes[i + 1], sheet)
+        return wb._eval(nodes[-1], sheet)
+    finally:
+        wb._scopes.pop()
+
+
+def _lambda_arg(x, params):
+    if not isinstance(x, Lambda) or len(x.params) != params:
+        raise CellError(VALUE)
+    return x
+
+
+def _single(v):
+    """What a LAMBDA gave for one item of MAP / BYROW / SCAN...: a single value (an array is #CALC!)."""
+    if is_array(v) and (v.nrows > 1 or v.ncols > 1):
+        return CellError(CALC)
+    try:
+        return _blank_zero(scalar(v))
+    except CellError as err:
+        return CellError(err.code)
+
+
+@_register("MAP")
+def _f_map(*args):
+    if len(args) < 2:
+        raise CellError(VALUE)
+    func = _lambda_arg(args[-1], len(args) - 1)
+    arrays = [as_block(a) for a in args[:-1]]
+    return _elementwise(lambda *items: _single(func(*items)), *arrays, errors=True) if any(map(is_array, arrays)) \
+        else _single(func(*(a.value(0, 0) for a in arrays)))
+
+
+@_register("REDUCE")
+def _f_reduce(initial, array, func):
+    func = _lambda_arg(func, 2)
+    acc = None if initial is None else _peek(initial)
+    for row in _grid(array):
+        for v in row:
+            acc = func(acc, v)
+    return acc
+
+
+@_register("SCAN")
+def _f_scan(initial, array, func):
+    func = _lambda_arg(func, 2)
+    acc = None if initial is None else _peek(initial)
+    out = []
+    for row in _grid(array):
+        line = []
+        for v in row:
+            acc = _single(func(acc, v))
+            line.append(acc)
+        out.append(line)
+    return Array(out)
+
+
+@_register("BYROW")
+def _f_byrow(array, func):
+    func = _lambda_arg(func, 1)
+    return Array([[_single(func(Array([row])))] for row in _grid(array)])
+
+
+@_register("BYCOL")
+def _f_bycol(array, func):
+    func = _lambda_arg(func, 1)
+    return Array([[_single(func(Array([[v] for v in col]))) for col in _transposed(_grid(array))]])
+
+
+@_register("MAKEARRAY")
+def _f_makearray(rows, cols, func):
+    rows, cols = _array_size(rows, cols)
+    func = _lambda_arg(func, 2)
+    return Array([[_single(func(float(i + 1), float(j + 1))) for j in range(cols)] for i in range(rows)])
 
 
 @_register("OFFSET")
@@ -2739,11 +3560,17 @@ class CellStore(TrackedDict):
     without scanning every cell (used_extent runs on every scroll). Adding cells grows the remembered
     bounds; removing one makes them unknown until next asked."""
 
-    __slots__ = ("_extent", "_first")
+    __slots__ = ("_extent", "_first", "_formulas")
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
-        self._extent = self._first = None
+        self._extent = self._first = self._formulas = None
+
+    def formulas(self):
+        """Keys of the cells holding formulas, kept up to date as cells change."""
+        if self._formulas is None:
+            self._formulas = {k for k, v in self.items() if v[:1] == "="}
+        return self._formulas
 
     def extent(self):
         """(rows, cols) spanned by the cells."""
@@ -2770,12 +3597,36 @@ class CellStore(TrackedDict):
             self._extent = (max(ext[0], key[0] + 1), max(ext[1], key[1] + 1))
         if first is not None and (key[0] < first[0] or key[1] < first[1]):
             self._first = (min(first[0], key[0]), min(first[1], key[1]))
+        if self._formulas is not None:
+            if value[:1] == "=":
+                self._formulas.add(key)
+            else:
+                self._formulas.discard(key)
         self.version += 1
         dict.__setitem__(self, key, value)
 
     def __delitem__(self, key):
         self._changed()
+        if self._formulas is not None:
+            self._formulas.discard(key)
         dict.__delitem__(self, key)
+
+    def pop(self, key, *default):
+        if self._formulas is not None:
+            self._formulas.discard(key)
+        return super().pop(key, *default)
+
+    def popitem(self):
+        self._formulas = None
+        return super().popitem()
+
+    def clear(self):
+        self._formulas = None
+        super().clear()
+
+    def update(self, *args, **kw):
+        self._formulas = None
+        super().update(*args, **kw)
 
 
 class Sheet:
@@ -2895,6 +3746,14 @@ class Workbook:
         self._cf_stats = {}    # (sheet, rule index, name) -> statistics of a rule's range
         self._evaluating = set()
         self._stack = []
+        self._scopes = []      # names LET and LAMBDA set, innermost last
+        self._spills = {}      # sheet -> {anchor (r, c): (rows, cols)} of the dynamic arrays that spilled
+        self._spilled = {}     # sheet -> {(r, c): (value, anchor)} of the cells they spilled into
+        self._spill_ready = set()  # sheets whose dynamic arrays are all worked out
+        self._candidates = {}  # sheet -> (cells version, [formula cells that can give an array])
+        self._journal = None   # keys cached during a tentative calculation (see _tentative)
+        self._outer = ()       # cells being calculated when a tentative calculation started
+        self._blocked = False  # a tentative calculation needed one of those
         self.names = {}        # NAME (upper case) -> {"name": as typed, "ref": "=Sheet1!$A$1:$B$4", "comment": ""}
         self.import_info = None  # how a text file was read: {"encoding", "delimiter", "decimal_comma", "truncated"}
         self._names_ast = {}
@@ -3036,6 +3895,9 @@ class Workbook:
         self._cache.clear()
         self._cf_cache.clear()
         self._cf_stats.clear()
+        self._spills.clear()
+        self._spilled.clear()
+        self._spill_ready.clear()
 
     def used_extent(self, sheet):
         """(rows, cols) spanned by non-empty cells."""
@@ -3056,7 +3918,8 @@ class Workbook:
         sh = self.sheets[sheet]
         raw = sh.cells.get((r, c))
         if raw is None:
-            return None
+            hit = self.spill_map(sheet, r, c).get((r, c))
+            return None if hit is None else 0.0 if hit[0] is None else hit[0]
         fmt = sh.formats.get((r, c))
         if fmt and fmt.get("num") == "@":  # Text format: keep exactly what was typed
             value = raw[1:] if raw.startswith("'") else raw
@@ -3064,11 +3927,14 @@ class Workbook:
             value = parse_literal(raw)[0]
         else:
             if key in self._evaluating:
+                if key in self._outer:  # (a tentative calculation, see _tentative)
+                    self._blocked = True
                 raise CellError(CIRC)
             self._evaluating.add(key)
             self._stack.append(key)
             try:
-                value = scalar(self._eval(self._parsed(key, raw), sheet))
+                result = self._eval(self._parsed(key, raw), sheet)
+                value = self._spill(sheet, r, c, result) if is_array(result) else scalar(result)
                 if value is None:
                     value = 0.0
             except CellError as err:
@@ -3079,7 +3945,121 @@ class Workbook:
                 self._evaluating.discard(key)
                 self._stack.pop()
         self._cache[key] = value
+        if self._journal is not None:
+            self._journal.append(key)
         return value
+
+    # dynamic arrays: a formula giving several values shows the first and spills the rest into the cells
+    # right of and below it, like Excel 365
+
+    def _spill(self, sheet, r, c, block):
+        """Value of a formula cell whose result is `block`: its top-left value, the rest going into the
+        cells beside and below - or #SPILL! when one of those holds something (or is merged)."""
+        rows, cols = block.nrows, block.ncols
+        r2, c2 = r + rows - 1, c + cols - 1
+        if r2 >= MAX_ROWS or c2 >= MAX_COLS:
+            return CellError(SPILL)
+        sh = self.sheets[sheet]
+        spilled = self._spilled.setdefault(sheet, {})
+        if rows * cols <= len(sh.cells) + len(spilled):
+            taken = any(k in sh.cells or k in spilled for k in itertools.product(range(r, r2 + 1), range(c, c2 + 1))
+                        if k != (r, c))
+        else:
+            taken = any(r <= k[0] <= r2 and c <= k[1] <= c2 and k != (r, c)
+                        for k in itertools.chain(sh.cells, spilled))
+        if taken or any(m[0] <= r2 and m[2] >= r and m[1] <= c2 and m[3] >= c for m in sh.merges):
+            return CellError(SPILL)
+        data = block.rows()
+        for i, row in enumerate(data):
+            for j, v in enumerate(row):
+                if i or j:
+                    spilled[(r + i, c + j)] = (v, (r, c))
+        self._spills.setdefault(sheet, {})[(r, c)] = (rows, cols)
+        return data[0][0]
+
+    def spill_map(self, sheet, r=MAX_ROWS - 1, c=MAX_COLS - 1):
+        """{(r, c): (value, anchor)} of the cells of `sheet` dynamic arrays spill into, with every array
+        that could reach (r, c) worked out first."""
+        if sheet not in self._spill_ready:
+            top = not self._evaluating
+            for ar, ac in self._spill_candidates(sheet):
+                if not top and ar > r:
+                    break
+                if (top or ac <= c) and (sheet, ar, ac) not in self._evaluating:
+                    if top:
+                        self.get_value(sheet, ar, ac)
+                    else:
+                        self._tentative(sheet, ar, ac)
+            if top:
+                self._spill_ready.add(sheet)
+        return self._spilled.get(sheet, _NO_SPILLS)
+
+    def _tentative(self, sheet, r, c):
+        """Work out formula (r, c) in the middle of another calculation, to learn where it spills. When it
+        needs a cell still being calculated, what it worked out is forgotten (Excel's dependency order
+        would have done it later), instead of keeping a circular-reference error."""
+        if (sheet, r, c) in self._cache:
+            return
+        journal, outer, blocked = self._journal, self._outer, self._blocked
+        self._journal, self._blocked = [], False
+        if journal is None:
+            self._outer = frozenset(self._evaluating)
+        try:
+            self.get_value(sheet, r, c)
+        finally:
+            added, failed = self._journal, self._blocked
+            self._journal, self._outer, self._blocked = journal, outer, blocked or failed
+            if failed:
+                for key in added:
+                    self._cache.pop(key, None)
+                    area = self._spills.get(key[0], {}).pop(key[1:], None)
+                    if area:
+                        spilled = self._spilled[key[0]]
+                        for k in itertools.product(range(key[1], key[1] + area[0]), range(key[2], key[2] + area[1])):
+                            spilled.pop(k, None)
+            elif journal is not None:
+                journal.extend(added)
+
+    def _spill_candidates(self, sheet):
+        """Formula cells of `sheet` that can give an array, top to bottom."""
+        cells = self.sheets[sheet].cells
+        hit = self._candidates.get(sheet)
+        if hit is None or hit[0] != (id(cells), cells.version):
+            found = sorted(k for k in cells.formulas() if _may_array(cells[k]))
+            hit = self._candidates[sheet] = ((id(cells), cells.version), found)
+        return hit[1]
+
+    def spill_areas(self, sheet):
+        """{anchor (r, c): (r1, c1, r2, c2)} of the dynamic arrays of `sheet` that spill."""
+        self.spill_map(sheet)
+        return {(r, c): (r, c, r + h - 1, c + w - 1) for (r, c), (h, w) in self._spills.get(sheet, {}).items()}
+
+    def spill_anchor(self, sheet, r, c):
+        """(row, col) of the formula whose array covers cell (r, c) - the cell itself for that formula -
+        or None."""
+        hit = self.spill_map(sheet).get((r, c))
+        if hit:
+            return hit[1]
+        return (r, c) if (r, c) in self._spills.get(sheet, ()) else None
+
+    def spill_range(self, sheet, r, c):
+        """(r1, c1, r2, c2) of the array that cell (r, c) belongs to, or None."""
+        anchor = self.spill_anchor(sheet, r, c)
+        if anchor is None:
+            return None
+        rows, cols = self._spills[sheet][anchor]
+        return anchor[0], anchor[1], anchor[0] + rows - 1, anchor[1] + cols - 1
+
+    def _spill_ref(self, sheet_ref, home, r, c):
+        """A1#: the range A1's dynamic array fills."""
+        name = home if sheet_ref is None else self.resolve_sheet(sheet_ref)
+        if name is None or not (0 <= r < MAX_ROWS and 0 <= c < MAX_COLS):
+            raise CellError(REF)
+        value = self.get_value(name, r, c)
+        area = self._spills.get(name, {}).get((r, c))
+        if area is None:
+            raise CellError(value.code if isinstance(value, CellError) else REF)
+        return RangeRef(self, name, r, c, r + area[0] - 1, c + area[1] - 1)
 
     def cell_display(self, sheet, r, c):
         """(value, number format) used to draw a cell."""
@@ -3124,15 +4104,28 @@ class Workbook:
         if kind == "range":
             return self._range(node[1], sheet, *node[2:])
         if kind == "bin":
-            return binary_op(node[1], scalar(self._eval(node[2], sheet)), scalar(self._eval(node[3], sheet)))
-        if kind == "neg":
-            return -to_number(scalar(self._eval(node[1], sheet)))
-        if kind == "pct":
-            return to_number(scalar(self._eval(node[1], sheet))) / 100
+            a, b = self._eval(node[2], sheet), self._eval(node[3], sheet)
+            if is_array(a) or is_array(b):  # =A1:A5*2: item by item
+                op = node[1]
+                return _elementwise(lambda x, y: binary_op(op, x, y), a, b)
+            return binary_op(node[1], scalar(a), scalar(b))
+        if kind in ("neg", "pct"):
+            a = self._eval(node[1], sheet)
+            op = (lambda x: -to_number(x)) if kind == "neg" else (lambda x: to_number(x) / 100)
+            return _elementwise(op, a) if is_array(a) else op(scalar(a))
         if kind == "func":
             return self._call(node[1], node[2], sheet)
         if kind == "name":
+            for scope in reversed(self._scopes):  # LET and LAMBDA names first
+                if node[1] in scope:
+                    return scope[node[1]]
             return self._eval(self._name_ast(node[1]), sheet)
+        if kind == "array":
+            return Array(node[1])
+        if kind == "spill":
+            return self._spill_ref(node[1], sheet, node[2], node[3])
+        if kind == "call":
+            return self._apply(self._eval(node[1], sheet), [self._eval(n, sheet) for n in node[2]])
         if kind == "err":
             raise CellError(node[1])
         if kind == "empty":
@@ -3151,8 +4144,13 @@ class Workbook:
         if lazy is not None:
             return lazy(self, nodes, sheet)
         func = _FUNCS.get(name)
-        if func is None:
-            raise CellError(NAME)
+        if func is None:  # a LAMBDA given a name by LET or the Name Manager
+            target = next((scope[name] for scope in reversed(self._scopes) if name in scope), None)
+            if target is None and name in self.names:
+                target = self._eval(self._name_ast(name), sheet)
+            if not isinstance(target, Lambda):
+                raise CellError(NAME)
+            return self._apply(target, [self._eval(n, sheet) for n in nodes])
         args = []
         for node in nodes:
             value = self._eval(node, sheet)
@@ -3160,17 +4158,15 @@ class Workbook:
                 args.extend(value)
             else:
                 args.append(value)
-        try:
-            result = func(*args)
-        except CellError:
-            raise
-        except TypeError:  # wrong number of arguments
-            raise CellError(VALUE) from None
-        except ZeroDivisionError:
-            raise CellError(DIV0) from None
-        except (ValueError, OverflowError, InvalidOperation, statistics.StatisticsError):
-            raise CellError(NUM) from None
-        return _finite(result)
+        if name in _LIFTED and any(map(is_array, args)):  # =LEN(A2:A9): one result per item
+            return _elementwise(func, *args)
+        return _safely(func, args)
+
+    def _apply(self, target, args):
+        """Call a LAMBDA with argument values."""
+        if not isinstance(target, Lambda):
+            raise CellError(VALUE)
+        return target(*args)
 
     def evaluate(self, text, sheet):
         """Value of a literal or '=formula' outside any cell (conditional-format operands)."""
@@ -4367,7 +5363,7 @@ def _raw_from_xlsx(cell):
         return number_text((v.hour * 3600 + v.minute * 60 + v.second) / 86400)
     text = str(getattr(v, "text", v))  # ArrayFormula objects keep the formula in .text
     if cell.data_type == "f" and is_formula(text):
-        return normalize_formula(text.replace("_xlfn.", "").replace("_xlws.", ""))
+        return formula_from_file(text)
     return _raw_text(text)
 
 
@@ -5012,7 +6008,7 @@ class XlsxCells:
         if self.raw_strings is None:
             self.raw_strings = [_raw_text(s) for s in self.strings]
         strings, raw_strings = self.strings, self.raw_strings
-        letters, shared, texts, fmts = {}, {}, {}, {}
+        letters, shared, texts, fmts, arrays = {}, {}, {}, {}, []
         row = col = 0
         for m in _SHEET_ITEM.finditer(body):
             row_attrs, key, row_text, s, kind, inner, attrs, inner2 = m.groups()
@@ -5068,7 +6064,7 @@ class XlsxCells:
                         if len(texts) < 200000:  # repeated words ("Kho A") are worked out once
                             texts[text] = raw
                 else:
-                    raw = self._general(inner, kind, pos, shared, strings)
+                    raw = self._general(inner, kind, pos, shared, strings, arrays)
             except (IndexError, KeyError, ValueError, OverflowError):
                 raw = None
             if raw:
@@ -5080,6 +6076,7 @@ class XlsxCells:
                     fmt = fmts[fk] = style_fmt(int(s), kind in ("n", "d"))
                 if fmt:
                     formats[pos] = fmt
+        _drop_spilled(cells, arrays)
         return cells, formats, rows
 
     @staticmethod
@@ -5100,12 +6097,15 @@ class XlsxCells:
         number = float(value)
         return number_text(int(number) if number.is_integer() and abs(number) < 1e15 else number)
 
-    def _general(self, inner, kind, pos, shared, strings):
-        """A cell with a formula, rich text or other less usual content."""
+    def _general(self, inner, kind, pos, shared, strings, arrays):
+        """A cell with a formula, rich text or other less usual content. Array formulas add (cell, ref) to
+        `arrays`."""
         f = _CELL_F.search(inner) if "<f" in inner else None
         if f is not None:
             fa = dict(_XML_ATTR.findall(f.group(1)))
             text = _xml_text(f.group(2) or "")
+            if fa.get("t") == "array" and fa.get("ref"):
+                arrays.append((pos, fa["ref"]))
             if fa.get("t") == "shared" and "si" in fa:
                 if text:
                     shared[fa["si"]] = (pos, text)
@@ -5113,9 +6113,22 @@ class XlsxCells:
                     (r0, c0), master = shared[fa["si"]]
                     text = shift_formula("=" + master, pos[0] - r0, pos[1] - c0)[1:]
             if text:
-                return normalize_formula("=" + text.replace("_xlfn.", "").replace("_xlws.", ""))
+                return formula_from_file(text)
         v = _CELL_V.search(inner) if "<v" in inner else None
         return self._value(kind, v.group(1) if v else None, inner, strings)
+
+
+def _drop_spilled(cells, arrays):
+    """The values Excel saved in the rest of each array formula's range (what it spilled, or the cells of an
+    old Ctrl+Shift+Enter formula) go: the formula in the first cell spills them again."""
+    for (r0, c0), ref in arrays:
+        rect = parse_range(ref.replace("$", ""))
+        if not rect or (r0, c0) != rect[:2] or (rect[2] - r0 + 1) * (rect[3] - c0 + 1) > 1000000:
+            continue
+        for r in range(r0, min(rect[2], MAX_ROWS - 1) + 1):
+            for c in range(c0, min(rect[3], MAX_COLS - 1) + 1):
+                if (r, c) != (r0, c0) and not is_formula(cells.get((r, c))):
+                    cells.pop((r, c), None)
 
 
 def _style_formatter(book, ws):
@@ -5169,7 +6182,7 @@ def _load_xlsx(path):
                 max_row=min(ws.max_row, MAX_ROWS), max_col=min(ws.max_column, MAX_COLS)) for cell in row)
         if fast is None or ws.title not in fast.data:
             cells, formats, cells_from_book = {}, {}, True
-        styles = {}
+        styles, arrays = {}, []
         for (row, col), cell in items:
             if row > MAX_ROWS or col > MAX_COLS:
                 continue
@@ -5182,6 +6195,8 @@ def _load_xlsx(path):
                 continue
             try:
                 raw = _raw_from_xlsx(cell)
+                if getattr(cell.value, "ref", None):  # an ArrayFormula
+                    arrays.append((pos, str(cell.value.ref)))
                 fmt = None
                 if cell.has_style:  # cells sharing a style share one format dict (formats are never edited in place)
                     key = (tuple(cell._style), cell.data_type)
@@ -5200,6 +6215,7 @@ def _load_xlsx(path):
                 link = _link_from_xlsx(cell.hyperlink)
                 if link:
                     sh.links[pos] = link
+        _drop_spilled(cells, arrays)
         sh.cells, sh.formats = cells, formats
         for key, dim in ws.column_dimensions.items():
             lo = dim.min or (col_index(key) + 1 if re.fullmatch(r"[A-Z]{1,3}", key) else None)
@@ -5380,7 +6396,7 @@ def _xl_cell_value(raw, fmt):
     if fmt.get("num") == "@":
         return (raw[1:] if raw.startswith("'") else raw), None, True
     if raw[:1] == "=" and len(raw) > 1:
-        return raw, None, False
+        return file_formula(raw), None, False
     if not _MAYBE_LITERAL.search(raw):  # words: nothing to read as a number or date
         return raw, None, True
     if raw.isdigit() and raw.isascii() and (raw[0] != "0" or raw == "0") and len(raw) < 16:
@@ -5423,7 +6439,7 @@ def _xml_escape(s):
     return s
 
 
-def _sheet_data_xml(sh, ws, book):
+def _sheet_data_xml(sh, ws, book, arrays=_NO_SPILLS):
     """(<sheetData> XML, dimension ref) of a sheet's cells and row settings, with the styles registered in
     the openpyxl book so they land in styles.xml (openpyxl would build an object for every cell)."""
     from openpyxl.cell.cell import Cell
@@ -5483,7 +6499,11 @@ def _sheet_data_xml(sh, ws, book):
             elif isinstance(value, bool):
                 out.append(f'<c r="{ref}"{s} t="b"><v>{int(value)}</v></c>')
             elif isinstance(value, str):  # a formula
-                out.append(f'<c r="{ref}"{s}><f>{_xml_escape(value[1:])}</f></c>')
+                if (r, c) in arrays:
+                    out.append(f'<c r="{ref}"{s} cm="1"><f t="array" ref="{range_name(*arrays[(r, c)])}">'
+                               f'{_xml_escape(value[1:])}</f></c>')
+                else:
+                    out.append(f'<c r="{ref}"{s}><f>{_xml_escape(value[1:])}</f></c>')
             else:
                 v = numbers.get(value)
                 if v is None:
@@ -5497,8 +6517,22 @@ def _sheet_data_xml(sh, ws, book):
     return "<sheetData>" + "".join(out) + "</sheetData>", dimension
 
 
-def _put_sheet_data(buffer, path, sheets):
-    """Write the .xlsx openpyxl made (in buffer) to path with the cell XML of `sheets` put in."""
+_DYNAMIC_ARRAY_METADATA = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+    'xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="1">'
+    '<metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" '
+    'splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/>'
+    '</metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}">'
+    '<xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata>'
+    '<cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>')
+_ARRAY_CELL_RE = re.compile(r'<c ((?:(?!cm=)[^>/])*)>(<f t="array")')
+
+
+def _put_sheet_data(buffer, path, sheets, dynamic=False):
+    """Write the .xlsx openpyxl made (in buffer) to path with the cell XML of `sheets` put in. With
+    `dynamic`, array formulas are marked as dynamic arrays (cm="1" and the metadata part it points to), so
+    Excel 365 spills them rather than treating them as old Ctrl+Shift+Enter formulas."""
     import zipfile
 
     with zipfile.ZipFile(buffer) as src:
@@ -5507,14 +6541,26 @@ def _put_sheet_data(buffer, path, sheets):
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as dst:
             for info in src.infolist():
                 data = src.read(info.filename)
-                if info.filename in wanted:
-                    body, dimension = wanted[info.filename]
+                if info.filename in wanted or (dynamic and info.filename in parts.values()):
                     xml = data.decode("utf-8")
-                    m = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>.*?</sheetData>", xml, re.S)
-                    xml = xml[:m.start()] + body + xml[m.end():]
-                    xml = re.sub(r'<dimension ref="[^"]*"\s*/>', f'<dimension ref="{dimension}"/>', xml, count=1)
+                    if info.filename in wanted:
+                        body, dimension = wanted[info.filename]
+                        m = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>.*?</sheetData>", xml, re.S)
+                        xml = xml[:m.start()] + body + xml[m.end():]
+                        xml = re.sub(r'<dimension ref="[^"]*"\s*/>', f'<dimension ref="{dimension}"/>', xml, count=1)
+                    if dynamic:
+                        xml = _ARRAY_CELL_RE.sub(r'<c \1 cm="1">\2', xml)
                     data = xml.encode("utf-8")
+                elif dynamic and info.filename == "[Content_Types].xml":
+                    data = data.replace(b"</Types>", b'<Override PartName="/xl/metadata.xml" ContentType="application/'
+                                        b'vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/></Types>')
+                elif dynamic and info.filename == "xl/_rels/workbook.xml.rels":
+                    data = data.replace(b"</Relationships>", b'<Relationship Id="rIdPyExcelMeta" Type="http://schemas.'
+                                        b'openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" '
+                                        b'Target="metadata.xml"/></Relationships>')
                 dst.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+            if dynamic:
+                dst.writestr("xl/metadata.xml", _DYNAMIC_ARRAY_METADATA, compress_type=zipfile.ZIP_DEFLATED)
 
 
 def _sheet_parts(z):
@@ -5541,10 +6587,18 @@ def _save_xlsx(wb, path, active=None):
     book.remove(book.active)
     from openpyxl.comments import Comment
 
-    fast_sheets = {}
+    from openpyxl.worksheet.formula import ArrayFormula
 
+    fast_sheets, dynamic = {}, False
     for sh in wb.sheets.values():
         ws = book.create_sheet(sh.name)
+        arrays = wb.spill_areas(sh.name)
+        for (r, c) in sh.cells.formulas():  # and those that work on arrays or can't spill (#SPILL!)
+            raw = sh.cells[(r, c)]
+            if (r, c) not in arrays and (_dynamic_formula(raw) or _may_array(raw) and
+                                         wb.get_value(sh.name, r, c) == CellError(SPILL)):
+                arrays[(r, c)] = (r, c, r, c)
+        dynamic = dynamic or bool(arrays)
         for (r, c), text in sh.notes.items():
             comment = Comment(text, FILE_TAG)
             comment.width, comment.height = 200, max(60, 20 * (text.count("\n") + 2))
@@ -5552,14 +6606,14 @@ def _save_xlsx(wb, path, active=None):
         for (r, c), link in sh.links.items():
             _xl_link(ws.cell(row=r + 1, column=c + 1), link)
         if len(sh.cells) + len(sh.formats) > FAST_SAVE_CELLS:  # big sheet: cell XML written directly
-            fast_sheets[ws.title] = _sheet_data_xml(sh, ws, book)
+            fast_sheets[ws.title] = _sheet_data_xml(sh, ws, book, arrays)
         else:
             for r, c in set(sh.cells) | set(sh.formats):
                 cell = ws.cell(row=r + 1, column=c + 1)
                 fmt = sh.formats.get((r, c)) or {}
                 value, implied, text = _xl_cell_value(sh.cells.get((r, c)), fmt)
                 if value is not None:
-                    cell.value = value
+                    cell.value = ArrayFormula(range_name(*arrays[(r, c)]), value) if (r, c) in arrays else value
                     if text:
                         cell.data_type = "s"
                 _xl_apply_style(cell, fmt, fmt.get("num") or implied)
@@ -5630,9 +6684,9 @@ def _save_xlsx(wb, path, active=None):
     book.active = list(wb.sheets).index(active)
     for ws in book.worksheets:  # Excel opens on the active sheet; others must not look selected
         ws.sheet_view.tabSelected = ws is book.active
-    if not fast_sheets:
+    if not fast_sheets and not dynamic:
         book.save(path)
         return
     buffer = io.BytesIO()
     book.save(buffer)
-    _put_sheet_data(buffer, path, fast_sheets)
+    _put_sheet_data(buffer, path, fast_sheets, dynamic)

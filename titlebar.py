@@ -166,7 +166,8 @@ class GlyphButton(tk.Canvas):
 class TitleBar(tk.Frame):
     """The green bar at the top of the window. `qat` and `tools` are frames for the caller's buttons."""
 
-    def __init__(self, root, ui, custom, on_close):
+    def __init__(self, root, ui, custom, on_close, window=None):
+        """window: the state of the bar this one replaces (rebuilt for another scale), see window_state."""
         super().__init__(root, bg=TAB_BAR_BG, height=ui.px(BAR_HEIGHT))
         self.root, self.ui, self.custom, self.on_close = root, ui, custom, on_close
         self.pack_propagate(False)
@@ -214,8 +215,20 @@ class TitleBar(tk.Frame):
                 edge.bind("<B1-Motion>", self._do_resize)
                 edge.bind("<ButtonRelease-1>", lambda e: setattr(self, "_resize", None))
             self._show_edges()
-            if sys.platform == "win32":
+            if window:
+                self.maximized, self._normal, self._snap = window
+                if self.maximized:
+                    self._set_maximized(True)
+            elif sys.platform == "win32":
                 root.after(10, self._fix_taskbar)
+
+    def window_state(self):
+        """What a new bar needs to carry on: maximised, the size to restore, a half-screen snap."""
+        return self.maximized, self._normal, self._snap
+
+    def busy(self):
+        """True while the window is being dragged or resized."""
+        return bool(self._drag or self._resize)
 
     # -------------------------------------------------------------- title
 
@@ -252,10 +265,10 @@ class TitleBar(tk.Frame):
             return
         x, y, w, h = work_area(self.root)
         self._normal = f"{width}x{height}+{x + max(0, (w - width) // 2)}+{y + max(0, (h - height) // 2)}"
-        if maximized:
-            self.maximize()
-        else:
-            self.root.geometry(self._normal)
+        self.root.geometry(self._normal)
+        if maximized:  # (not maximize(): the window isn't shown yet, so its geometry isn't the one to go back to)
+            self._set_maximized(True)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     def maximize(self, point=None):
         if not self.maximized and self._resize is None:
