@@ -17,6 +17,7 @@ from screens import keep_on_screen
 
 _NAME_CHARS = "._"
 _REF_RE = re.compile(r"(\$?)([A-Za-z]{1,3})(\$?)([0-9]+)")
+_LINES_RE = re.compile(r"(\$?)([A-Za-z]{1,3}):(\$?)([A-Za-z]{1,3})|(\$?)([0-9]+):(\$?)([0-9]+)")  # A:C, 3:5
 
 
 def _string_spans(text):
@@ -107,13 +108,14 @@ def _cycle(col_abs, row_abs):
             (True, False): (False, False)}[(col_abs, row_abs)]
 
 
-def _refs(text):
-    """Cell references in a formula, outside strings, not part of a name or function call."""
+def _refs(text, pattern=_REF_RE):
+    """Cell references (or whole columns and rows, with _LINES_RE) in a formula, outside strings, not part
+    of a name or function call."""
     strings = _string_spans(text)
     out = []
-    for m in _REF_RE.finditer(text):
+    for m in pattern.finditer(text):
         before, after = text[m.start() - 1:m.start()], text[m.end():m.end() + 1]
-        if (before and (before.isalnum() or before in "_.$")) or (after and (after.isalnum() or after in "_.(")):
+        if (before and (before.isalnum() or before in "_.$")) or (after and (after.isalnum() or after in "_.(!")):
             continue
         if any(a <= m.start() < b for a, b in strings):
             continue
@@ -125,11 +127,18 @@ def toggle_reference(text, pos):
     """F4: cycle the reference at or left of the cursor (both ends of a range together).
     Returns (text, cursor) or None when there is no reference there."""
     refs = _refs(text)
-    hit = next((i for i, m in enumerate(refs) if m.start() <= pos <= m.end()), None)
-    if hit is None:
-        hit = next((i for i in range(len(refs) - 1, -1, -1) if refs[i].end() <= pos), None)
-        if hit is None:
+    found = sorted(refs + _refs(text, _LINES_RE), key=lambda m: m.start())
+    m = next((m for m in found if m.start() <= pos <= m.end()), None)
+    if m is None:
+        m = next((m for m in reversed(found) if m.end() <= pos), None)
+        if m is None:
             return None
+    if m.re is _LINES_RE:  # A:C <-> $A:$C, 3:5 <-> $3:$5
+        g = 0 if m.group(2) else 4
+        sign = "" if m.group(g + 1) else "$"
+        ref = f"{sign}{m.group(g + 2)}:{sign}{m.group(g + 4)}"
+        return text[:m.start()] + ref + text[m.end():], m.start() + len(ref)
+    hit = refs.index(m)
     group = [hit]
     if hit + 1 < len(refs) and refs[hit + 1].start() == refs[hit].end() + 1 and text[refs[hit].end()] == ":":
         group.append(hit + 1)

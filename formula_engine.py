@@ -38,6 +38,7 @@ sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
 
 MAX_ROWS = 1048576  # as Excel
 MAX_COLS = 16384   # column XFD, as Excel
+MAX_TEXT = 32767   # characters a cell holds, as Excel
 DEFAULT_COL_WIDTH = 80   # pixels at 96 DPI
 DEFAULT_ROW_HEIGHT = 20  # pixels at 96 DPI
 MIN_COL_WIDTH = 12
@@ -128,6 +129,21 @@ def rect_minus(rect, cut):
     if b2 < c2:
         parts.append((top, b2 + 1, bottom, c2))
     return parts
+
+
+_LINES_RE = re.compile(r"\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})|\$?(\d+):\$?(\d+)")
+
+
+def parse_lines(text):
+    """Whole columns 'A:C' or rows '3:5' -> (r1, c1, r2, c2); None when invalid."""
+    m = _LINES_RE.fullmatch(text.strip())
+    if m is None:
+        return None
+    if m.group(1):
+        c1, c2 = sorted((col_index(m.group(1)), col_index(m.group(2))))
+        return (0, c1, MAX_ROWS - 1, c2) if c2 < MAX_COLS else None
+    r1, r2 = sorted((int(m.group(3)) - 1, int(m.group(4)) - 1))
+    return (r1, 0, r2, MAX_COLS - 1) if 0 <= r1 and r2 < MAX_ROWS else None
 
 
 def parse_address(text):
@@ -728,12 +744,15 @@ _TOKEN_RE = re.compile(rf"""
   | (?P<string>"(?:[^"]|"")*")
   | (?P<error>\#(?:DIV/0!|REF!|NAME\?|VALUE!|N/A|NUM!|CIRC!|ERROR!))
   | (?P<ref>(?:(?P<sheet>{_SHEET_PAT})!)?(?P<cabs>\$?)(?P<col>[A-Za-z]{{1,3}})(?P<rabs>\$?)(?P<row>\d+)(?![\w(]))
+  | (?P<cols>(?:(?P<csheet>{_SHEET_PAT})!)?\$?[A-Za-z]{{1,3}}:\$?[A-Za-z]{{1,3}}(?![\w(.!]))
+  | (?P<rows>(?:(?P<rsheet>{_SHEET_PAT})!)?\$?\d+:\$?\d+(?![\w(.!]))
   | (?P<number>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)
   | (?P<ident>[^\W\d][\w.]*)
   | (?P<op><>|<=|>=|[-+*/^&=<>%:(),;])
 """, re.VERBOSE)
-_TOKEN_KINDS = ("ws", "string", "error", "ref", "number", "ident", "op")
+_TOKEN_KINDS = ("ws", "string", "error", "ref", "cols", "rows", "number", "ident", "op")
 
+# One end of a reference. The ends of whole columns (A:C) have row None, those of whole rows (3:5) col None.
 RefParts = namedtuple("RefParts", "sheet_text sheet cabs col rabs row")
 
 
@@ -742,6 +761,10 @@ class Token:
 
     def __init__(self, kind, text, ref=None):
         self.kind, self.text, self.ref = kind, text, ref
+
+
+def _sheet_name(st):
+    return (st[1:-1].replace("''", "'") if st.startswith("'") else st) if st else None
 
 
 def tokenize(text):
@@ -754,9 +777,24 @@ def tokenize(text):
         ref = None
         if kind == "ref":
             st = m.group("sheet")
-            sheet = (st[1:-1].replace("''", "'") if st.startswith("'") else st) if st else None
-            ref = RefParts(st, sheet, bool(m.group("cabs")), col_index(m.group("col")),
+            ref = RefParts(st, _sheet_name(st), bool(m.group("cabs")), col_index(m.group("col")),
                            bool(m.group("rabs")), int(m.group("row")) - 1)
+        elif kind in ("cols", "rows"):  # A:C or 3:5 - two ends around a ":", as A1:C5 is
+            st = m.group(kind[0] + "sheet")
+            prefix = f"{st}!" if st else ""
+            first, last = m.group(0)[len(prefix):].split(":")
+            for i, end in enumerate((first, last)):
+                name = end.lstrip("$")
+                if kind == "cols":
+                    ref = RefParts(st, _sheet_name(st), name != end, col_index(name), False, None)
+                else:
+                    ref = RefParts(st, _sheet_name(st), False, None, name != end, int(name) - 1)
+                if i:
+                    tokens.append(Token("op", ":"))
+                    ref = ref._replace(sheet_text=None, sheet=None)
+                tokens.append(Token("ref", prefix + end if i == 0 else end, ref))
+            pos = m.end()
+            continue
         tokens.append(Token(kind, m.group(0), ref))
         pos = m.end()
     return tokens
@@ -764,7 +802,21 @@ def tokenize(text):
 
 def _format_ref(p):
     prefix = f"{p.sheet_text}!" if p.sheet_text else ""
-    return f"{prefix}{'$' if p.cabs else ''}{col_name(p.col)}{'$' if p.rabs else ''}{p.row + 1}"
+    col = "" if p.col is None else f"{'$' if p.cabs else ''}{col_name(p.col)}"
+    row = "" if p.row is None else f"{'$' if p.rabs else ''}{p.row + 1}"
+    return prefix + col + row
+
+
+def _ref_rect(p, q):
+    """(r1, c1, r2, c2) between the ends of a reference; whole columns or rows reach across the sheet."""
+    r1, r2 = (0, MAX_ROWS - 1) if p.row is None else (min(p.row, q.row), max(p.row, q.row))
+    c1, c2 = (0, MAX_COLS - 1) if p.col is None else (min(p.col, q.col), max(p.col, q.col))
+    return r1, c1, r2, c2
+
+
+def _same_shape(p, q):
+    """Whether two reference ends make a range: two cells, two columns or two rows."""
+    return (p.row is None) == (q.row is None) and (p.col is None) == (q.col is None)
 
 
 def _ref_items(tokens):
@@ -772,8 +824,8 @@ def _ref_items(tokens):
     i, n = 0, len(tokens)
     while i < n:
         t = tokens[i]
-        if (t.kind == "ref" and i + 2 < n and tokens[i + 1].kind == "op"
-                and tokens[i + 1].text == ":" and tokens[i + 2].kind == "ref"):
+        if (t.kind == "ref" and i + 2 < n and tokens[i + 1].kind == "op" and tokens[i + 1].text == ":"
+                and tokens[i + 2].kind == "ref" and _same_shape(t.ref, tokens[i + 2].ref)):
             yield ("range", t, tokens[i + 2])
             i += 3
         else:
@@ -862,8 +914,11 @@ class _Parser:
                     raise CellError(SYNTAX)
                 q = self.toks[self.pos].ref
                 self.pos += 1
-                return ("range", p.sheet, min(p.row, q.row), min(p.col, q.col),
-                        max(p.row, q.row), max(p.col, q.col))
+                if not _same_shape(p, q):  # A1:B:C
+                    raise CellError(SYNTAX)
+                return ("range", p.sheet) + _ref_rect(p, q)
+            if p.row is None or p.col is None:
+                raise CellError(SYNTAX)
             return ("ref", p.sheet, p.row, p.col)
         if t.kind == "ident":
             name = t.text.upper()
@@ -942,10 +997,10 @@ def shift_formula(raw, dr, dc):
     except CellError:
         return raw
 
-    def moved(p):
-        row = p.row if p.rabs else p.row + dr
-        col = p.col if p.cabs else p.col + dc
-        if not (0 <= row < MAX_ROWS and 0 <= col < MAX_COLS):
+    def moved(p):  # whole columns (A:A) keep their rows, whole rows their columns
+        row = p.row if p.rabs or p.row is None else p.row + dr
+        col = p.col if p.cabs or p.col is None else p.col + dc
+        if not ((row is None or 0 <= row < MAX_ROWS) and (col is None or 0 <= col < MAX_COLS)):
             return None
         return p._replace(row=row, col=col)
 
@@ -977,7 +1032,7 @@ def formula_references(text):
             refs.append((p.sheet, p.row, p.col, p.row, p.col))
         elif item[0] == "range":
             p, q = item[1].ref, item[2].ref
-            refs.append((p.sheet, min(p.row, q.row), min(p.col, q.col), max(p.row, q.row), max(p.col, q.col)))
+            refs.append((p.sheet,) + _ref_rect(p, q))
     return refs
 
 
@@ -994,10 +1049,6 @@ def _rewrite_axis(raw, home, target, axis, move, move_span, band=None):
     def idx(p):
         return p.row if axis == 0 else p.col
 
-    def in_band(p):
-        other = p.col if axis == 0 else p.row
-        return band is None or band[0] <= other <= band[1]
-
     def put(p, i):
         return p._replace(row=i) if axis == 0 else p._replace(col=i)
 
@@ -1008,7 +1059,11 @@ def _rewrite_axis(raw, home, target, axis, move, move_span, band=None):
             continue
         p = item[1].ref
         q = item[2].ref if item[0] == "range" else p
-        if (p.sheet or home).lower() != target or not (in_band(p) and in_band(q)):
+        r1, c1, r2, c2 = _ref_rect(p, q)
+        lo, hi = (c1, c2) if axis == 0 else (r1, r2)  # what it spans the other way
+        outside = band is not None and not band[0] <= lo <= hi <= band[1]
+        # whole columns (A:C) span every row, so they stay as rows move; whole rows likewise
+        if (p.sheet or home).lower() != target or outside or idx(p) is None:
             out.append(item[1].text if item[0] == "ref" else f"{item[1].text}:{item[2].text}")
         elif item[0] == "ref":
             n = move(idx(p))
@@ -1096,10 +1151,19 @@ class RangeRef:
             return None
         return self.wb.get_value(self.sheet, r, c)
 
-    def rows(self):
-        return [[self.value(i, j) for j in range(self.ncols)] for i in range(self.nrows)]
+    def used(self):
+        """(rows, cols) of the range's top-left part that can hold anything: past the sheet's last used row
+        and column every cell is empty, so walks over A:A or 1:1 stop there (nrows stays 1048576)."""
+        rows, cols = self.wb.sheets[self.sheet].cells.extent()
+        return max(0, min(self.nrows, rows - self.r1)), max(0, min(self.ncols, cols - self.c1))
+
+    def rows(self, shape=None):
+        """Values row by row of the used() part, or of the top-left `shape` (rows, cols)."""
+        h, w = shape or self.used()
+        return [[self.value(i, j) for j in range(w)] for i in range(h)]
 
     def flat(self):
+        """Values of the used() part, row by row (the cells left out are all empty)."""
         return [v for row in self.rows() for v in row]
 
     def stored(self):
@@ -1123,11 +1187,13 @@ class RangeRef:
                 yield v
 
     def line(self):
-        """Cells of a one-row or one-column range, in order; None for a 2-D block."""
+        """Cells of a one-row or one-column range in order, up to the sheet's last used row or column (the
+        rest are empty); None for a 2-D block."""
+        h, w = self.used()
         if self.ncols == 1:
-            return [self.value(i, 0) for i in range(self.nrows)]
+            return [self.value(i, 0) for i in range(h)]
         if self.nrows == 1:
-            return [self.value(0, j) for j in range(self.ncols)]
+            return [self.value(0, j) for j in range(w)]
         return None
 
     def part(self, i, by_row):
@@ -1223,11 +1289,13 @@ def _numbers(args):
             yield to_number(a)
 
 
-def _flat(args):
+def _flat(args, blanks=False):
+    """Values of the arguments: of a range the cells of its used() part, or all its cells with `blanks`."""
     for a in args:
         if isinstance(a, RangeRef):
-            for v in a.flat():
-                yield _raise_if_error(v)
+            for row in a.rows((a.nrows, a.ncols) if blanks else None):
+                for v in row:
+                    yield _raise_if_error(v)
         else:
             yield a
 
@@ -1522,10 +1590,11 @@ def _f_sumproduct(*ranges):
     shape = (ranges[0].nrows, ranges[0].ncols)
     if any((r.nrows, r.ncols) != shape for r in ranges):
         raise CellError(VALUE)
-    grids = [r.rows() for r in ranges]
+    h, w = map(max, zip(*(r.used() for r in ranges)))  # further on every product is 0
+    grids = [r.rows((h, w)) for r in ranges]
     total = 0.0
-    for i in range(shape[0]):
-        for j in range(shape[1]):
+    for i in range(h):
+        for j in range(w):
             prod = 1.0
             for g in grids:
                 v = _raise_if_error(g[i][j])
@@ -1883,10 +1952,18 @@ def _f_concat(*args):
 
 @_register("TEXTJOIN")
 def _f_textjoin(delimiter, ignore_empty, *args):
-    parts = [to_text(v) for v in _flat(args)]
-    if _bool(ignore_empty):
-        parts = [p for p in parts if p != ""]
-    return _text(delimiter).join(parts)
+    delimiter = _text(delimiter)
+    if _bool(ignore_empty) or not delimiter:  # empty cells add nothing: those past the data need no visit
+        parts = [p for p in map(to_text, _flat(args)) if p != ""]
+    else:  # each cell adds a delimiter: whole columns or rows would pass what a cell holds
+        cells = sum(a.nrows * a.ncols if isinstance(a, RangeRef) else 1 for a in args)
+        if (cells - 1) * len(delimiter) > MAX_TEXT:
+            raise CellError(VALUE)
+        parts = [to_text(v) for v in _flat(args, blanks=True)]
+    text = delimiter.join(parts)
+    if len(text) > MAX_TEXT:
+        raise CellError(VALUE)
+    return text
 
 
 @_register("LEN")
@@ -1967,7 +2044,7 @@ def _f_replace(x, start, n, new):
 @_register("REPT")
 def _f_rept(x, n):
     n, s = _int(n), _text(x)
-    if n < 0 or len(s) * n > 32767:
+    if n < 0 or len(s) * n > MAX_TEXT:
         raise CellError(VALUE)
     return s * n
 
@@ -2257,7 +2334,7 @@ def _f_vlookup(key, table, col, approx=True):
         raise CellError(VALUE)
     if ci > table.ncols:
         raise CellError(REF)
-    i = _match_index([table.value(r, 0) for r in range(table.nrows)], scalar(key), 1 if _bool(approx) else 0)
+    i = _match_index(table.part(0, False).line(), scalar(key), 1 if _bool(approx) else 0)
     return _raise_if_error(table.value(i, ci - 1))
 
 
@@ -2268,7 +2345,7 @@ def _f_hlookup(key, table, row, approx=True):
         raise CellError(VALUE)
     if ri > table.nrows:
         raise CellError(REF)
-    j = _match_index([table.value(0, c) for c in range(table.ncols)], scalar(key), 1 if _bool(approx) else 0)
+    j = _match_index(table.part(0, True).line(), scalar(key), 1 if _bool(approx) else 0)
     return _raise_if_error(table.value(ri - 1, j))
 
 
@@ -2290,7 +2367,7 @@ def _f_match(key, rng, mode=1):
     if rng.nrows != 1 and rng.ncols != 1:
         raise CellError(NA)
     m = _int(mode)
-    return _match_index(rng.flat(), scalar(key), (m > 0) - (m < 0)) + 1
+    return _match_index(rng.line(), scalar(key), (m > 0) - (m < 0)) + 1
 
 
 def _wildcard_re(text):
@@ -2342,7 +2419,7 @@ def _f_xlookup(wb, nodes, sheet):
     result = _range_arg(wb._eval(nodes[2], sheet))
     items = look.line()
     by_row = look.ncols == 1
-    if items is None or (result.nrows if by_row else result.ncols) != len(items):
+    if items is None or (result.nrows != look.nrows if by_row else result.ncols != look.ncols):
         raise CellError(VALUE)
     match_mode = _optional_int(wb, nodes, 4, sheet, 0)
     search_mode = _optional_int(wb, nodes, 5, sheet, 1)
@@ -2397,7 +2474,7 @@ def _f_indirect(wb, nodes, sheet):
         if len(sheet_ref) >= 2 and sheet_ref[0] == sheet_ref[-1] == "'":
             sheet_ref = sheet_ref[1:-1].replace("''", "'")
     if a1:
-        rect = parse_range(text)
+        rect = parse_range(text) or parse_lines(text)
     else:
         m = _R1C1_RE.fullmatch(text)
         if m:
@@ -2455,8 +2532,12 @@ def _aligned(base, rng):
     return RangeRef(rng.wb, rng.sheet, rng.r1, rng.c1, rng.r1 + base.nrows - 1, rng.c1 + base.ncols - 1)
 
 
-def _matching_cells(pairs):
-    """(first range, positions) where every (range, criteria) pair matches."""
+def _matching_cells(pairs, target=None):
+    """(range to aggregate, positions where every (range, criteria) pair matches, how many more match
+    beyond them). The range aggregated is `target` resized like the first range, or the first range.
+
+    Only the part of the ranges that can hold anything is visited (A:A on a sheet of 2000 rows): past it
+    every cell is empty, so the positions there all match or all don't, and hold nothing to add up."""
     if not pairs or len(pairs) % 2:
         raise CellError(VALUE)
     ranges = [_range_arg(pairs[i]) for i in range(0, len(pairs), 2)]
@@ -2464,9 +2545,11 @@ def _matching_cells(pairs):
     shape = (ranges[0].nrows, ranges[0].ncols)
     if any((r.nrows, r.ncols) != shape for r in ranges):
         raise CellError(VALUE)
-    hits = [(i, j) for i in range(shape[0]) for j in range(shape[1])
-            if all(p(r.value(i, j)) for r, p in zip(ranges, preds))]
-    return ranges[0], hits
+    target = ranges[0] if target is None else _aligned(ranges[0], _range_arg(target))
+    h, w = map(max, zip(*(r.used() for r in ranges + [target])))
+    hits = [(i, j) for i in range(h) for j in range(w) if all(p(r.value(i, j)) for r, p in zip(ranges, preds))]
+    more = shape[0] * shape[1] - h * w if all(p(None) for p in preds) else 0
+    return target, hits, more
 
 
 def _numbers_at(rng, positions):
@@ -2478,31 +2561,31 @@ def _numbers_at(rng, positions):
 
 @_register("COUNTIF")
 def _f_countif(rng, crit):
-    return len(_matching_cells((rng, crit))[1])
+    _, hits, more = _matching_cells((rng, crit))
+    return len(hits) + more
 
 
 @_register("COUNTIFS")
 def _f_countifs(*pairs):
-    return len(_matching_cells(pairs)[1])
+    _, hits, more = _matching_cells(pairs)
+    return len(hits) + more
 
 
 @_register("SUMIF")
 def _f_sumif(rng, crit, sum_rng=None):
-    base, hits = _matching_cells((rng, crit))
-    target = _aligned(base, _range_arg(sum_rng)) if sum_rng is not None else base
+    target, hits, _ = _matching_cells((rng, crit), sum_rng)
     return math.fsum(_numbers_at(target, hits))
 
 
 @_register("SUMIFS")
 def _f_sumifs(sum_rng, *pairs):
-    base, hits = _matching_cells(pairs)
-    return math.fsum(_numbers_at(_aligned(base, _range_arg(sum_rng)), hits))
+    target, hits, _ = _matching_cells(pairs, sum_rng)
+    return math.fsum(_numbers_at(target, hits))
 
 
 @_register("AVERAGEIF")
 def _f_averageif(rng, crit, avg_rng=None):
-    base, hits = _matching_cells((rng, crit))
-    target = _aligned(base, _range_arg(avg_rng)) if avg_rng is not None else base
+    target, hits, _ = _matching_cells((rng, crit), avg_rng)
     nums = list(_numbers_at(target, hits))
     if not nums:
         raise CellError(DIV0)
@@ -2511,8 +2594,8 @@ def _f_averageif(rng, crit, avg_rng=None):
 
 @_register("AVERAGEIFS")
 def _f_averageifs(avg_rng, *pairs):
-    base, hits = _matching_cells(pairs)
-    nums = list(_numbers_at(_aligned(base, _range_arg(avg_rng)), hits))
+    target, hits, _ = _matching_cells(pairs, avg_rng)
+    nums = list(_numbers_at(target, hits))
     if not nums:
         raise CellError(DIV0)
     return math.fsum(nums) / len(nums)
@@ -2520,14 +2603,14 @@ def _f_averageifs(avg_rng, *pairs):
 
 @_register("MAXIFS")
 def _f_maxifs(max_rng, *pairs):
-    base, hits = _matching_cells(pairs)
-    return max(_numbers_at(_aligned(base, _range_arg(max_rng)), hits), default=0.0)
+    target, hits, _ = _matching_cells(pairs, max_rng)
+    return max(_numbers_at(target, hits), default=0.0)
 
 
 @_register("MINIFS")
 def _f_minifs(min_rng, *pairs):
-    base, hits = _matching_cells(pairs)
-    return min(_numbers_at(_aligned(base, _range_arg(min_rng)), hits), default=0.0)
+    target, hits, _ = _matching_cells(pairs, min_rng)
+    return min(_numbers_at(target, hits), default=0.0)
 
 
 # ------------------------------------------------------------------ AutoFilter criteria
@@ -3338,9 +3421,8 @@ class Workbook:
         if not is_formula(source):
             return [item.strip() for item in re.split(r"[,;]", source) if item.strip()]
         value = self._rule_eval(sheet, rule, source, r, c)
-        if isinstance(value, RangeRef):
-            texts = (self.display_text(value.sheet, rr, cc) for rr in range(value.r1, value.r2 + 1)
-                     for cc in range(value.c1, value.c2 + 1))
+        if isinstance(value, RangeRef):  # only cells holding something show text (=Sheet2!$A:$A)
+            texts = (self.display_text(value.sheet, rr, cc) for rr, cc in value.stored())
             return [t for t in texts if t != ""]
         return [] if value is None or isinstance(value, CellError) else [to_text(value)]
 

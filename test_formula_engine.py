@@ -1838,5 +1838,166 @@ class ThreeDReferenceTests(unittest.TestCase):
         self.assertEqual(val(wb, "U3", "BH"), 6)
         self.assertEqual(fe.shift_formula("=SUM(BH:ボルト!Q5:Q50000)", 1, 0), "=SUM(BH:ボルト!Q6:Q50001)")
 
+
+class WholeColumnTests(unittest.TestCase):
+    """A:A, $A:$C, Sheet2!A:D (whole columns) and 1:1, 3:5 (whole rows), as in Excel."""
+
+    def build(self):
+        wb = Workbook(("Sheet1", "Sheet2"))
+        make({"A1": "10", "A2": "20", "A3": "x", "A4": "30", "B1": "1", "C1": "2", "D1": "abc", "B2": "5"}, wb=wb)
+        for i, (fruit, price) in enumerate((("táo", 1), ("lê", 2), ("sung", 3)), 1):
+            make({f"A{i}": fruit, f"B{i}": str(price), f"D{i}": str(price * 10)}, sheet="Sheet2", wb=wb)
+        return wb
+
+    def test_parse(self):
+        top, right = fe.MAX_ROWS - 1, fe.MAX_COLS - 1
+        for formula, node in (("=A:A", ("range", None, 0, 0, top, 0)), ("=$C:a", ("range", None, 0, 0, top, 2)),
+                              ("=Sheet2!A:D", ("range", "Sheet2", 0, 0, top, 3)),
+                              ("='Bảng 1'!$B:$B", ("range", "Bảng 1", 0, 1, top, 1)),
+                              ("=BH:ボルト!A:A", ("range", "BH:ボルト", 0, 0, top, 0)),
+                              ("=BH:CD", ("range", None, 0, 59, top, 81)), ("=BH:CD!A1", ("ref", "BH:CD", 0, 0)),
+                              ("=1:1", ("range", None, 0, 0, 0, right)), ("=$5:3", ("range", None, 2, 0, 4, right)),
+                              ("=Sheet2!1:3", ("range", "Sheet2", 0, 0, 2, right))):
+            self.assertEqual(fe.parse_formula(formula), node, formula)
+        for formula in ("=A1:B:C", "=SUM(A:B1)", "=SUM(A1:3)", "=A:"):
+            self.assertEqual(fe.parse_formula(formula), ("err", fe.SYNTAX), formula)
+        self.assertEqual(fe.parse_formula("=Tax*2")[1:3], ("*", ("name", "TAX")))  # names stay names
+        self.assertEqual(fe.normalize_formula("=sum(sheet2!$a:b;2:$3"), "=SUM(sheet2!$A:B,2:$3)")
+        self.assertEqual(fe.formula_references("=VLOOKUP(A1,Sheet2!A:D,2,0)+SUM(3:5)"),
+                         [(None, 0, 0, 0, 0), ("Sheet2", 0, 0, top, 3), (None, 2, 0, 4, right)])
+        self.assertEqual(fe.parse_lines("$B:a"), (0, 0, top, 1))
+        self.assertEqual(fe.parse_lines("7:7"), (6, 0, 6, right))
+        self.assertIsNone(fe.parse_lines("0:2"))
+
+    def test_functions(self):
+        wb = self.build()
+        wb.define_name("Giá", "=Sheet2!$B:$B")
+        self.assertEqual(wb.name_target("giá"), ("Sheet2", (0, 1, fe.MAX_ROWS - 1, 1)))
+        for formula, expected in (
+                ("=SUM(A:A)", 60), ("=COUNT(A:A)", 3), ("=COUNTA(A:A)", 4), ("=AVERAGE($A:$A)", 20),
+                ("=MAX(A:B)", 30), ("=SUM(1:1)", 13), ("=COUNT(1:1)", 3), ("=SUM(1:2)", 38),
+                ("=COUNTBLANK(A:A)", fe.MAX_ROWS - 4), ("=ROWS(A:A)", fe.MAX_ROWS), ("=COLUMNS(A:C)", 3),
+                ("=ROWS(3:5)", 3), ("=COLUMNS(1:1)", fe.MAX_COLS),
+                ('=VLOOKUP("lê",Sheet2!A:D,4,0)', 20), ('=VLOOKUP("sung",Sheet2!$A:$D,2,FALSE)', 3),
+                ('=MATCH(30,A:A,0)', 4), ('=MATCH(2,1:1,0)', 3), ('=MATCH("sung",Sheet2!A:A,0)', 3),
+                ("=INDEX(A:A,4)", 30), ("=INDEX(Sheet2!A:D,3,4)", 30), ("=INDEX(1:1,4)", "abc"),
+                ("=HLOOKUP(1,1:2,2,0)", 5), ('=XLOOKUP("lê",Sheet2!A:A,Sheet2!D:D)', 20),
+                ('=XMATCH("sung",Sheet2!A:A)', 3), ("=SUMPRODUCT(A:A,B:B)", 110),
+                ('=COUNTIF(A:A,">15")', 2), ('=COUNTIF(A:A,"")', fe.MAX_ROWS - 4),
+                ('=COUNTIF(A:A,"<>x")', fe.MAX_ROWS - 1), ('=COUNTIFS(A:A,"",B:B,"")', fe.MAX_ROWS - 4),
+                ('=COUNTIF(1:1,">1")', 2), ('=SUMIF(Sheet2!A:A,"sung",Sheet2!B:B)', 3),
+                ('=SUMIF(Sheet2!D:D,"<>",B:B)', 6), ('=SUMIFS(Sheet2!D:D,Sheet2!B:B,">1")', 50),
+                ('=AVERAGEIF(A:A,">0")', 20), ('=MAXIFS(A:A,A:A,"<25")', 20), ("=SUBTOTAL(9,A:A)", 60),
+                ("=LARGE(A:A,2)", 20), ("=CONCAT(D:D)", "abc"), ('=TEXTJOIN("-",TRUE,A:A)', "10-20-x-30"),
+                ('=TEXTJOIN("",FALSE,A:A)', "1020x30"), ('=TEXTJOIN("-",FALSE,A1:A5)', "10-20-x-30-"),
+                ('=SUM(INDIRECT("A:A"))', 60), ('=SUM(INDIRECT("Sheet2!B:B"))', 6),
+                ("=SUM(OFFSET(A:A,0,1))", 6), ("=SUM(Sheet1:Sheet2!B:B)", 12), ("=SUM(Giá)", 6)):
+            make({"H200": formula}, wb=wb)
+            self.assertEqual(val(wb, "H200"), expected, formula)
+        for formula, code in (('=VLOOKUP("mận",Sheet2!A:D,2,0)', fe.NA), ("=VLOOKUP(1,A:B,3,0)", fe.REF),
+                              ('=TEXTJOIN(",",FALSE,A:A)', fe.VALUE), ("=SUMPRODUCT(A:A,1:1)", fe.VALUE),
+                              ('=XLOOKUP(1,A:A,1:1)', fe.VALUE), ("=SUM(XFE:XFE)", fe.REF)):
+            make({"H200": formula}, wb=wb)
+            self.assertEqual(val(wb, "H200").code, code, formula)
+
+    def test_three_d(self):
+        wb = Workbook(("BH", "形鋼", "ボルト"))
+        for i, name in enumerate(wb.sheets, 1):
+            make({"Q5": str(i), "Q9": "2", "A3": "1"}, sheet=name, wb=wb)
+        make({"U10": "=SUM(BH:ボルト!Q:Q)", "U11": "=COUNT(BH:形鋼!3:3)", "U12": "=SUM('BH:ボルト'!$Q:$Q)"},
+             sheet="BH", wb=wb)
+        self.assertEqual([val(wb, a, "BH") for a in ("U10", "U11", "U12")], [12, 2, 12])
+
+    def test_shift_and_rewrite(self):
+        self.assertEqual(fe.shift_formula("=SUM(A:A)+SUM(1:1)", 3, 2), "=SUM(C:C)+SUM(4:4)")
+        self.assertEqual(fe.shift_formula("=VLOOKUP(A1,Sheet2!$A:D,2,0)", 1, 1), "=VLOOKUP(B2,Sheet2!$A:E,2,0)")
+        self.assertEqual(fe.shift_formula("=SUM($2:3)", 5, 5), "=SUM($2:8)")
+        self.assertEqual(fe.shift_formula("=SUM(BH:ボルト!A:A)", 1, 1), "=SUM(BH:ボルト!B:B)")
+        self.assertEqual(fe.shift_formula("=SUM(A:A)", 0, -1), "=SUM(#REF!)")
+        self.assertEqual(fe.shift_formula("=SUM(1048576:1048576)", 1, 0), "=SUM(#REF!)")
+        wb = make({"A1": "1", "A2": "2", "B1": "10", "H10": "=SUM(A:A)", "H11": "=SUM(B:C)", "H12": "=SUM(1:2)",
+                   "H13": "=SUM(Sheet1!$A:$A)"})
+
+        def formulas():
+            cells = wb.sheets["Sheet1"].cells
+            return [cells[k] for k in sorted(cells) if cells[k].startswith("=")]
+
+        def values():
+            return [wb.get_value("Sheet1", *k) for k in sorted(wb.sheets["Sheet1"].cells) if k[1] > 2]
+
+        wb.insert_rows("Sheet1", 0)  # rows move: whole columns stay
+        self.assertEqual(formulas(), ["=SUM(A:A)", "=SUM(B:C)", "=SUM(2:3)", "=SUM(Sheet1!$A:$A)"])
+        wb.insert_cols("Sheet1", 1)  # a column inserted before B:C, then one inside it
+        wb.insert_cols("Sheet1", 3)
+        self.assertEqual(formulas(), ["=SUM(A:A)", "=SUM(C:E)", "=SUM(2:3)", "=SUM(Sheet1!$A:$A)"])
+        self.assertEqual(values(), [3, 10, 13, 3])
+        wb.delete_rows("Sheet1", 1, 2)  # rows 2:3 are gone
+        self.assertEqual(formulas(), ["=SUM(A:A)", "=SUM(C:E)", "=SUM(#REF!)", "=SUM(Sheet1!$A:$A)"])
+        wb.delete_cols("Sheet1", 0)  # column A is gone, then column C of B:D
+        self.assertEqual(formulas(), ["=SUM(#REF!)", "=SUM(B:D)", "=SUM(#REF!)", "=SUM(#REF!)"])
+        wb.delete_cols("Sheet1", 2)
+        self.assertEqual(formulas()[1], "=SUM(B:C)")
+        wb = make({"A1": "1", "B1": "2", "D1": "=SUM(A:A)+SUM(1:1)"})
+        wb.insert_cells("Sheet1", 0, 0, 0, 0, "down")  # cells moved within a column or row: the lines stay
+        wb.insert_cells("Sheet1", 0, 0, 0, 0, "right")
+        self.assertEqual(wb.get_raw("Sheet1", 0, 4), "=SUM(A:A)+SUM(1:1)")
+
+    def test_rename_and_files(self):
+        wb = self.build()
+        make({"F1": '=VLOOKUP("lê",Sheet2!A:D,4,0)', "F2": "=SUM(Sheet2!1:2)+SUM(A:A)"}, wb=wb)
+        wb.rename_sheet("Sheet2", "Bảng giá")
+        self.assertEqual(wb.get_raw("Sheet1", 0, 5), "=VLOOKUP(\"lê\",'Bảng giá'!A:D,4,0)")
+        self.assertEqual(wb.get_raw("Sheet1", 1, 5), "=SUM('Bảng giá'!1:2)+SUM(A:A)")
+        self.assertEqual((val(wb, "F1"), val(wb, "F2")), (20, 93))
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, fast in (("a.pyxl", False), ("b.xlsx", False), ("c.xlsx", True)):  # c: PyExcel's own XML
+                if name.endswith(".xlsx") and not fe.HAS_XLSX:
+                    continue
+                path = os.path.join(tmp, name)
+                with mock.patch.object(fe, "FAST_SAVE_CELLS", 0 if fast else fe.FAST_SAVE_CELLS):
+                    fe.save_workbook(wb, path)
+                loaded = [fe.load_workbook(path)]
+                if name.endswith(".xlsx"):
+                    loaded.append(FastXlsxTests.load_with_openpyxl(path))
+                for back in loaded:
+                    self.assertEqual([back.get_raw("Sheet1", r, 5) for r in (0, 1)],
+                                     [wb.get_raw("Sheet1", r, 5) for r in (0, 1)], path)
+                    self.assertEqual((val(back, "F1"), val(back, "F2")), (20, 93), path)
+
+    def test_f4_and_highlight(self):
+        import formula_assist as fa
+        self.assertEqual(fa.toggle_reference("=SUM(A:C)", 8), ("=SUM($A:$C)", 10))
+        self.assertEqual(fa.toggle_reference("=SUM($A:$C)", 10), ("=SUM(A:C)", 8))
+        self.assertEqual(fa.toggle_reference("=VLOOKUP(B2,Sheet2!A:D,2,0)", 21)[0], "=VLOOKUP(B2,Sheet2!$A:$D,2,0)")
+        self.assertEqual(fa.toggle_reference("=VLOOKUP(B2,Sheet2!A:D,2,0)", 10)[0], "=VLOOKUP($B$2,Sheet2!A:D,2,0)")
+        self.assertEqual(fa.toggle_reference("=SUM(3:5)+1", 9)[0], "=SUM($3:$5)+1")
+        self.assertEqual(fa.toggle_reference("=SUM(A1:B2)+C:C", 15)[0], "=SUM(A1:B2)+$C:$C")
+        self.assertEqual(fa.toggle_reference("=SUM(AB:CD!A1)", 13)[0], "=SUM(AB:CD!$A$1)")  # sheets AB to CD
+        self.assertEqual(fa.toggle_reference('="A:A"&B:B', 10)[0], '="A:A"&$B:$B')
+
+    def test_speed(self):
+        """Lines of 1048576 cells are walked only as far as the sheet's data: 10000 rows x 10 columns."""
+        import time
+        wb = Workbook(("Sheet1", "Sheet2"))
+        wb.write_cells([("Sheet2", r, c, f"m{r}" if c == 0 else str(r * 10 + c), None)
+                        for r in range(10000) for c in range(10)])
+        for formula, expected in (("=SUM(Sheet2!B:B)", 499960000), ("=COUNT(Sheet2!1:1)", 9),
+                                  ('=VLOOKUP("m9999",Sheet2!A:D,3,0)', 99992), ('=MATCH("m9999",Sheet2!A:A,0)', 10000),
+                                  ('=INDEX(Sheet2!A:J,9000,2)', 89991), ('=COUNTIF(Sheet2!A:A,"m5*")', 1111),
+                                  ('=COUNTIF(Sheet2!B:B,"")', fe.MAX_ROWS - 10000),
+                                  ('=SUMIF(Sheet2!A:A,"m1*",Sheet2!B:B)', 15147071),
+                                  ("=SUMPRODUCT(Sheet2!B:B,Sheet2!C:C)", 33329833370000),
+                                  ('=XLOOKUP("m9999",Sheet2!A:A,Sheet2!C:C)', 99992)):
+            best = float("inf")
+            for _ in range(3):
+                start = time.perf_counter()
+                wb.set_raw("Sheet1", 0, 0, formula)  # any change recalculates
+                value = val(wb, "A1")
+                best = min(best, time.perf_counter() - start)
+            self.assertEqual(value, expected, formula)
+            self.assertLess(best, 0.1, formula)
+
+
 if __name__ == "__main__":
     unittest.main()
