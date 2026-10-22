@@ -313,8 +313,21 @@ _DATE_DMY_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
 _DATE_ISO_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
 
 
+_NOT_CACHED = object()
+_LITERALS = {}  # raw text -> parse_literal(raw): sheets repeat texts and numbers, and every change recalculates
+
+
 def parse_literal(raw):
     """Interpret typed (non-formula) text. Returns (value, implied number format)."""
+    hit = _LITERALS.get(raw)
+    if hit is None:
+        if len(_LITERALS) > 200000:
+            _LITERALS.clear()
+        hit = _LITERALS[raw] = _parse_literal(raw)
+    return hit
+
+
+def _parse_literal(raw):
     if raw.startswith("'"):
         return raw[1:], None
     s = raw.strip()
@@ -709,7 +722,7 @@ def blend(c1, c2, t):
 
 # ------------------------------------------------------------------ tokenizer
 
-_SHEET_PAT = r"(?:'(?:[^']|'')+'|[^\W\d][\w.]*)"
+_SHEET_PAT = r"(?:'(?:[^']|'')+'|[^\W\d][\w.]*(?::[^\W\d][\w.]*)?)"  # also Sheet1:Sheet3 (a 3-D reference)
 _TOKEN_RE = re.compile(rf"""
     (?P<ws>\s+)
   | (?P<string>"(?:[^"]|"")*")
@@ -1090,13 +1103,17 @@ class RangeRef:
         return [v for row in self.rows() for v in row]
 
     def stored(self):
-        """(row, col) of the cells holding something, row by row; on large sparse ranges only
-        stored cells are visited."""
+        """(row, col) of the cells holding something, row by row; only the part of the range within the
+        sheet's data is looked at (=SUM(A:A) or A1:A50000 on a sheet of 2000 rows), and on large sparse
+        ranges only stored cells are visited."""
         cells = self.wb.sheets[self.sheet].cells
-        if self.nrows * self.ncols <= len(cells):
-            return [(r, c) for r in range(self.r1, min(self.r2 + 1, MAX_ROWS))
-                    for c in range(self.c1, min(self.c2 + 1, MAX_COLS)) if (r, c) in cells]
-        return sorted(k for k in cells if self.r1 <= k[0] <= self.r2 and self.c1 <= k[1] <= self.c2)
+        rows, cols = cells.extent()
+        r2, c2 = min(self.r2, rows - 1), min(self.c2, cols - 1)
+        if r2 < self.r1 or c2 < self.c1:
+            return []
+        if (r2 - self.r1 + 1) * (c2 - self.c1 + 1) <= len(cells):
+            return [(r, c) for r in range(self.r1, r2 + 1) for c in range(self.c1, c2 + 1) if (r, c) in cells]
+        return sorted(k for k in cells if self.r1 <= k[0] <= r2 and self.c1 <= k[1] <= c2)
 
     def values(self):
         """Non-empty values row by row."""
@@ -1120,8 +1137,15 @@ class RangeRef:
         return RangeRef(self.wb, self.sheet, self.r1, self.c1 + i, self.r2, self.c1 + i)
 
 
+class RangeAreas(tuple):
+    """The same block on several sheets - a 3-D reference such as Sheet1:Sheet3!A1:B5 - as one RangeRef
+    per sheet; functions such as SUM get them as separate arguments, as in Excel."""
+
+
 def scalar(x):
     """Single value of an argument: a one-cell range is dereferenced, larger ones are an error."""
+    if isinstance(x, RangeAreas):
+        raise CellError(VALUE)
     if isinstance(x, RangeRef):
         if x.nrows == 1 and x.ncols == 1:
             v = x.value(0, 0)
@@ -2645,11 +2669,23 @@ class TrackedDict(dict):
     """A dict that counts its changes, so an undo copy can be reused while nothing changed (copying or
     comparing millions of cells on every command is what made big sheets slow)."""
 
-    __slots__ = ("version", "_copy", "_copy_version")
+    __slots__ = ("version", "_copy", "_copy_version", "_memo")
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
-        self.version, self._copy, self._copy_version = 0, None, -1
+        self.version, self._copy, self._copy_version, self._memo = 0, None, -1, None
+
+    def memo(self, name, compute):
+        """compute(self), remembered until the dict changes (things worked out from every entry, such as
+        the area of a big sheet's formats that prints)."""
+        hit = self._memo.get(name) if self._memo else None
+        if hit is not None and hit[0] == self.version:
+            return hit[1]
+        value = compute(self)
+        if self._memo is None:
+            self._memo = {}
+        self._memo[name] = (self.version, value)
+        return value
 
     def frozen(self):
         """A plain-dict copy of the contents, the same object until the dict changes."""
@@ -2699,15 +2735,15 @@ class TrackedDict(dict):
 
 
 class CellStore(TrackedDict):
-    """A sheet's {(row, col): raw text} that also knows how far its data reaches without scanning every
-    cell (used_extent runs on every scroll). Adding cells grows the remembered extent; removing one makes
-    it unknown until next asked."""
+    """A sheet's {(row, col): raw text} that also knows where its data starts and how far it reaches
+    without scanning every cell (used_extent runs on every scroll). Adding cells grows the remembered
+    bounds; removing one makes them unknown until next asked."""
 
-    __slots__ = ("_extent",)
+    __slots__ = ("_extent", "_first")
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
-        self._extent = None
+        self._extent = self._first = None
 
     def extent(self):
         """(rows, cols) spanned by the cells."""
@@ -2718,14 +2754,22 @@ class CellStore(TrackedDict):
                 self._extent = (max(self)[0] + 1, max(map(itemgetter(1), self)) + 1)
         return self._extent
 
+    def first(self):
+        """(first row, first column) holding a cell; None when there are none."""
+        if self._first is None and self:
+            self._first = (min(self)[0], min(map(itemgetter(1), self)))
+        return self._first
+
     def _changed(self):
         self.version += 1
-        self._extent = None
+        self._extent = self._first = None
 
     def __setitem__(self, key, value):
-        ext = self._extent
+        ext, first = self._extent, self._first
         if ext is not None and (key[0] >= ext[0] or key[1] >= ext[1]):
             self._extent = (max(ext[0], key[0] + 1), max(ext[1], key[1] + 1))
+        if first is not None and (key[0] < first[0] or key[1] < first[1]):
+            self._first = (min(first[0], key[0]), min(first[1], key[1]))
         self.version += 1
         dict.__setitem__(self, key, value)
 
@@ -2971,7 +3015,8 @@ class Workbook:
             else:
                 sh.cells.pop((r, c), None)
             if fmt:
-                sh.formats[(r, c)] = fmt  # format dicts are shared, never edited in place
+                if sh.formats.get((r, c)) is not fmt:
+                    sh.formats[(r, c)] = fmt  # format dicts are shared, never edited in place
             else:
                 sh.formats.pop((r, c), None)
             self._ast.pop((sheet, r, c), None)
@@ -3005,10 +3050,9 @@ class Workbook:
 
     def get_value(self, sheet, r, c):
         key = (sheet, r, c)
-        try:
-            return self._cache[key]
-        except KeyError:
-            pass
+        value = self._cache.get(key, _NOT_CACHED)  # not try/except: after a change nearly every lookup misses
+        if value is not _NOT_CACHED:
+            return value
         sh = self.sheets[sheet]
         raw = sh.cells.get((r, c))
         if raw is None:
@@ -3058,7 +3102,16 @@ class Workbook:
 
     def _range(self, sheet_ref, home, r1, c1, r2, c2):
         name = home if sheet_ref is None else self.resolve_sheet(sheet_ref)
-        if name is None or r1 < 0 or c1 < 0 or r2 >= MAX_ROWS or c2 >= MAX_COLS:
+        if r1 < 0 or c1 < 0 or r2 >= MAX_ROWS or c2 >= MAX_COLS:
+            raise CellError(REF)
+        if name is None and sheet_ref and ":" in sheet_ref:  # Sheet1:Sheet3!A1: the sheets from one to the other
+            first, last = (self.resolve_sheet(s) for s in sheet_ref.split(":", 1))
+            if first is None or last is None:
+                raise CellError(REF)
+            names = list(self.sheets)
+            i, j = sorted((names.index(first), names.index(last)))
+            return RangeAreas(RangeRef(self, s, r1, c1, r2, c2) for s in names[i:j + 1])
+        if name is None:
             raise CellError(REF)
         return RangeRef(self, name, r1, c1, r2, c2)
 
@@ -3100,7 +3153,13 @@ class Workbook:
         func = _FUNCS.get(name)
         if func is None:
             raise CellError(NAME)
-        args = [self._eval(n, sheet) for n in nodes]
+        args = []
+        for node in nodes:
+            value = self._eval(node, sheet)
+            if isinstance(value, RangeAreas):
+                args.extend(value)
+            else:
+                args.append(value)
         try:
             result = func(*args)
         except CellError:
@@ -4066,7 +4125,8 @@ def save_workbook(wb, path, active=None):
 # text files (.csv, .txt): reading them as Excel does
 TEXT_ENCODINGS = [("auto", "Tự động nhận"), ("utf-8", "UTF-8"), ("utf-16", "UTF-16 (Unicode)"),
                   ("cp1258", "Windows-1258 (Tiếng Việt)"), ("cp1252", "Windows-1252 (Tây Âu)"),
-                  ("tcvn3", "TCVN3 (ABC, phông .Vn...)"), ("vni", "VNI (phông VNI-...)")]
+                  ("cp932", "Shift-JIS (Tiếng Nhật)"), ("tcvn3", "TCVN3 (ABC, phông .Vn...)"),
+                  ("vni", "VNI (phông VNI-...)")]
 _VN_TONE_MARKS = re.compile("[a-zA-Z\u00c0-\u01b0][\u0300\u0301\u0303\u0309\u0323]")
 _COMBINING = re.compile("[\u0300-\u036f]")
 
@@ -4106,16 +4166,36 @@ def decode_text(data, encoding="auto"):
             try:
                 encoding, text = "utf-8", data.decode("utf-8")
             except UnicodeDecodeError:
-                vietnamese = data.decode("cp1258", errors="replace")
-                ansi = ansi_code_page()
-                encoding = "cp1258" if _VN_TONE_MARKS.search(vietnamese) or ansi == "cp1258" else ansi
-                try:
-                    text = vietnamese if encoding == "cp1258" else data.decode(encoding)
-                except (UnicodeDecodeError, LookupError):
-                    encoding, text = "cp1252", data.decode("cp1252", errors="replace")
+                text, encoding = _decode_ansi(data)
     if _COMBINING.search(text):
         text = unicodedata.normalize("NFC", text)
     return text, encoding
+
+
+_DBCS_CODE_PAGES = ("cp932", "cp936", "cp949", "cp950")  # Japanese, Chinese, Korean Windows
+_PRIVATE_USE = re.compile("[\ue000-\uf8ff]")
+
+
+def _decode_ansi(data):
+    """(text, encoding) of a file in a Windows ANSI code page. On a Japanese, Chinese or Korean Windows its
+    two-byte code page comes first: text that reads in it cleanly is not Vietnamese (half-width katakana
+    such as ﾃﾞ look like a letter with a tone mark in Windows-1258), while Vietnamese read that way breaks
+    or lands in the user-defined area (ư, ơ, đ)."""
+    ansi = ansi_code_page()
+    if ansi in _DBCS_CODE_PAGES:
+        try:
+            text = data.decode(ansi)
+            if not _PRIVATE_USE.search(text):
+                return text, ansi
+        except (UnicodeDecodeError, LookupError):
+            pass
+    vietnamese = data.decode("cp1258", errors="replace")
+    if ansi == "cp1258" or _VN_TONE_MARKS.search(vietnamese):
+        return vietnamese, "cp1258"
+    try:
+        return data.decode(ansi), ansi
+    except (UnicodeDecodeError, LookupError):
+        return data.decode("cp1252", errors="replace"), "cp1252"
 
 
 _TCVN3_FROM = "¸µ¶·¹¨¾»¼½Æ©ÊÇÈÉË®ÐÌÎÏÑªÕÒÓÔÖÝ×ØÜÞãßáâä«èåæçé¬íêëìîóïñòô­øõö÷ùýúûüþ¡¢§£¤¥¦"
@@ -4211,6 +4291,8 @@ def _load_csv(path, **options):
 
 
 ENCODING_NAMES = {"utf-8": "UTF-8", "utf-16": "UTF-16", "utf-16-le": "UTF-16", "utf-16-be": "UTF-16",
+                  "cp932": "Shift-JIS (Tiếng Nhật)", "cp936": "GBK (Tiếng Trung)", "cp949": "Tiếng Hàn",
+                  "cp950": "Big5 (Tiếng Trung phồn thể)",
                   "cp1258": "Windows-1258 (Tiếng Việt)", "cp1252": "Windows-1252", "tcvn3": "TCVN3", "vni": "VNI"}
 DELIMITER_NAMES = {",": "dấu phẩy", ";": "dấu chấm phẩy", "\t": "Tab", " ": "dấu cách", "|": "dấu |"}
 

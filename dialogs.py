@@ -10,6 +10,7 @@ import formula_engine as fe
 import printing
 from function_info import CATEGORIES, FUNCTION_INFO
 from ribbon import GROUP_LINE, HOVER_BG, STANDARD_COLORS, TEXT_FG, Popup, color_popup, theme_palette
+from screens import center_on
 
 SYMBOLS = ["₫", "$", "€", "¥", "£", "Không"]
 LONG_DATE = 'dddd, "ngày" dd "tháng" mm "năm" yyyy'
@@ -105,10 +106,8 @@ class Dialog(tk.Toplevel):
 
     def show(self, focus=None):
         self.update_idletasks()
-        top = self.master.winfo_toplevel()
-        x = top.winfo_rootx() + (top.winfo_width() - self.winfo_reqwidth()) // 2
-        y = top.winfo_rooty() + (top.winfo_height() - self.winfo_reqheight()) // 3
-        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        x, y = center_on(self, self.master, self.winfo_reqwidth(), self.winfo_reqheight(), rise=3)
+        self.geometry(f"+{x}+{y}")
         self.deiconify()
         self.grab_set()
         (focus or self).focus_set()

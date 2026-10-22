@@ -1550,6 +1550,14 @@ class TextImportTests(unittest.TestCase):
             self.assertEqual(fe.decode_text(data), (self.VN, encoding), encoding)
         self.assertEqual(fe.decode_text("Café;12\n".encode("cp1252"))[0], "Café;12\n")
 
+    def test_japanese_windows(self):
+        from unittest import mock
+        japanese = "種類,ﾌﾞﾗｹｯﾄ,ﾃﾞｰﾀ,スプライス\n1,ﾌﾞﾚｰｽ,大梁,PL-16x570x100\n"
+        with mock.patch.object(fe, "ansi_code_page", return_value="cp932"):
+            self.assertEqual(fe.decode_text(japanese.encode("cp932")), (japanese, "cp932"))
+            self.assertEqual(fe.decode_text(cp1258(self.VN)), (self.VN, "cp1258"))  # still Vietnamese
+        self.assertEqual(fe.decode_text(japanese.encode("cp932"), "cp932")[0], japanese)
+
     def test_separate_tone_marks_are_composed(self):
         self.assertEqual(fe.decode_text("Nguyễn".encode("utf-8"))[0], "Nguyễn")
 
@@ -1606,6 +1614,20 @@ class BigSheetTests(unittest.TestCase):
         sh.cells = {(1, 1): "y"}
         self.assertIsInstance(sh.cells, fe.CellStore)
         self.assertEqual(sh.cells.extent(), (2, 2))
+
+    def test_bounds_and_memo(self):
+        cells = fe.CellStore({(3, 2): "a", (7, 1): "b"})
+        self.assertEqual((cells.first(), cells.extent()), ((3, 1), (8, 3)))
+        cells[(1, 5)] = "c"
+        self.assertEqual((cells.first(), cells.extent()), ((1, 1), (8, 6)))
+        del cells[(1, 5)]
+        self.assertEqual(cells.first(), (3, 1))
+        formats = fe.TrackedDict({(0, 0): {"bold": True}})
+        calls = []
+        count = lambda d: calls.append(1) or len(d)  # noqa: E731
+        self.assertEqual((formats.memo("n", count), formats.memo("n", count)), (1, 1))
+        formats[(1, 1)] = {"bg": "#ffff00"}
+        self.assertEqual((formats.memo("n", count), len(calls)), (2, 2))
 
     def test_snapshots_share_unchanged_cells(self):
         wb = make({"A1": "1", "B1": "2"})
@@ -1767,6 +1789,54 @@ class UndoNameTests(unittest.TestCase):
         cmd.seen.clear()
         cmd.format_cells({"bold": True})
         self.assertEqual((cmd.seen, cmd._undo_name), (["In đậm"], None))
+
+class ScreenTests(unittest.TestCase):
+    """Popups and dialogs stay on the monitor PyExcel is on (Tk on Windows only knows the primary one)."""
+
+    MONITORS = [(-1920, 0, 1920, 1040), (0, 0, 1920, 1040), (1920, -200, 2560, 1400)]
+
+    def area(self, widget, point=None):
+        x, y = point
+        return next((m for m in self.MONITORS if m[0] <= x < m[0] + m[2] and m[1] <= y < m[1] + m[3]),
+                    self.MONITORS[1])
+
+    def test_popups_stay_on_their_monitor(self):
+        from unittest import mock
+        import screens
+        with mock.patch.object(screens, "work_area", self.area):
+            self.assertEqual(screens.keep_on_screen(None, 3000, 500, 300, 200, flip=30), (3000, 500))
+            self.assertEqual(screens.keep_on_screen(None, 4400, 500, 300, 200, flip=30), (4176, 500))  # right edge
+            self.assertEqual(screens.keep_on_screen(None, -1500, 100, 300, 200), (-1500, 100))  # left monitor
+            self.assertEqual(screens.keep_on_screen(None, -1500, 950, 300, 200, flip=30), (-1500, 720))  # opens above
+            self.assertEqual(screens.keep_on_screen(None, 100, 1000, 300, 200), (100, 840))
+
+class ThreeDReferenceTests(unittest.TestCase):
+    """Sheet1:Sheet3!A1 - the same cells on every sheet from the first to the last, as in Excel."""
+
+    def build(self):
+        wb = Workbook(("Tổng", "Tháng 1", "Tháng 2", "Tháng 3"))
+        for i, name in enumerate(["Tháng 1", "Tháng 2", "Tháng 3"], 1):
+            make({"A1": str(i * 10), "A2": str(i)}, sheet=name, wb=wb)
+        return wb
+
+    def test_functions(self):
+        wb = self.build()
+        for formula, expected in (("=SUM('Tháng 1:Tháng 3'!A1)", 60), ("=SUM('Tháng 1:Tháng 3'!A1:A2)", 66),
+                                  ("=AVERAGE('Tháng 1:Tháng 3'!A1)", 20), ("=MAX('Tháng 3:Tháng 1'!A1:A2)", 30),
+                                  ("=COUNT('Tháng 1:Tháng 2'!A1:A5)", 4), ("=SUM('Tháng 2:Tháng 2'!A1:A50000)", 22)):
+            make({"B2": formula}, sheet="Tổng", wb=wb)
+            self.assertEqual(val(wb, "B2", "Tổng"), expected, formula)
+
+    def test_errors_and_unquoted_names(self):
+        wb = self.build()
+        make({"B1": "='Tháng 1:Tháng 3'!A1", "B2": "=SUM('Tháng 1:Không có'!A1)"}, sheet="Tổng", wb=wb)
+        self.assertEqual((val(wb, "B1", "Tổng").code, val(wb, "B2", "Tổng").code), ("#VALUE!", "#REF!"))
+        wb = Workbook(("BH", "形鋼", "ボルト"))
+        for name in wb.sheets:
+            make({"Q5": "2"}, sheet=name, wb=wb)
+        make({"U3": "=SUM(BH:ボルト!Q5:Q50000)"}, sheet="BH", wb=wb)
+        self.assertEqual(val(wb, "U3", "BH"), 6)
+        self.assertEqual(fe.shift_formula("=SUM(BH:ボルト!Q5:Q50000)", 1, 0), "=SUM(BH:ボルト!Q6:Q50001)")
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,8 @@ import os
 import tkinter as tk
 import tkinter.font as tkfont
 
+from screens import keep_on_screen
+
 RIBBON_BG = "#f3f3f3"
 TAB_BAR_BG = "#217346"
 TAB_HOVER_BG = "#2d8656"
@@ -1189,8 +1191,10 @@ class Tooltip:
         tk.Label(tip, text=self.text, bg="#ffffff", fg="#333333", bd=1, relief="solid", padx=7, pady=4,
                  justify="left", font=self.font).pack()
         tip.update_idletasks()
-        x = min(self.widget.winfo_rootx(), tip.winfo_screenwidth() - tip.winfo_reqwidth() - 4)
-        tip.geometry(f"+{x}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
+        x, y = keep_on_screen(self.widget, self.widget.winfo_rootx(), self.widget.winfo_rooty() +
+                              self.widget.winfo_height() + 4, tip.winfo_reqwidth(), tip.winfo_reqheight(),
+                              flip=self.widget.winfo_height() + 8)
+        tip.geometry(f"+{x}+{y}")
 
     def _hide(self, e=None):
         if self.job:
@@ -1389,9 +1393,7 @@ class Popup(tk.Toplevel):
         w, h = self.winfo_reqwidth(), self.winfo_reqheight()
         if right:
             x -= w
-        x = max(0, min(x, self.winfo_screenwidth() - w - 4))
-        if y + h > self.winfo_screenheight() - 40:
-            y = max(0, y - h - 30)
+        x, y = keep_on_screen(self, x, y, w, h, flip=30)  # on the monitor it opens on, not the primary one
         self.geometry(f"+{x}+{y}")
         self.deiconify()
         self.lift()

@@ -13,6 +13,7 @@ import pdf
 import printing
 from dialogs import PAPER_LABELS
 from ribbon import RibbonButton
+from screens import center_on
 
 SCOPES = [("sheet", "In trang tính hiện hành"), ("book", "In toàn bộ sổ làm việc"), ("selection", "In vùng chọn")]
 ORIENTS = [("portrait", "Hướng dọc"), ("landscape", "Hướng ngang")]
@@ -217,9 +218,8 @@ class PrintPreview(tk.Toplevel):
         self._build(scope)
         top = app.root
         w, h = max(900, round(top.winfo_width() * 0.92)), max(600, round(top.winfo_height() * 0.92))
-        x = top.winfo_rootx() + (top.winfo_width() - w) // 2
-        y = top.winfo_rooty() + (top.winfo_height() - h) // 2
-        self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        x, y = center_on(self, top, w, h)
+        self.geometry(f"{w}x{h}+{x}+{y}")
         self.rebuild()
         self.deiconify()
         self.grab_set()

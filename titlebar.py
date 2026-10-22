@@ -13,6 +13,7 @@ import sys
 import tkinter as tk
 
 from ribbon import RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, Tooltip
+from screens import user32, work_area
 
 BAR_HEIGHT = 30   # px at 100 %, like Excel's
 EDGE = 4          # px at 100 %: width of the window edges that resize it
@@ -49,69 +50,13 @@ def user_name():
 
 # ------------------------------------------------------------------ Windows
 
-_user32 = None
-
-
-def _win32():
-    """user32 with the prototypes used here (a private copy: other modules declare their own)."""
-    global _user32
-    if _user32 is None:
-        import ctypes
-        from ctypes import wintypes
-        u = ctypes.WinDLL("user32")
-        u.GetParent.argtypes, u.GetParent.restype = [wintypes.HWND], wintypes.HWND
-        u.GetWindowLongW.argtypes, u.GetWindowLongW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_long
-        u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
-        u.SetWindowLongW.restype = ctypes.c_long
-        u.ShowWindow.argtypes, u.ShowWindow.restype = [wintypes.HWND, ctypes.c_int], wintypes.BOOL
-        u.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
-        u.MonitorFromWindow.restype = wintypes.HMONITOR
-        u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
-        u.MonitorFromPoint.restype = wintypes.HMONITOR
-        u.GetMonitorInfoW.argtypes, u.GetMonitorInfoW.restype = [wintypes.HMONITOR, ctypes.c_void_p], wintypes.BOOL
-        _user32 = u
-    return _user32
-
-
-def _monitor_work_area(monitor):
-    import ctypes
-    from ctypes import wintypes
-
-    class MONITORINFO(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
-                    ("dwFlags", wintypes.DWORD)]
-    info = MONITORINFO()
-    info.cbSize = ctypes.sizeof(info)
-    if not monitor or not _win32().GetMonitorInfoW(monitor, ctypes.byref(info)):
-        return None
-    r = info.rcWork
-    return r.left, r.top, r.right - r.left, r.bottom - r.top
-
-
-def work_area(root, point=None):
-    """(x, y, width, height) of the screen area a maximised window fills (without the taskbar): of the
-    monitor holding `point` (x, y), or else the window."""
-    if sys.platform == "win32":
-        try:
-            from ctypes import wintypes
-            u = _win32()
-            monitor = (u.MonitorFromPoint(wintypes.POINT(*point), 2) if point
-                       else u.MonitorFromWindow(u.GetParent(root.winfo_id()), 2))  # 2: the nearest monitor
-            area = _monitor_work_area(monitor)
-            if area:
-                return area
-        except (AttributeError, OSError, ValueError):
-            pass
-    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
-
-
 def show_in_taskbar(root):
     """A borderless (override-redirect) Tk window is a tool window to Windows: no taskbar button and no
     Alt+Tab. Make it an application window again, which can also be minimised from the taskbar."""
     GWL_STYLE, GWL_EXSTYLE = -16, -20
     WS_EX_TOOLWINDOW, WS_EX_APPWINDOW = 0x80, 0x40000
     WS_MINIMIZEBOX, WS_SYSMENU = 0x20000, 0x80000
-    u = _win32()
+    u = user32()
     hwnd = u.GetParent(root.winfo_id())
     u.SetWindowLongW(hwnd, GWL_EXSTYLE, (u.GetWindowLongW(hwnd, GWL_EXSTYLE) & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW)
     u.SetWindowLongW(hwnd, GWL_STYLE, u.GetWindowLongW(hwnd, GWL_STYLE) | WS_MINIMIZEBOX | WS_SYSMENU)
@@ -331,7 +276,7 @@ class TitleBar(tk.Frame):
     def minimize(self):
         if sys.platform == "win32":
             try:
-                _win32().ShowWindow(_win32().GetParent(self.root.winfo_id()), 6)  # SW_MINIMIZE
+                user32().ShowWindow(user32().GetParent(self.root.winfo_id()), 6)  # SW_MINIMIZE
                 return
             except (AttributeError, OSError):
                 pass

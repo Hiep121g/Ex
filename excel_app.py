@@ -4,6 +4,7 @@ Run:  python excel_app.py [file.xlsx | file.pyxl | file.csv]
 """
 
 import base64
+import bisect
 import csv
 import datetime as dt
 import functools
@@ -299,8 +300,8 @@ THANH TIÊU ĐỀ VÀ RIBBON
 
 TỆP CSV / VĂN BẢN
   • Mở tệp .csv tự nhận bảng mã như Excel: UTF-8 (có hoặc không có BOM), UTF-16 ("Văn bản Unicode"),
-    còn lại là bảng mã ANSI của Windows - Windows-1258 khi tệp là tiếng Việt. Dấu thanh viết tách rời
-    (kiểu "Unicode tổ hợp" / Windows-1258) được ghép lại để hiển thị đúng.
+    còn lại là bảng mã ANSI của Windows (Shift-JIS trên Windows tiếng Nhật...) - Windows-1258 khi tệp là
+    tiếng Việt. Dấu thanh viết tách rời (kiểu "Unicode tổ hợp" / Windows-1258) được ghép lại.
   • Tự nhận dấu phân cách (phẩy, chấm phẩy, Tab, |); tệp dùng dấu chấm phẩy với số kiểu 1.234,5 được đọc
     thành số. Thanh trạng thái cho biết bảng mã và dấu phân cách đã dùng.
   • Nếu chữ vẫn sai: Dữ liệu → Từ Văn bản/CSV để tự chọn bảng mã (kể cả TCVN3 / ABC và VNI của các
@@ -365,6 +366,19 @@ def content_named(func):
         finally:
             self._undo_name = outer
     return command
+
+
+class _Tagged:
+    """A canvas whose new items all get `tag`, so that layer can be replaced on its own."""
+
+    def __init__(self, canvas, tag):
+        self.canvas, self.tag = canvas, tag
+
+    def __getattr__(self, name):
+        attr = getattr(self.canvas, name)
+        if name.startswith("create_"):
+            return lambda *args, **kw: attr(*args, tags=self.tag, **kw)
+        return attr
 
 
 class UndoStep(tuple):
@@ -455,10 +469,15 @@ class SpreadsheetApp:
         self._cursor = ""
         self._v_total = self._h_total = 1
         self._ribbon_level = 0
+        self._refresh_job, self._pending = None, (False, False)  # see request_refresh
+        self._frame = None             # what the last full redraw drew (see redraw_selection)
+        self._runs_key = self._runs = None  # hidden rows as runs (see shown_rows)
+        self._drawn_refs = None        # references of the formula being typed, as last outlined
         self._ribbon_widths = {}
         self._zoom_busy = False
         self.find_win = None
-        self.fonts, self._widths, self._tints, self._images = {}, {}, {}, []
+        self.fonts, self._char_widths, self._tints, self._images = {}, {}, {}, []
+        self._line_spaces = {}
         self.commands = []  # (label, callable) for the "tell me" search
         self.command_icons = {}  # label -> icon of the ribbon button it came from
 
@@ -470,6 +489,8 @@ class SpreadsheetApp:
         self.menu_icons = MenuIcons(root, self.scale, os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons"))
         self.pictures = images.PictureCache(root)
         self._link_click = self._link_tip = self._link_tip_job = self._link_hover = None
+        root.tk.eval("proc pyexcel_create_items {canvas items} {"
+                     " foreach {kind coords options} $items {$canvas create $kind {*}$coords {*}$options} }")
         self._build_styles()
         self._build_ribbon()
         self._build_formula_bar()
@@ -503,7 +524,8 @@ class SpreadsheetApp:
         """Pixel sizes for the current DPI and zoom."""
         self.px = self.scale * self.zoom
         self.fonts.clear()
-        self._widths.clear()
+        self._char_widths.clear()
+        self._line_spaces.clear()
         size = -max(6, round(12 * self.px))
         self.header_font = tkfont.Font(root=self.root, family=self.ui_family, size=size)
         self.header_bold = tkfont.Font(root=self.root, family=self.ui_family, size=size, weight="bold")
@@ -537,28 +559,39 @@ class SpreadsheetApp:
                 underline=key[4], overstrike=key[5])
         return font
 
+    def line_space(self, font):
+        """A font's line height (asked of Tk once per font)."""
+        space = self._line_spaces.get(font.name)
+        if space is None:
+            space = self._line_spaces[font.name] = font.metrics("linespace")
+        return space
+
     def text_width(self, font, text):
-        key = (font.name, text)
-        width = self._widths.get(key)
-        if width is None:
-            if len(self._widths) > 20000:
-                self._widths.clear()
-            width = self._widths[key] = font.measure(text)
-        return width
+        """Pixel width of `text`: the sum of its characters' widths, each asked of Tk once per font (Tk is
+        slow to measure, above all characters it takes from a fallback font, such as Japanese, and new
+        texts come into view with every scroll)."""
+        chars = self._char_widths.get(font.name)
+        if chars is None:
+            chars = self._char_widths[font.name] = {}
+        try:
+            return sum(map(chars.__getitem__, text))
+        except KeyError:
+            for ch in set(text).difference(chars):
+                chars[ch] = font.measure(ch)
+            return sum(map(chars.__getitem__, text))
 
     def clip_text(self, text, font, width):
+        """The start of `text` that fits `width` pixels."""
         if width <= 0:
             return ""
         if self.text_width(font, text) <= width:
             return text
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if font.measure(text[:mid]) <= width:
-                lo = mid
-            else:
-                hi = mid - 1
-        return text[:lo]
+        chars, total = self._char_widths[font.name], 0
+        for i, ch in enumerate(text):
+            total += chars[ch]
+            if total > width:
+                return text[:i]
+        return text
 
     def wrap_lines(self, text, font, width):
         """Word-wrap text to a pixel width (long words are broken)."""
@@ -1509,7 +1542,7 @@ class SpreadsheetApp:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         cv = self.canvas
-        cv.bind("<Configure>", lambda e: self.refresh_view())
+        cv.bind("<Configure>", lambda e: self.request_refresh(ui=False))
         cv.bind("<Button-1>", self.on_press)
         cv.bind("<B1-Motion>", self.on_drag)
         cv.bind("<ButtonRelease-1>", self.on_release)
@@ -1617,6 +1650,49 @@ class SpreadsheetApp:
             return 0
         return round(sh.row_heights.get(r, fe.DEFAULT_ROW_HEIGHT) * self.px)
 
+    def _hidden_runs(self):
+        """The sheet's hidden rows (hidden or filtered out) as runs: (starts, ends) with ends exclusive,
+        worked out again only after a change."""
+        sh = self.sh
+        filtered = sh.filter["hidden"] if sh.filter else ()
+        key = (id(sh), self.edit_serial, id(sh.hidden_rows), len(sh.hidden_rows), id(filtered), len(filtered))
+        if self._runs_key != key:
+            starts, ends = [], []
+            for r in sorted(set(sh.hidden_rows).union(filtered)):
+                if ends and ends[-1] == r:
+                    ends[-1] = r + 1
+                else:
+                    starts.append(r)
+                    ends.append(r + 1)
+            self._runs_key, self._runs = key, (starts, ends)
+        return self._runs
+
+    def shown_rows(self, start, stop=MAX_ROWS):
+        """The rows from `start` up to `stop` that are not hidden. A filter can hide thousands of rows in
+        a row; each such run is stepped over at once."""
+        starts, ends = self._hidden_runs()
+        i = bisect.bisect_right(starts, start) - 1  # the last run starting at or before `start`
+        r = ends[i] if i >= 0 and start < ends[i] else start
+        i += 1
+        while r < stop:
+            if i < len(starts) and r == starts[i]:
+                r, i = ends[i], i + 1
+                continue
+            yield r
+            r += 1
+
+    def shown_rows_back(self, start, stop=-1):
+        """The rows from `start` down to `stop` (not included) that are not hidden, as shown_rows."""
+        starts, ends = self._hidden_runs()
+        i = bisect.bisect_right(starts, start) - 1
+        r = start
+        while r > stop:
+            if i >= 0 and starts[i] <= r < ends[i]:
+                r, i = starts[i] - 1, i - 1
+                continue
+            yield r
+            r -= 1
+
     def frozen(self):
         """(r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 are frozen (empty spans when not)."""
         return self.sh.freeze or (0, 0, 0, 0)
@@ -1663,12 +1739,12 @@ class SpreadsheetApp:
                 return y
         far = self.canvas.winfo_height() + 4000
         if r >= self.top:
-            for k in range(self.top, r):
+            for k in self.shown_rows(self.top, r):
                 y += self.row_h(k)
                 if y > far:
                     return y + (r - k - 1) * self.default_row_px
             return y
-        for k in range(self.top - 1, r - 1, -1):
+        for k in self.shown_rows_back(self.top - 1, r - 1):
             y -= self.row_h(k)
             if y < -far:
                 return y - (k - r) * self.default_row_px
@@ -1696,12 +1772,10 @@ class SpreadsheetApp:
             edge += self.row_h(r)
             if y < edge:
                 return r
-        r = self.top
-        while r < MAX_ROWS - 1:
+        for r in self.shown_rows(self.top, MAX_ROWS - 1):
             edge += self.row_h(r)
             if y < edge:
                 return r
-            r += 1
         return MAX_ROWS - 1
 
     def col_at(self, x):
@@ -1793,13 +1867,13 @@ class SpreadsheetApp:
         elif r < self.top:
             self.top = r
         elif self.row_y(r + 1) > H:
-            avail, acc, t = H - y0, 0, r
-            while t >= r1:
+            avail, acc, top = H - y0, 0, r
+            for t in self.shown_rows_back(r, r1 - 1):
                 acc += self.row_h(t)
                 if acc > avail:
                     break
-                t -= 1
-            self.top = min(r, t + 1)
+                top = t
+            self.top = top
         if c < c1:
             pass
         elif c < self.left:
@@ -1818,9 +1892,12 @@ class SpreadsheetApp:
     def redraw(self):
         cv = self.canvas
         cv.delete("all")
+        self._frame = None
         W, H = cv.winfo_width(), cv.winfo_height()
         if W < 20 or H < 20:
             return
+        # hidden markers of where the layers redraw_selection replaces go in the stacking order
+        cv.create_line(0, 0, 0, 0, state="hidden", tags="z_selbg")
         sh = self.sh
         cells, formats = sh.cells, sh.formats
         self._outline_metrics()
@@ -1828,10 +1905,10 @@ class SpreadsheetApp:
         self._clamp_view()
         fr0, fr1, fc0, fc1 = self.frozen()
 
-        def strip(first, frozen, limit, size, origin, end):
-            """[(index, start, end)] of the frozen lines, then of the scrolled ones from `first`."""
+        def strip(lines, size, origin, end):
+            """[(index, start, end)] of the lines that fit between origin and end."""
             out, pos = [], origin
-            for i in itertools.chain(frozen, range(first, limit)):
+            for i in lines:
                 if pos >= end:
                     break
                 n = size(i)
@@ -1840,8 +1917,8 @@ class SpreadsheetApp:
                 pos += n
             return out
 
-        cols = strip(self.left, range(fc0, fc1), MAX_COLS, self.col_w, hw, W)
-        rows = strip(self.top, range(fr0, fr1), MAX_ROWS, self.row_h, hh, H)
+        cols = strip(itertools.chain(range(fc0, fc1), range(self.left, MAX_COLS)), self.col_w, hw, W)
+        rows = strip(itertools.chain(range(fr0, fr1), self.shown_rows(self.top)), self.row_h, hh, H)
         self.vis_cols, self.vis_rows = cols, rows
         self._scroll_rows = sum(1 for r, _, _ in rows if r >= self.top)
         self._filter_buttons = []
@@ -1892,22 +1969,16 @@ class SpreadsheetApp:
                         covered.add((r, c))
 
         # backgrounds: selection tint, filled cells, the active cell left clear, data bars
-        if multi:
-            box = self._clip_box(self._rect_bbox(r1, c1, r2, c2), W, H)
-            if box:
-                cv.create_rectangle(*box, fill=self.tint("#ffffff"), outline="")
-        for area in areas:
-            box = self._clip_box(self._rect_bbox(*area), W, H)
-            if box:
-                cv.create_rectangle(*box, fill=self.tint("#ffffff"), outline="")
+        self._draw_selection_tint(cv, W, H, (r1, c1, r2, c2), multi, areas)
         filled = {k for k in visible(formats) if formats[k].get("bg")} | {k for k, s in cf.items() if s.get("bg")}
+        tinted = set(filled)  # cells whose colour the selection changes
         for r, c in filled:
             cv.create_rectangle(col_pos[c][0], row_pos[r][0], col_pos[c][1], row_pos[r][1], fill=fill_of(r, c),
                                 outline="")
         if multi:
             box = self._clip_box(self._rect_bbox(*active), W, H)
             if box:
-                cv.create_rectangle(*box, fill=fill_of(*self.cur), outline="")
+                cv.create_rectangle(*box, fill=fill_of(*self.cur), outline="", tags=("sel", "selbg"))
         for (r, c), style in cf.items():
             bar = style.get("databar")
             if bar and (r, c) not in covered:
@@ -1917,16 +1988,17 @@ class SpreadsheetApp:
                     cv.create_rectangle(x0 + 2, y0 + 2, x0 + 2 + width, y1 - 3, fill=mix(bar[1], "#ffffff", 0.45),
                                         outline=bar[1])
         if self.show_grid:
-            for c, x0, x1 in cols:
-                cv.create_line(x1 - 1, hh, x1 - 1, bottom, fill=GRID)
-            for r, y0, y1 in rows:
-                cv.create_line(hw, y1 - 1, right, y1 - 1, fill=GRID)
+            grid = ("-fill", GRID)
+            self._create_items(cv, [x for c, x0, x1 in cols for x in ("line", (x1 - 1, hh, x1 - 1, bottom), grid)] +
+                               [x for r, y0, y1 in rows for x in ("line", (hw, y1 - 1, right, y1 - 1), grid)])
         for m in merges:  # merged blocks hide their inner grid lines
             box = self._clip_box(self._rect_bbox(*m), W, H)
             if box:
                 cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, fill=fill_of(m[0], m[1]), outline="")
 
-        # cell borders
+        # cell borders, made in one go; an edge two cells both draw (bottom of one, top of the next) is made
+        # once, where it was drawn last, which looks just the same
+        lines = []
         for r, c in visible(formats):
             fmt = formats[(r, c)]
             if not any(k in fmt for k in fe.BORDER_KEYS):
@@ -1940,7 +2012,13 @@ class SpreadsheetApp:
                 if m and ((key == "bt" and r != m[0]) or (key == "bb" and r != m[2]) or
                           (key == "bl" and c != m[1]) or (key == "br" and c != m[3])):
                     continue
-                self._draw_border(cv, key, spec, x0, y0, x1, y1)
+                lines += self._border_lines(key, spec, x0, y0, x1, y1)
+        seen, last = set(), []
+        for line in reversed(lines):
+            if line not in seen:
+                seen.add(line)
+                last.append(line)
+        self._create_items(cv, [x for coords, options in reversed(last) for x in ("line", coords, options)])
 
         # filter dropdown buttons (sized first so header text can leave room for them)
         f = sh.filter
@@ -1983,7 +2061,7 @@ class SpreadsheetApp:
             align = fmt.get("align") or align
             valign = fmt.get("valign") or "bottom"
             fg = eff.get("fg") or "#000000"
-            ls = font.metrics("linespace")
+            ls = self.line_space(font)
             rotate = fmt.get("rotate") or 0
             if rotate and rotate != 255:
                 text = text.replace("\n", " ")
@@ -2009,6 +2087,7 @@ class SpreadsheetApp:
                             if self.show_grid:
                                 boundary = col_pos[nc][0] - 1
                                 cv.create_line(boundary, y0, boundary, y1 - 1, fill=fill_of(r, nc - 1))
+                                tinted.add((r, nc - 1))
                             end, nc = col_pos[nc][1], nc + 1
                         avail = end - x0 - 2 * pad - indent
                     text = self.clip_text(text, font, avail)
@@ -2021,13 +2100,17 @@ class SpreadsheetApp:
                 tx, anchor = x1 - pad - 1 - indent, "e"
             else:
                 tx, anchor = x0 + pad + indent, "w"
+            if fmt.get("underline") != "double":
+                texts.extend(("text", (tx, ty), ("-text", "\n".join(lines), "-anchor", anchor, "-justify", align,
+                                                 "-font", font.name, "-fill", fg)))
+                return
             item = cv.create_text(tx, ty, text="\n".join(lines), anchor=anchor, justify=align, font=font, fill=fg)
-            if fmt.get("underline") == "double":
-                bx0, _, bx1, by1 = cv.bbox(item)
-                base = by1 - font.metrics("descent")
-                for dy in (1, 3):
-                    cv.create_line(bx0, base + dy, bx1, base + dy, fill=fg)
+            bx0, _, bx1, by1 = cv.bbox(item)  # double underline: two lines under the text
+            base = by1 - font.metrics("descent")
+            for dy in (1, 3):
+                cv.create_line(bx0, base + dy, bx1, base + dy, fill=fg)
 
+        texts = []  # most cells' text items, created together after the loop
         targets = [k for k in visible(cells) if k not in covered]
         seen = set(targets)
         targets += [(m[0], m[1]) for m in merges if (m[0], m[1]) in cells and (m[0], m[1]) not in seen]
@@ -2042,6 +2125,7 @@ class SpreadsheetApp:
                 box = (col_pos[c][0], row_pos[r][0], col_pos[c][1], row_pos[r][1])
                 style = cf.get((r, c))
             draw_text(r, c, box, style, spill=not m)
+        self._create_items(cv, texts)
 
         mark = max(4, round(5 * self.px))
         for r, c in visible(sh.notes):
@@ -2075,9 +2159,11 @@ class SpreadsheetApp:
                 self._filter_buttons.append((bx0, by0, bx1, by1, c))
 
         line = max(2, round(2 * self.px))
+        self._drawn_refs = None
         if self.is_editing() and self.edit_cell[0] == self.sheet:
             text = self.edit_var.get() if self.editor is not None else self.fx_var.get()
-            for i, (ref_sheet, a1, b1, a2, b2) in enumerate(fe.formula_references(text)):
+            self._drawn_refs = fe.formula_references(text)
+            for i, (ref_sheet, a1, b1, a2, b2) in enumerate(self._drawn_refs):
                 if ref_sheet is not None and self.wb.resolve_sheet(ref_sheet) != self.sheet:
                     continue
                 if not (0 <= a1 and 0 <= b1 and a2 < MAX_ROWS and b2 < MAX_COLS):
@@ -2091,23 +2177,8 @@ class SpreadsheetApp:
             if box:
                 cv.create_rectangle(box[0] + 1, box[1] + 1, box[2] - 2, box[3] - 2, outline=ACCENT, dash=(5, 3),
                                     width=line)
-        for area in areas:
-            box = self._clip_box(self._rect_bbox(*area), W, H)
-            if box:
-                cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT)
-        sel_box = self._rect_bbox(r1, c1, r2, c2)
-        box = self._clip_box(sel_box, W, H)
-        if box:
-            cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT, width=line)
-            hx, hy = sel_box[2] - 1, sel_box[3] - 1
-            corner_shown = not (fr1 <= r2 < self.top or fc1 <= c2 < self.left)
-            if hw < hx < W and hh < hy < H and corner_shown and not self.is_editing():
-                s = max(3, round(3 * self.px))
-                cv.create_rectangle(hx - s, hy - s, hx + s, hy + s, fill=ACCENT, outline="white")
-        if self.drag and self.drag.get("mode") == "fill" and self.drag.get("target"):
-            box = self._clip_box(self._rect_bbox(*self.drag["target"]), W, H)
-            if box:
-                cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline="#555555", dash=(4, 3))
+        cv.create_line(0, 0, 0, 0, state="hidden", tags="z_selfg")
+        sel_box = self._draw_selection_outline(cv, W, H, (r1, c1, r2, c2), areas)
         self._draw_charts(cv, W, H)
         if sh.page_setup or self.sheet in self.breaks_shown:
             self._draw_page_breaks(cv, col_pos, row_pos, right, bottom)
@@ -2118,8 +2189,95 @@ class SpreadsheetApp:
             cv.create_line(px - 1, hh, px - 1, bottom, fill=FREEZE_LINE)
         self._draw_headers(cv, W, H, (r1, c1, r2, c2), sel_box)
         self._draw_outline(cv, W, H, row_pos, col_pos)
-        self._draw_cell_extras(cv, W, H, col_pos, row_pos)
+        cv.create_line(0, 0, 0, 0, state="hidden", tags="z_extra")
+        self._draw_cell_extras(_Tagged(cv, "extra"), W, H, col_pos, row_pos)
         self._place_editor()
+        self._frame = {"key": self._frame_key(), "sel": (r1, c1, r2, c2), "multi": multi, "areas": bool(areas),
+                       "tinted": tinted, "merges": merges, "col_pos": col_pos, "row_pos": row_pos}
+
+    @staticmethod
+    def _create_items(cv, items):
+        """Create canvas items given as kind, (coordinates), (options), kind, ... in one call to Tcl: a
+        sheet's hundreds of texts and lines are made several times faster than one Python call each."""
+        if items:
+            cv.tk.call("pyexcel_create_items", cv._w, tuple(items))
+
+    def _frame_key(self):
+        """What a drawn frame shows besides the selection: redraw_selection only reuses a frame drawn for
+        the same key."""
+        cv = self.canvas
+        return (id(self.wb), id(self.sh), self.sheet, self.top, self.left, cv.winfo_width(), cv.winfo_height(),
+                self.px, self.edit_serial, self.is_editing(), self.show_grid, self.show_headings, self.show_formulas,
+                self.show_notes, self.hover_note, self.chart_sel, self.clip and self.clip["rect"],
+                self.header_w, self.header_h)
+
+    def _draw_selection_tint(self, cv, W, H, rect, multi, areas, clear=False):
+        """The shading of a selection of several cells (and of Ctrl+click blocks); with clear=True also the
+        active cell left white inside it."""
+        tint = self.tint("#ffffff")
+        for block in ([rect] if multi else []) + list(areas):
+            box = self._clip_box(self._rect_bbox(*block), W, H)
+            if box:
+                cv.create_rectangle(*box, fill=tint, outline="", tags=("sel", "selbg"))
+        if multi and clear:
+            box = self._clip_box(self._rect_bbox(*self._cell_box(*self.cur)), W, H)
+            if box:
+                cv.create_rectangle(*box, fill="#ffffff", outline="", tags=("sel", "selbg"))
+
+    def _draw_selection_outline(self, cv, W, H, rect, areas):
+        """The selection's green outline with its fill handle, the outlines of Ctrl+click blocks and the
+        dashed box of a fill-handle drag. Returns the selection's canvas box."""
+        r1, c1, r2, c2 = rect
+        tags = ("sel", "selfg")
+        line = max(2, round(2 * self.px))
+        for area in areas:
+            box = self._clip_box(self._rect_bbox(*area), W, H)
+            if box:
+                cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT, tags=tags)
+        sel_box = self._rect_bbox(r1, c1, r2, c2)
+        box = self._clip_box(sel_box, W, H)
+        if box:
+            cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT, width=line, tags=tags)
+            hx, hy = sel_box[2] - 1, sel_box[3] - 1
+            _, fr1, _, fc1 = self.frozen()
+            corner_shown = not (fr1 <= r2 < self.top or fc1 <= c2 < self.left)
+            hw, hh = self.header_w, self.header_h
+            if hw < hx < W and hh < hy < H and corner_shown and not self.is_editing():
+                s = max(3, round(3 * self.px))
+                cv.create_rectangle(hx - s, hy - s, hx + s, hy + s, fill=ACCENT, outline="white", tags=tags)
+        if self.drag and self.drag.get("mode") == "fill" and self.drag.get("target"):
+            box = self._clip_box(self._rect_bbox(*self.drag["target"]), W, H)
+            if box:
+                cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline="#555555", dash=(4, 3),
+                                    tags=tags)
+        return sel_box
+
+    def redraw_selection(self):
+        """Redraw only what shows the selection - its shading and outline, the highlighted headings and
+        the active cell's list arrow or input message - when the cells are drawn as they were: moving
+        around with the keys or the mouse then costs Tk a few small repaints instead of every cell."""
+        frame, cv = self._frame, self.canvas
+        rect = self.sel_rect()
+        multi = rect != self._cell_box(*self.cur)
+
+        def tints_drawn_cells(block):
+            r1, c1, r2, c2 = block
+            return any(r1 <= r <= r2 and c1 <= c <= c2 for r, c in frame["tinted"]) or \
+                any(m[0] <= r2 and m[2] >= r1 and m[1] <= c2 and m[3] >= c1 for m in frame["merges"])
+        if (frame is None or frame["key"] != self._frame_key() or self.areas or frame["areas"]
+                or (frame["multi"] and tints_drawn_cells(frame["sel"])) or (multi and tints_drawn_cells(rect))):
+            self.redraw()
+            return
+        W, H = cv.winfo_width(), cv.winfo_height()
+        cv.delete("sel", "extra")
+        self._draw_selection_tint(cv, W, H, rect, multi, (), clear=True)
+        cv.tag_raise("selbg", "z_selbg")
+        sel_box = self._draw_selection_outline(cv, W, H, rect, ())
+        cv.tag_raise("selfg", "z_selfg")
+        self._update_headers(rect, sel_box, W, H)
+        self._draw_cell_extras(_Tagged(cv, "extra"), W, H, frame["col_pos"], frame["row_pos"])
+        cv.tag_raise("extra", "z_extra")
+        frame["sel"], frame["multi"] = rect, multi
 
     def _sheet_x(self, c):
         """Canvas x of column c's left edge, also when scrolled out of view (col_x clamps those)."""
@@ -2290,7 +2448,8 @@ class SpreadsheetApp:
         if lines:
             cv.create_text(x + pad, ty, text="\n".join(lines), anchor="nw", font=font, fill="#000000")
 
-    def _draw_border(self, cv, key, spec, x0, y0, x1, y1):
+    def _border_lines(self, key, spec, x0, y0, x1, y1):
+        """The canvas lines of one border of a cell box: [((x0, y0, x1, y1), (option, value, ...))]."""
         style, color = spec[0], spec[1] if len(spec) > 1 else "#000000"
         width = max(1, round({"medium": 2, "thick": 3}.get(style, 1) * min(self.px, 2)))
         dash = {"dashed": "-", "dotted": "."}.get(style, "")
@@ -2299,51 +2458,85 @@ class SpreadsheetApp:
         (a, b, c, d), (dx, dy) = points[key]
         if style == "double":
             gap = max(2, round(2 * self.px))
-            cv.create_line(a, b, c, d, fill=color)
-            cv.create_line(a + dx * gap, b + dy * gap, c + dx * gap, d + dy * gap, fill=color)
-        else:
-            cv.create_line(a, b, c, d, fill=color, width=width, dash=dash)
+            return [((a, b, c, d), ("-fill", color)),
+                    ((a + dx * gap, b + dy * gap, c + dx * gap, d + dy * gap), ("-fill", color))]
+        return [((a, b, c, d), ("-fill", color, "-width", width, "-dash", dash))]
 
     def _draw_headers(self, cv, W, H, sel, sel_box=None):
+        """The column letters and row numbers. Each heading gets its own items so _update_headers can
+        recolour just the ones the selection enters or leaves."""
         hw, hh = self.header_w, self.header_h
         ow, oh = self.outline_w, self.outline_h  # outline symbols take the room before the headings
+        self._headers = None
         if not self.show_headings:
             return
-        r1, c1, r2, c2 = sel
         cv.create_rectangle(0, oh, W, hh, fill=HEADER_BG, outline="")
         cv.create_rectangle(ow, 0, hw, H, fill=HEADER_BG, outline="")
-        full_cols = r1 == 0 and r2 == MAX_ROWS - 1
-        full_rows = c1 == 0 and c2 == MAX_COLS - 1
-        for c, x0, x1 in self.vis_cols:
-            sel_col = c1 <= c <= c2
-            if sel_col:
-                cv.create_rectangle(x0, oh, x1, hh, fill=HEADER_FULL_BG if full_cols else HEADER_SEL_BG, outline="")
+        heads = {"cols": {}, "rows": {}}
+        for c, x0, x1 in self.vis_cols:  # [background, text, look shown, normal text colour]
+            heads["cols"][c] = [cv.create_rectangle(x0, oh, x1, hh, fill=HEADER_BG, outline=""), None, None, HEADER_FG]
             cv.create_line(x1 - 1, oh, x1 - 1, hh, fill=HEADER_LINE)
-            cv.create_text((x0 + x1) // 2, (oh + hh) // 2, text=col_name(c), fill=HEADER_SEL_FG if sel_col else HEADER_FG,
-                           font=self.header_bold if sel_col else self.header_font)
+            heads["cols"][c][1] = cv.create_text((x0 + x1) // 2, (oh + hh) // 2, text=col_name(c), fill=HEADER_FG,
+                                                 font=self.header_font)
         f = self.sh.filter
         fr1, fr2 = (f["range"][0], f["range"][2]) if f and f["criteria"] else (0, -1)
+        tall = self.line_space(self.header_font) * 0.6
         for r, y0, y1 in self.vis_rows:
-            sel_row = r1 <= r <= r2
-            if sel_row:
-                cv.create_rectangle(ow, y0, hw, y1, fill=HEADER_FULL_BG if full_rows else HEADER_SEL_BG, outline="")
+            fg = FILTERED_ROW_FG if fr1 < r <= fr2 else HEADER_FG
+            item = heads["rows"][r] = [cv.create_rectangle(ow, y0, hw, y1, fill=HEADER_BG, outline=""), None, None, fg]
             cv.create_line(ow, y1 - 1, hw, y1 - 1, fill=HEADER_LINE)
-            if y1 - y0 >= self.header_font.metrics("linespace") * 0.6:
-                fg = HEADER_SEL_FG if sel_row else FILTERED_ROW_FG if fr1 < r <= fr2 else HEADER_FG
-                cv.create_text((ow + hw) // 2, (y0 + y1) // 2, text=str(r + 1), fill=fg,
-                               font=self.header_bold if sel_row else self.header_font)
+            if y1 - y0 >= tall:
+                item[1] = cv.create_text((ow + hw) // 2, (y0 + y1) // 2, text=str(r + 1), fill=fg,
+                                         font=self.header_font)
         cv.create_line(ow, hh - 1, W, hh - 1, fill=HEADER_LINE)
         cv.create_line(hw - 1, oh, hw - 1, H, fill=HEADER_LINE)
+        heads["col_line"] = cv.create_line(0, 0, 0, 0, fill=ACCENT, width=2, state="hidden")
+        heads["row_line"] = cv.create_line(0, 0, 0, 0, fill=ACCENT, width=2, state="hidden")
+        cv.create_rectangle(ow, oh, hw - 1, hh - 1, fill=HEADER_BG, outline="")
+        t = round((hh - oh) * 0.45)
+        heads["corner"] = cv.create_polygon(hw - 5, hh - 5 - t, hw - 5, hh - 5, hw - 5 - t, hh - 5, outline="",
+                                            fill="#c4c4c4")
+        self._headers = heads
+        self._update_headers(sel, sel_box, W, H)
+
+    def _update_headers(self, sel, sel_box, W, H):
+        """Highlight the headings of the selected rows and columns, with the green line along them. Only
+        headings whose look changes are touched: Tk repaints one box around all the changes, so moving
+        the active cell repaints a small area instead of the whole sheet."""
+        heads, cv = self._headers, self.canvas
+        if not heads:
+            return
+        r1, c1, r2, c2 = sel
+        for items, lo, hi, full in ((heads["cols"], c1, c2, r1 == 0 and r2 == MAX_ROWS - 1),
+                                    (heads["rows"], r1, r2, c1 == 0 and c2 == MAX_COLS - 1)):
+            for i, item in items.items():
+                if lo <= i <= hi:
+                    look = (HEADER_FULL_BG if full else HEADER_SEL_BG, HEADER_SEL_FG, self.header_bold)
+                else:
+                    look = (HEADER_BG, item[3], self.header_font)
+                if look != item[2]:
+                    item[2] = look
+                    cv.itemconfigure(item[0], fill=look[0])
+                    if item[1]:
+                        cv.itemconfigure(item[1], fill=look[1], font=look[2])
+        hw, hh = self.header_w, self.header_h
+        lines = {"col_line": None, "row_line": None}
         if sel_box:
             sx0, sy0, sx1, sy1 = sel_box
             if sx1 > hw and sx0 < W:
-                cv.create_line(max(sx0, hw), hh - 1, min(sx1, W), hh - 1, fill=ACCENT, width=2)
+                lines["col_line"] = (max(sx0, hw), hh - 1, min(sx1, W), hh - 1)
             if sy1 > hh and sy0 < H:
-                cv.create_line(hw - 1, max(sy0, hh), hw - 1, min(sy1, H), fill=ACCENT, width=2)
-        cv.create_rectangle(ow, oh, hw - 1, hh - 1, fill=HEADER_BG, outline="")
-        t = round((hh - oh) * 0.45)
-        cv.create_polygon(hw - 5, hh - 5 - t, hw - 5, hh - 5, hw - 5 - t, hh - 5, outline="",
-                          fill=ACCENT if full_cols and full_rows else "#c4c4c4")
+                lines["row_line"] = (hw - 1, max(sy0, hh), hw - 1, min(sy1, H))
+        for key, coords in lines.items():
+            if heads.get(key + "_at", False) != coords:
+                heads[key + "_at"] = coords
+                if coords:
+                    cv.coords(heads[key], *coords)
+                cv.itemconfigure(heads[key], state="normal" if coords else "hidden")
+        corner = ACCENT if (r1, c1, r2, c2) == (0, 0, MAX_ROWS - 1, MAX_COLS - 1) else "#c4c4c4"
+        if heads.get("corner_fill") != corner:
+            heads["corner_fill"] = corner
+            cv.itemconfigure(heads["corner"], fill=corner)
 
     def _draw_outline(self, cv, W, H, row_pos, col_pos):
         """Excel's outline symbols beside the headings: level buttons 1, 2, ..., a bracket along each group
@@ -2414,12 +2607,46 @@ class SpreadsheetApp:
 
     # ------------------------------------------------------------------ refresh
 
-    def refresh_view(self):
-        self.redraw()
+    def request_refresh(self, ui=True, cells=True):
+        """Refresh once the input waiting now has been handled: scrolling, key repeat and dragging then draw
+        once per batch of events instead of falling behind by drawing for each one. ui: also the formula
+        bar, name box, ribbon and status bar; cells=False: only the selection moved."""
+        if self._refresh_job is None:
+            self._pending = (ui, cells)
+            self._refresh_job = self.root.after_idle(self._run_refresh)
+        else:
+            self._pending = (self._pending[0] or ui, self._pending[1] or cells)
+
+    def _run_refresh(self):
+        self._refresh_job = None
+        if not self.canvas.winfo_exists():  # the window was closed meanwhile
+            return
+        ui, cells = self._pending
+        if ui:
+            self.refresh(cells)
+        else:
+            self.refresh_view(cells)
+
+    def refresh_view(self, cells=True):
+        if self._refresh_job is not None:  # what was waiting is drawn now
+            cells = cells or self._pending[1]
+            if self._pending[0]:
+                self._pending = (True, False)
+            else:
+                self.root.after_cancel(self._refresh_job)
+                self._refresh_job = None
+        if cells:
+            self.redraw()
+        else:
+            self.redraw_selection()
         self.update_scrollbars()
 
-    def refresh(self):
-        self.refresh_view()
+    def refresh(self, cells=True):
+        if self._refresh_job is not None:
+            cells = cells or self._pending[1]
+            self.root.after_cancel(self._refresh_job)
+            self._refresh_job = None
+        self.refresh_view(cells)
         self.update_formula_bar()
         self.update_name_box()
         self.update_toolbar()
@@ -2623,8 +2850,8 @@ class SpreadsheetApp:
             r = m[2] if dr > 0 else m[0] if dr < 0 else r
             c = m[3] if dc > 0 else m[1] if dc < 0 else c
         r, c = r + dr, c + dc
-        while dr and 0 <= r < MAX_ROWS and self.sh.row_hidden(r):
-            r += dr
+        if dr and 0 <= r < MAX_ROWS and self.sh.row_hidden(r):  # step over the hidden rows at once
+            r = next(self.shown_rows(r) if dr > 0 else self.shown_rows_back(r), -1)
         while dc and 0 <= c < MAX_COLS and c in self.sh.hidden_cols:
             c += dc
         if not (0 <= r < MAX_ROWS and 0 <= c < MAX_COLS):
@@ -2637,8 +2864,9 @@ class SpreadsheetApp:
             self.ext = target
         else:
             self.cur = self.ext = self._anchor(target)
+        view = (self.top, self.left)
         self.ensure_visible(*target)
-        self.refresh()
+        self.request_refresh(cells=(self.top, self.left) != view)
 
     def move_active(self, dr, dc):
         self.select_to(self._step(self.cur, dr, dc))
@@ -2802,7 +3030,7 @@ class SpreadsheetApp:
                 if not self.painter and not e.state & CONTROL and self.wb.hyperlink_at(self.sheet, *self.cur):
                     self._link_click = (self.sheet, self.cur, e.time)  # opened on release unless held
             self.drag = {"mode": "select"}
-        self.refresh()
+        self.request_refresh(cells=False)
         return None
 
     def on_drag(self, e):
@@ -2829,7 +3057,7 @@ class SpreadsheetApp:
             else:
                 self.sh.row_heights[d["index"]] = max(4, size)
                 self.sh.custom_rows.add(d["index"])
-            self.refresh_view()
+            self.request_refresh(ui=False)
             return
         r, c = self.row_at(y), self.col_at(x)
         if mode == "select":
@@ -2842,7 +3070,7 @@ class SpreadsheetApp:
             self._point_set(*d["anchor"], r, c)
         elif mode == "fill":
             d["target"] = self._fill_target(r, c)
-        self.redraw()
+        self.request_refresh(ui=False, cells=mode == "point")  # point: the formula's reference boxes change
         self.update_status()
         self.update_name_box()
 
@@ -2895,7 +3123,7 @@ class SpreadsheetApp:
                 self.refresh()
                 self.follow_link(link)
                 return
-        self.refresh()
+        self.request_refresh(cells=False)
 
     def on_double(self, e):
         if self._chart_at(e.x, e.y) is not None:
@@ -2975,7 +3203,7 @@ class SpreadsheetApp:
             self.left = max(0, min(MAX_COLS - 1, self.left - notches))
         else:
             self.top = max(0, min(MAX_ROWS - 1, self.top - 3 * notches))
-        self.refresh_view()
+        self.request_refresh(ui=False)
         return "break"
 
     def on_vscroll(self, *args):
@@ -2984,7 +3212,7 @@ class SpreadsheetApp:
         elif args[0] == "scroll":
             self.top += int(args[1]) * (self._visible_rows() if args[2] == "pages" else 1)
         self.top = max(0, min(self.top, MAX_ROWS - 1))
-        self.refresh_view()
+        self.request_refresh(ui=False)
 
     def on_hscroll(self, *args):
         if args[0] == "moveto":
@@ -2992,7 +3220,7 @@ class SpreadsheetApp:
         elif args[0] == "scroll":
             self.left += int(args[1]) * (max(1, len(self.vis_cols) - 1) if args[2] == "pages" else 1)
         self.left = max(0, min(self.left, MAX_COLS - 1))
-        self.refresh_view()
+        self.request_refresh(ui=False)
 
     def on_context(self, e):
         self.commit_edit()
@@ -3098,11 +3326,17 @@ class SpreadsheetApp:
     def _on_edit_text(self, *_):
         if self.editor is not None:
             self.fx_var.set(self.edit_var.get())
-            self.redraw()
+            self._show_edit_refs(self.edit_var.get())
 
     def _on_fx_text(self, *_):
         if self.bar_editing:
-            self.redraw()
+            self._show_edit_refs(self.fx_var.get())
+
+    def _show_edit_refs(self, text):
+        """While a formula is typed its references are outlined in colour on the sheet: redraw when they
+        change (not for every key, which made typing slow)."""
+        if fe.formula_references(text) != self._drawn_refs:
+            self.request_refresh(ui=False)
 
     def _on_fx_focus(self, e):
         if self.editor is not None:  # move an in-cell edit into the formula bar

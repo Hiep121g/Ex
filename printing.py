@@ -7,6 +7,7 @@ at 96 DPI are converted with PT (0.75).
 """
 
 import datetime as dt
+import itertools
 import os
 from operator import itemgetter
 
@@ -94,18 +95,27 @@ def wrap(text, width, measure):
 
 # ------------------------------------------------------------------ pages
 
+def _printable_box(formats):
+    """The block of cells whose format prints (fill or borders). Formats are shared between cells, so each
+    distinct one is judged once and the cells are picked out without a Python loop."""
+    styles = dict(zip(map(id, formats.values()), formats.values()))
+    printable = {i for i, f in styles.items() if f.get("bg") or any(f.get(b) for b in fe.BORDER_KEYS)}
+    if not printable:
+        return None
+    keys = list(itertools.compress(formats, map(printable.__contains__, map(id, formats.values()))))
+    return min(keys)[0], min(map(itemgetter(1), keys)), max(keys)[0], max(map(itemgetter(1), keys))
+
+
 def used_rect(wb, sheet):
     """The block that holds anything printable: values, fills, borders, merges and charts."""
     sh = wb.sheets[sheet]
     rects = [tuple(m) for m in sh.merges]
-    if sh.cells:  # min/max over the keys in C: a big sheet has millions of cells
+    if sh.cells:  # the cell store keeps its bounds: a big sheet has millions of cells
         rows, cols = sh.cells.extent()
-        rects.append((min(sh.cells)[0], min(map(itemgetter(1), sh.cells)), rows - 1, cols - 1))
-    printable = {}  # formats are shared between cells: judge each one once
-    keys = [k for k, f in sh.formats.items()
-            if printable.setdefault(id(f), bool(f.get("bg") or any(f.get(b) for b in fe.BORDER_KEYS)))]
-    if keys:
-        rects.append((min(keys)[0], min(map(itemgetter(1), keys)), max(keys)[0], max(map(itemgetter(1), keys))))
+        rects.append(sh.cells.first() + (rows - 1, cols - 1))
+    box = sh.formats.memo("printable", _printable_box)
+    if box:
+        rects.append(box)
     for chart in sh.charts:
         r, c = chart["anchor"][:2]
         w, h = chart["size"]

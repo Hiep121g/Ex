@@ -13,6 +13,8 @@ try:
 except ImportError:  # the text functions are usable (and tested) without Tk
     tk = None
 
+from screens import keep_on_screen
+
 _NAME_CHARS = "._"
 _REF_RE = re.compile(r"(\$?)([A-Za-z]{1,3})(\$?)([0-9]+)")
 
@@ -252,7 +254,8 @@ class FormulaAssist:
         box = self.entry.bbox(index)
         x = self.entry.winfo_rootx() + (box[0] if box else 0)
         y = self.entry.winfo_rooty() + self.entry.winfo_height() + 1
-        x = max(0, min(x, win.winfo_screenwidth() - win.winfo_reqwidth() - 4))
+        x, y = keep_on_screen(self.entry, x, y, win.winfo_reqwidth(), win.winfo_reqheight(),
+                              flip=self.entry.winfo_height() + 2)
         win.geometry(f"+{x}+{y}")
         win.deiconify()
 
