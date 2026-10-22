@@ -1493,6 +1493,16 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(again.recent(), [a])
             self.assertEqual(again.autosave_minutes, 3)
 
+    def test_toolbar_and_ribbon_settings(self):
+        import session
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = session.Settings(tmp)
+            self.assertEqual((settings.qat, settings.ribbon), (["save", "undo", "redo"], "full"))
+            self.assertEqual(settings.custom_title_bar, sys.platform == "win32")  # Windows: drawn like Excel
+            settings.qat, settings.ribbon, settings.custom_title_bar = ["new", "save"], "auto", False
+            again = session.Settings(tmp)
+            self.assertEqual((again.qat, again.ribbon, again.custom_title_bar), (["new", "save"], "auto", False))
+
     def test_autorecover(self):
         import time
         import session
@@ -1706,6 +1716,57 @@ class FastXlsxTests(unittest.TestCase):
         self.assertSameSheets(fast, other)
         self.assertEqual(val(fast, "C1"), 25)
         self.assertEqual(fast.sheets["Sheet1"].hidden_rows, {2})
+
+@unittest.skipUnless(importlib.util.find_spec("tkinter"), "tkinter not installed")
+class UndoNameTests(unittest.TestCase):
+    """The names the Undo button's list shows for each step."""
+
+    def test_names_of_cell_changes(self):
+        import excel_app
+        name = excel_app.SpreadsheetApp._step_name
+        sel = ("Sheet1", (0, 0), (0, 0))
+        typed = ("cells", [(("Sheet1", 0, 0), None, "Hà Nội", None, None)], sel)
+        self.assertEqual(name(typed), 'Nhập "Hà Nội" vào A1')
+        long_text = ("cells", [(("Sheet1", 2, 1), None, "x" * 40, None, None)], sel)
+        self.assertEqual(name(long_text), f'Nhập "{"x" * 23}…" vào B3')
+        cleared = ("cells", [(("Sheet1", 0, 0), "1", None, None, None), (("Sheet1", 1, 0), "2", None, None, None)], sel)
+        self.assertEqual(name(cleared), "Xóa nội dung")
+        bold = ("cells", [(("Sheet1", 0, 0), "1", "1", None, {"bold": True})], sel)
+        self.assertEqual(name(bold), "In đậm")
+        border = ("cells", [(("Sheet1", 0, 0), None, None, {"bt": ["thin", "#000000"]}, {"bb": ["thin", "#000000"]})], sel)
+        self.assertEqual(name(border), "Viền")
+        mixed = ("cells", [(("Sheet1", 0, 0), None, None, None, {"bold": True, "bg": "#ffff00"})], sel)
+        self.assertEqual(name(mixed), "Định dạng ô")
+
+    def test_outer_command_names_the_step(self):
+        import excel_app
+
+        class Commands:
+            _undo_name = None
+
+            def __init__(self):
+                self.seen = []
+
+            @excel_app.undo_name("Chèn hàng")
+            def insert_rows(self):
+                self.finish_typing()
+                self.seen.append(self._undo_name)
+                self.format_cells({"bold": True})
+
+            @excel_app.undo_name(lambda self, update: excel_app.format_name(update))
+            def format_cells(self, update):
+                self.seen.append(self._undo_name)
+
+            @excel_app.content_named
+            def finish_typing(self):
+                self.seen.append(self._undo_name)
+
+        cmd = Commands()
+        cmd.insert_rows()
+        self.assertEqual(cmd.seen, [None, "Chèn hàng", "Chèn hàng"])
+        cmd.seen.clear()
+        cmd.format_cells({"bold": True})
+        self.assertEqual((cmd.seen, cmd._undo_name), (["In đậm"], None))
 
 if __name__ == "__main__":
     unittest.main()

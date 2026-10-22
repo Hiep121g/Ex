@@ -272,9 +272,9 @@ def _icon_sort_filter(cv, P, k, c):
 
 def _icon_sort(cv, P, k, c, desc):
     top, bottom = ("Z", "A") if desc else ("A", "Z")
-    _glyph(cv, P, k, 5, 4, top, 7, BLUE, "bold")
-    _glyph(cv, P, k, 5, 11.5, bottom, 7, DARK, "bold")
-    _arrow(cv, P, k, 11.5, 2, 11.5, 14, DARK, 1.2)
+    _glyph(cv, P, k, 5, 4, top, 7, c or BLUE, "bold")
+    _glyph(cv, P, k, 5, 11.5, bottom, 7, c or DARK, "bold")
+    _arrow(cv, P, k, 11.5, 2, 11.5, 14, c or DARK, 1.2)
 
 
 def _icon_filter(cv, P, k, c, clear=False):
@@ -722,6 +722,15 @@ def _icon_sheet_op(cv, P, k, c, op):
 
 
 def _icon_file(cv, P, k, c, kind):
+    if c and kind in ("open", "new"):  # one colour (white on the title bar)
+        width = max(1, round(1.2 * k))
+        if kind == "open":
+            cv.create_line(*P(1.5, 13.5, 1.5, 3, 6, 3, 7.5, 4.5, 13, 4.5, 13, 7.5), fill=c, width=width)
+            cv.create_polygon(*P(1.5, 13.5, 4, 7.5, 15.5, 7.5, 13, 13.5), fill="", outline=c, width=width)
+        else:
+            cv.create_polygon(*P(3, 1.5, 9.5, 1.5, 13, 5, 13, 14.5, 3, 14.5), fill="", outline=c, width=width)
+            cv.create_line(*P(9.5, 1.5, 9.5, 5, 13, 5), fill=c, width=width)
+        return
     if kind == "open":
         cv.create_polygon(*P(1, 3, 6, 3, 7.5, 5, 14, 5, 14, 14, 1, 14), fill="#ffd65c", outline="#b38f00")
         cv.create_polygon(*P(1, 14, 3.5, 8, 15.5, 8, 14, 14), fill="#ffe699", outline="#b38f00")
@@ -865,6 +874,13 @@ def _icon_print(cv, P, k, c):
 
 
 def _icon_print_preview(cv, P, k, c):
+    if c:  # one colour: page and magnifier outlines
+        width = max(1, round(1.2 * k))
+        cv.create_polygon(*P(2, 1.5, 8.5, 1.5, 11, 4, 11, 7), fill="", outline=c, width=width)
+        cv.create_line(*P(2, 1.5, 2, 14, 6.5, 14), fill=c, width=width)
+        cv.create_oval(*P(6.5, 7.5, 12, 13), outline=c, width=width)
+        cv.create_line(*P(11.5, 12.5, 15, 16), fill=c, width=max(2, round(1.8 * k)))
+        return
     _page(cv, P, 1.5, 1, 11.5, 14)
     _lines(cv, P, k, [(3.5, 4, 8.5), (3.5, 6, 8.5), (3.5, 8, 7)], GRAY)
     cv.create_oval(*P(6.5, 7.5, 12.5, 13.5), outline=BLUE, width=max(1, round(1.4 * k)), fill="#ffffff")
@@ -872,6 +888,11 @@ def _icon_print_preview(cv, P, k, c):
 
 
 def _icon_pdf(cv, P, k, c):
+    if c:
+        width = max(1, round(1.2 * k))
+        cv.create_polygon(*P(3, 1.5, 10, 1.5, 13, 4.5, 13, 14.5, 3, 14.5), fill="", outline=c, width=width)
+        _glyph(cv, P, k, 8, 9.5, "PDF", 5.5, c, "bold")
+        return
     _page(cv, P, 2.5, 1, 13.5, 15)
     cv.create_rectangle(*P(0.5, 7, 12, 13), fill=RED, outline="")
     _glyph(cv, P, k, 6.25, 10, "PDF", 5.5, "#ffffff", "bold")
@@ -1189,10 +1210,12 @@ class RibbonButton(tk.Canvas):
     """
 
     def __init__(self, master, ui, *, text="", icon=None, command=None, menu=None, large=False, split=False,
-                 tooltip=None, color=None, bg=None, fg=TEXT_FG, hover_bg=HOVER_BG, height=None):
+                 tooltip=None, color=None, bg=None, fg=TEXT_FG, hover_bg=HOVER_BG, pressed_bg=PRESSED_BG,
+                 disabled_color=None, height=None):
         self.ui, self.text, self.icon, self.command = ui, text, icon, command
         self.menu, self.large, self.split, self.color = menu, large, split and menu is not None, color
-        self.bg, self.fg, self.hover_bg = bg or ui.bg, fg, hover_bg
+        self.bg, self.fg, self.hover_bg, self.pressed_bg = bg or ui.bg, fg, hover_bg, pressed_bg
+        self.disabled_color = disabled_color
         self.checked = self.pressed = False
         self.hover = None
         self.enabled = True
@@ -1206,8 +1229,7 @@ class RibbonButton(tk.Canvas):
         self.bind("<Leave>", lambda e: self._set_hover(None))
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
-        if tooltip:
-            Tooltip(self, tooltip, ui.small_font)
+        self.tip = Tooltip(self, tooltip, ui.small_font) if tooltip else None
         self.draw()
 
     def _width(self):
@@ -1238,8 +1260,13 @@ class RibbonButton(tk.Canvas):
         self.draw()
 
     def set_enabled(self, value):
-        self.enabled = bool(value)
-        self.draw()
+        if bool(value) != self.enabled:
+            self.enabled = bool(value)
+            self.draw()
+
+    def set_tooltip(self, text):
+        if self.tip:
+            self.tip.text = text
 
     def _boxes(self):
         w, h = int(self["width"]), int(self["height"])
@@ -1254,7 +1281,7 @@ class RibbonButton(tk.Canvas):
         if self.checked:
             self.create_rectangle(0, 0, w - 1, h - 1, fill=CHECKED_BG, outline=CHECKED_LINE)
         if self.hover and self.enabled:
-            hot = PRESSED_BG if self.pressed else self.hover_bg
+            hot = self.pressed_bg if self.pressed else self.hover_bg
             if self.split:
                 main, arrow = self._boxes()
                 active, other = (arrow, main) if self.hover == "arrow" else (main, arrow)
@@ -1263,9 +1290,10 @@ class RibbonButton(tk.Canvas):
             else:
                 self.create_rectangle(0, 0, w - 1, h - 1, fill=hot, outline="")
         fg = self.fg if self.enabled else "#a0a0a0"
+        color = self.color if self.enabled or not self.disabled_color else self.disabled_color
         if self.large:
             iy = round(4 * s)
-            draw_icon(self, self.icon, (w - self.icon_px) // 2, iy, self.icon_px, self.color)
+            draw_icon(self, self.icon, (w - self.icon_px) // 2, iy, self.icon_px, color)
             lines = self.text.split("\n") if self.text else []
             line_h = self.ui.font.metrics("linespace")
             y = iy + self.icon_px + round(4 * s) + line_h // 2
@@ -1283,7 +1311,7 @@ class RibbonButton(tk.Canvas):
         else:
             x = round(4 * s)
             if self.icon:
-                draw_icon(self, self.icon, x, (h - self.icon_px) // 2, self.icon_px, self.color)
+                draw_icon(self, self.icon, x, (h - self.icon_px) // 2, self.icon_px, color)
                 x += self.icon_px + round(5 * s)
             if self.text:
                 self.create_text(x, h // 2, text=self.text, anchor="w", font=self.ui.font, fill=fg)
@@ -1293,6 +1321,8 @@ class RibbonButton(tk.Canvas):
     def _triangle(self, cx, cy):
         d = max(2, round(2.6 * self.ui.scale))
         color = "#ffffff" if self.bg != RIBBON_BG else DARK
+        if not self.enabled and self.disabled_color:
+            color = self.disabled_color
         self.create_polygon(cx - d, cy - d // 2, cx + d, cy - d // 2, cx, cy + d - d // 2, fill=color, outline="")
 
     def _part(self, x, y):
@@ -1352,10 +1382,13 @@ class Popup(tk.Toplevel):
         self._pos = (x, y)
         self.bind("<Escape>", lambda e: self.close())
 
-    def show(self):
+    def show(self, right=False):
+        """Open below the given point; with right=True the point is the popup's top-right corner."""
         self.update_idletasks()
         x, y = self._pos
         w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        if right:
+            x -= w
         x = max(0, min(x, self.winfo_screenwidth() - w - 4))
         if y + h > self.winfo_screenheight() - 40:
             y = max(0, y - h - 30)
@@ -1538,17 +1571,16 @@ class RibbonGroup(tk.Frame):
 
 
 class Ribbon(tk.Frame):
-    """Green tab strip with a quick-access toolbar, plus the active tab's page of groups."""
+    """Green tab strip plus the active tab's page of groups. on_toggle(collapsed) is called when the
+    commands are hidden or shown again (double-click on a tab)."""
 
     def __init__(self, master, ui):
         super().__init__(master, bg=ui.bg)
         self.ui = ui
         self.bar = tk.Frame(self, bg=TAB_BAR_BG)
         self.bar.pack(side="top", fill="x")
-        self.qat = tk.Frame(self.bar, bg=TAB_BAR_BG)
-        self.qat.pack(side="left", padx=(ui.px(4), ui.px(10)))
         self.tab_strip = tk.Frame(self.bar, bg=TAB_BAR_BG)
-        self.tab_strip.pack(side="left", fill="y")
+        self.tab_strip.pack(side="left", fill="y", padx=(ui.px(4), 0))
         self.extra = tk.Frame(self.bar, bg=TAB_BAR_BG)
         self.extra.pack(side="left", fill="both", expand=True, padx=(ui.px(16), ui.px(8)))
         self.body = tk.Frame(self, bg=ui.bg, height=ui.content_h + ui.label_h + ui.px(4))
@@ -1559,6 +1591,7 @@ class Ribbon(tk.Frame):
         self.pages, self.labels = {}, {}
         self.current = None
         self.collapsed = False
+        self.on_toggle = None
 
     def add_tab(self, name, command=None):
         """A tab with a page of groups; with `command` the tab only runs it (like 'File')."""
@@ -1600,3 +1633,5 @@ class Ribbon(tk.Frame):
             self.body.pack_forget()
         else:
             self.body.pack(side="top", fill="x", before=self.line)
+        if self.on_toggle:
+            self.on_toggle(self.collapsed)

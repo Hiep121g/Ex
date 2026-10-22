@@ -15,7 +15,9 @@ import time
 import formula_engine as fe
 
 MAX_RECENT = 10
-DEFAULTS = {"recent": [], "autosave_minutes": 5}
+QAT_DEFAULT = ["save", "undo", "redo"]  # Excel's Quick Access Toolbar out of the box
+RIBBON_MODES = ("full", "tabs", "auto")  # tabs and commands / tabs only / auto-hide
+DEFAULTS = {"recent": [], "autosave_minutes": 5, "qat": QAT_DEFAULT, "ribbon": "full", "custom_title_bar": None}
 
 
 def app_dir():
@@ -42,7 +44,8 @@ def _write_json(path, data):
 
 
 class Settings:
-    """settings.json: the recent files and the AutoRecover interval."""
+    """settings.json: the recent files, the AutoRecover interval, the Quick Access Toolbar's commands, how
+    the ribbon shows and whether PyExcel draws the window's title bar."""
 
     def __init__(self, folder=None):
         self.folder = folder or app_dir()
@@ -82,6 +85,37 @@ class Settings:
     @autosave_minutes.setter
     def autosave_minutes(self, minutes):
         self.data["autosave_minutes"] = max(0, int(minutes))
+        self.save()
+
+    @property
+    def qat(self):
+        items = self.data.get("qat")
+        return [k for k in items if isinstance(k, str)] if isinstance(items, list) else list(QAT_DEFAULT)
+
+    @qat.setter
+    def qat(self, keys):
+        self.data["qat"] = list(keys)
+        self.save()
+
+    @property
+    def ribbon(self):
+        mode = self.data.get("ribbon")
+        return mode if mode in RIBBON_MODES else "full"
+
+    @ribbon.setter
+    def ribbon(self, mode):
+        self.data["ribbon"] = mode
+        self.save()
+
+    @property
+    def custom_title_bar(self):
+        """PyExcel's own title bar instead of the system's: by default on Windows (as Excel)."""
+        value = self.data.get("custom_title_bar")
+        return sys.platform == "win32" if value is None else bool(value)
+
+    @custom_title_bar.setter
+    def custom_title_bar(self, value):
+        self.data["custom_title_bar"] = bool(value)
         self.save()
 
 
