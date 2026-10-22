@@ -72,6 +72,50 @@ def load_picture(path):
     raise ValueError("Chỉ chèn được ảnh PNG, GIF hoặc JPEG (cài thêm Pillow để mở các định dạng khác).")
 
 
+# ------------------------------------------------------------------ pictures from the clipboard
+
+def encode_png(width, height, rows, alpha=False):
+    """PNG data of `height` rows of RGB (or RGBA) bytes."""
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xffffffff)
+    raw = b"".join(b"\0" + bytes(row) for row in rows)
+    head = struct.pack(">IIBBBBB", width, height, 8, 6 if alpha else 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", head) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+
+
+def png_from_dib(dib):
+    """PNG data of a Windows device-independent bitmap (CF_DIB / CF_DIBV5 on the clipboard: a screenshot,
+    a picture copied in a browser...) with 24 or 32 bits per pixel; None for other kinds."""
+    if len(dib) < 40:
+        return None
+    size, width, height, _, bits, compression = struct.unpack("<IiiHHI", dib[:20])
+    used = struct.unpack("<I", dib[32:36])[0]
+    if width <= 0 or height == 0 or bits not in (24, 32) or compression not in (0, 3):
+        return None
+    start = size + (12 if compression == 3 and size == 40 else 0) + used * 4
+    stride = (width * bits + 31) // 32 * 4
+    h = abs(height)
+    if len(dib) < start + stride * h:
+        return None
+    step = bits // 8
+    rows = []
+    has_alpha = False
+    for y in range(h):
+        line = dib[start + (h - 1 - y if height > 0 else y) * stride:][:width * step]
+        if bits == 32 and not has_alpha and any(line[3::4]):
+            has_alpha = True
+        rows.append(line)
+    out = []
+    for line in rows:
+        rgb = bytearray(width * (4 if has_alpha else 3))
+        n = 4 if has_alpha else 3
+        rgb[0::n], rgb[1::n], rgb[2::n] = line[2::step], line[1::step], line[0::step]
+        if has_alpha:
+            rgb[3::4] = line[3::4]
+        out.append(rgb)
+    return encode_png(width, h, out, has_alpha)
+
+
 # ------------------------------------------------------------------ PNG decoding (for PDFs without Pillow)
 
 def decode_png(data):

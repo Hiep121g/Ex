@@ -1594,6 +1594,7 @@ class Ribbon(tk.Frame):
         self.current = None
         self.collapsed = False
         self.on_toggle = None
+        self.on_select = None  # called with the tab's name when one is shown
 
     def add_tab(self, name, command=None):
         """A tab with a page of groups; with `command` the tab only runs it (like 'File')."""
@@ -1628,6 +1629,8 @@ class Ribbon(tk.Frame):
         for n, label in self.labels.items():
             active = n == name
             label.config(bg=self.ui.bg if active else TAB_BAR_BG, fg=TAB_BAR_BG if active else "#ffffff")
+        if self.on_select:
+            self.on_select(name)
 
     def toggle_collapse(self):
         self.collapsed = not self.collapsed

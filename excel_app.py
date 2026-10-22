@@ -27,6 +27,7 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import charts
 import dialogs
+import drawing
 import formula_engine as fe
 import images
 import pivot as pv
@@ -34,6 +35,7 @@ import printing
 import richclip
 import screens
 import session
+import shapes
 import ttf
 from formula_assist import FormulaAssist
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
@@ -62,6 +64,7 @@ RIBBON_MODE_ITEMS = (  # Ribbon Display Options: (mode, name, explanation)
 
 ACCENT = "#107c41"
 SPILL_LINE = "#5b9bd5"  # the outline of a dynamic array
+AUTOSCROLL_MS = 25  # how often the sheet scrolls while a drag is held past its edge
 GRID = "#e1e1e1"
 HEADER_BG = "#f3f3f3"
 HEADER_FG = "#555555"
@@ -244,7 +247,10 @@ THANH RIBBON
     liên kết; nhấp và giữ để chọn ô. Hàm =HYPERLINK("https://...", "Tên") cũng tạo liên kết.
   • Chèn → Ảnh: ảnh PNG, GIF, JPEG đặt nổi trên trang tính; kéo để di chuyển, kéo góc để đổi cỡ (giữ tỉ lệ),
     chuột phải để thay ảnh / đặt lại kích thước / xóa. Ảnh được in và lưu cùng tệp. Cài Pillow (pip install
-    pillow) để ảnh co giãn mịn hơn và xem được ảnh JPEG trên màn hình.
+    pillow) để ảnh co giãn mịn hơn và xem được ảnh JPEG trên màn hình. Chụp màn hình (Win+Shift+S) hoặc sao
+    chép ảnh trên web rồi Ctrl+V cũng dán được ảnh vào trang tính.
+  • Chèn → Hình dạng: hình chữ nhật, bầu dục, mũi tên, lưu đồ, chú thích, sao...; chọn hình rồi kéo trên trang
+    tính (giữ Shift để vuông/tròn), hoặc nhấp một lần để có cỡ mặc định. Chèn → Hộp văn bản để viết chữ tự do.
   • Dữ liệu → Nhóm (Alt+Shift+→): gom các hàng/cột đang chọn; nút −/+ ở lề trái (hoặc trên) thu gọn / mở
     rộng nhóm, các nút 1 2 3 ở góc hiện theo mức. Bỏ nhóm (Alt+Shift+←), Xóa dàn bài, Hiện/Ẩn chi tiết.
   • Dữ liệu → Tổng phụ: với bảng đã sắp xếp theo một cột (ví dụ Khu vực), thêm hàng "Bắc Tổng", "Nam Tổng"...
@@ -261,6 +267,29 @@ NHẬP DỮ LIỆU
   • F4 khi đang gõ công thức: đổi địa chỉ cạnh con trỏ lần lượt A1 → $A$1 → A$1 → $A1 → A1.
   • Gõ ' ở đầu để giữ nguyên dạng chữ ('007). Ngày nhập dạng 21/10/2026; phần trăm như 15%.
 
+HÌNH VẼ VÀ SƠ ĐỒ (tab Sơ đồ)
+  • Tab Sơ đồ dành riêng cho vẽ sơ đồ logic / lưu đồ: bấm một hình (Bắt đầu/Kết thúc, Xử lý, Quyết định,
+    Nhập/Xuất...) hoặc cổng logic (AND, OR, NOT, NAND, NOR, XOR...) rồi kéo hoặc nhấp trên trang tính.
+  • Đường nối: chọn Gấp khúc / Thẳng / Cong rồi kéo từ một hình sang hình khác — khi rê gần hình sẽ hiện các
+    chấm xanh (điểm nối), thả vào đó là đường dính vào hình: kéo hình đi thì đường tự đi theo và tự vòng
+    tránh hình. Công cụ đường nối giữ nguyên để vẽ liền nhiều đường; Esc hoặc chuột phải để thôi.
+  • Thêm nối tiếp (↓ → ↑ ←): chọn một hình rồi bấm, có ngay hình giống nó bên cạnh, nối sẵn bằng mũi tên,
+    và gõ chữ luôn — vẽ lưu đồ rất nhanh.
+  • Chọn hình: nhấp vào hình; Shift/Ctrl+nhấp để chọn thêm; bật "Chọn đối tượng" rồi kéo để chọn nhiều hình.
+    Kéo để di chuyển (đường hồng hiện ra khi thẳng hàng với hình khác; giữ Shift để đi thẳng ngang/dọc;
+    Ctrl+kéo để sao chép), kéo chấm tròn để đổi cỡ, kéo chấm trên cùng để xoay (Shift: từng 15°), chấm vàng
+    của hình chú thích để chỉnh đuôi. Phím mũi tên: dịch 5 điểm ảnh (Ctrl: 1), Shift+mũi tên: đổi cỡ,
+    Alt+←/→: xoay 15°, Delete: xóa, Tab: sang hình khác, Esc: bỏ chọn.
+  • Gõ chữ trong hình: chọn hình rồi gõ luôn (hoặc Enter / F2 / nhấp đúp để sửa); Esc hoặc nhấp ra ngoài để
+    xong. Nút B, I, U, cỡ chữ, màu chữ, màu tô, căn lề ở tab Trang chủ cũng áp dụng cho hình đang chọn.
+  • Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D (nhân bản) với hình đang chọn; chuột phải để đổi hình, đổi kiểu đường
+    nối, đưa lên trên / xuống dưới.
+  • Kiểu hình: Kiểu nhanh, Màu tô, Đường viền (màu, độ dày, nét đứt), Màu chữ, Mũi tên; Sắp xếp: đưa lên
+    trước / ra sau, căn trái/giữa/phải, phân phối đều, xoay, lật. Bắt dính lưới: hình bám vào cạnh ô.
+  • Trang sơ đồ mới: thêm một trang tính riêng để vẽ, bật sẵn Chọn đối tượng và Bắt dính lưới.
+  • Hình được lưu trong .xlsx đúng kiểu của Excel (mở bằng Excel vẫn sửa được, đường nối vẫn dính hình) và
+    được in / xuất PDF. Cổng logic không có sẵn trong Excel nên được lưu dạng hình tự do.
+
 MẢNG ĐỘNG (như Excel 365)
   • Công thức cho ra nhiều giá trị sẽ tự "tràn" sang các ô bên dưới / bên phải: =SORT(FILTER(A2:C99,B2:B99="Bắc"))
     =UNIQUE(A2:A99)   =SEQUENCE(10)   =TEXTSPLIT("a,b,c",",")   =A2:A10*B2:B10. Chỉ ô đầu chứa công thức;
@@ -275,7 +304,8 @@ MẢNG ĐỘNG (như Excel 365)
     Chưa hỗ trợ tham chiếu cả cột/hàng (A:A, 1:1) và toán tử @ (dùng hàm SINGLE).
 
 CHUỘT
-  • Kéo để chọn vùng; Shift+nhấp mở rộng vùng; nhấp tiêu đề để chọn cả cột/hàng.
+  • Kéo để chọn vùng; Shift+nhấp mở rộng vùng; nhấp tiêu đề để chọn cả cột/hàng. Kéo ra ngoài mép để cuộn
+    theo: chuột càng xa mép thì cuộn càng nhanh.
   • Kéo mép tiêu đề cột/hàng để đổi kích thước; nhấp đúp mép để tự khớp.
   • Kéo ô vuông nhỏ ở góc vùng chọn để sao chép hoặc điền chuỗi (1, 2 → 3, 4...; "Mục 1" → "Mục 2").
   • Chổi "Sao chép định dạng": nhấp một lần để dán định dạng một lần, nhấp đúp để dán nhiều lần.
@@ -314,7 +344,8 @@ THANH TIÊU ĐỀ VÀ RIBBON
     phải để chiếm nửa màn hình), nhấp đúp để phóng to / khôi phục, kéo các cạnh cửa sổ để đổi kích thước.
     Muốn dùng thanh tiêu đề của Windows: Tùy chọn Hiển thị Ribbon → Dùng thanh tiêu đề của Windows.
   • Nhiều màn hình (Windows): PyExcel vẽ theo tỉ lệ (Scale) của màn hình đang đứng, kéo sang màn hình khác
-    là tự vẽ lại cho nét và mượt. Tắt ở Tùy chọn Hiển thị Ribbon → Vẽ theo tỉ lệ của từng màn hình (cần mở lại).
+    là tự vẽ lại (chuyển mờ dần cho mượt) cho nét. Tắt ở Tùy chọn Hiển thị Ribbon → Vẽ theo tỉ lệ của từng
+    màn hình (cần mở lại).
 
 TỆP CSV / VĂN BẢN
   • Mở tệp .csv tự nhận bảng mã như Excel: UTF-8 (có hoặc không có BOM), UTF-16 ("Văn bản Unicode"),
@@ -434,7 +465,7 @@ class ChangeSet:
         return [(key, *item) for key, item in self.items.items() if item[0] != item[1] or item[2] != item[3]]
 
 
-class SpreadsheetApp:
+class SpreadsheetApp(drawing.DrawingTools):
     def __init__(self, root, path=None):
         self.root = root
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
@@ -473,7 +504,8 @@ class SpreadsheetApp:
         self.show_notes = False        # every note shown, not just the one under the pointer
         self.hover_note = None         # (sheet, row, col) of the note shown under the pointer
         self._list_button = None       # canvas box of the active cell's validation-list arrow
-        self.chart_sel = None          # index of the selected chart on this sheet
+        self.chart_sel = None          # index of the selected chart, picture or shape on this sheet
+        self._init_drawing()
         self.show_pivot_fields = True  # the PivotTable Fields pane appears in a pivot report
         self._pane_key = None          # (sheet, pivot id, layout) the pane shows
         self._chart_boxes = []         # [(index, canvas box)] of the charts drawn
@@ -563,8 +595,50 @@ class SpreadsheetApp:
 
     def rescale(self, scale):
         """Build the window's contents again at another scale, keeping the window's physical size: text,
-        icons, ribbon, bars and the sheet. The workbook, selection, undo and settings carry on."""
+        icons, ribbon, bars and the sheet. The workbook, selection, undo and settings carry on. A picture of
+        the window as it was covers it meanwhile and then fades into the new one (Windows)."""
         self.commit_edit()
+        cover = self._cover_window()
+        try:
+            self._rebuild_at(scale)
+        finally:
+            if cover is not None:
+                self.root.update()
+                self._fade_cover(cover, time.perf_counter())
+
+    def _cover_window(self, image=None):
+        """A borderless window on top of PyExcel's showing what PyExcel showed (or `image`, PPM data): the
+        rebuilding behind it is not seen. None where the screen can't be read."""
+        root = self.root
+        x, y, w, h = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
+        image = image or screens.grab_screen(x, y, w, h)
+        if not image:
+            return None
+        try:
+            cover = tk.Toplevel(root)
+            cover.overrideredirect(True)
+            cover.attributes("-topmost", True)
+            cover.geometry(f"{w}x{h}+{x}+{y}")
+            cover.picture = tk.PhotoImage(master=cover, data=image, format="ppm")
+            tk.Label(cover, image=cover.picture, bd=0, highlightthickness=0).pack(fill="both", expand=True)
+            cover.update()
+        except tk.TclError:
+            return None
+        return cover
+
+    def _fade_cover(self, cover, start, length=0.22):
+        """Fade the cover out (easing out) and remove it."""
+        t = (time.perf_counter() - start) / length
+        try:
+            if t >= 1:
+                cover.destroy()
+                return
+            cover.attributes("-alpha", (1 - t) ** 2)
+        except tk.TclError:
+            return
+        self.root.after(15, self._fade_cover, cover, start, length)
+
+    def _rebuild_at(self, scale):
         old, root = self.scale, self.root
         tab, mode = self.ribbon.current, self.ribbon_mode
         shown = {"grid": self.grid_var.get(), "headings": self.headings_var.get(), "fxbar": self.fxbar_var.get()}
@@ -829,6 +903,7 @@ class SpreadsheetApp:
             label.winfo_rootx(), label.winfo_rooty() + label.winfo_height()))
         self._build_home(rb.add_tab("Trang chủ"))
         self._build_insert_tab(rb.add_tab("Chèn"))
+        self._build_diagram_tab(rb.add_tab("Sơ đồ"))
         self._build_page_layout_tab(rb.add_tab("Bố cục Trang"))
         self._build_formulas_tab(rb.add_tab("Công thức"))
         self._build_data_tab(rb.add_tab("Dữ liệu"))
@@ -838,6 +913,7 @@ class SpreadsheetApp:
         rb.select("Trang chủ")
         self._build_tell_me(rb.extra)
         rb.body.bind("<Configure>", self._fit_ribbon, add="+")
+        rb.on_select = lambda name: self.root.after_idle(self._fit_ribbon)
 
     # ------------------------------------------------------------------ title bar: toolbar and ribbon options
 
@@ -1253,10 +1329,26 @@ class SpreadsheetApp:
 
     def _build_insert_tab(self, page):
         rb = self.ribbon
+        self._register_shape_icons()
         g = rb.group(page, "Bảng")
         self._btn(g, large=True, icon="pivot", text="PivotTable\n", label="PivotTable", command=self.insert_pivot,
                   tooltip="Chèn PivotTable\nTóm tắt dữ liệu: tổng, đếm, trung bình... theo hàng và cột")
         self._btn(g, large=True, icon="format_table", text="Bảng", menu=self._table_gallery, tooltip="Tạo bảng có định dạng")
+        g = rb.group(page, "Minh họa")
+        self._btn(g, large=True, icon="picture", text="Ảnh\n", command=self.insert_picture,
+                  tooltip="Chèn ảnh\nẢnh PNG, GIF, JPEG từ máy tính, đặt nổi trên các ô. Cũng có thể dán ảnh chụp "
+                          "màn hình bằng Ctrl+V")
+        self._btn(g, large=True, icon="shapes", text="Hình\ndạng", label="Hình dạng",
+                  menu=lambda b: self.shape_gallery(b, self.insert_shape),
+                  tooltip="Chèn hình dạng\nHình chữ nhật, hình tròn, mũi tên, đường nối, lưu đồ, chú thích...\n"
+                          "Chọn hình rồi kéo trên trang tính (giữ Shift để giữ tỉ lệ)")
+        self._btn(g, large=True, icon="shape_flowChartDecision", text="Sơ đồ\n", label="Vẽ sơ đồ",
+                  command=lambda: self.ribbon.select("Sơ đồ"),
+                  tooltip="Vẽ sơ đồ logic, lưu đồ\nMở tab Sơ đồ: hình lưu đồ, cổng logic, đường nối tự dính vào hình")
+        g = rb.group(page, "Văn bản")
+        self._btn(g, large=True, icon="shape_textBox", text="Hộp văn\nbản", label="Hộp văn bản",
+                  command=lambda: self.insert_shape("textBox"),
+                  tooltip="Hộp văn bản\nKéo trên trang tính để vẽ hộp rồi gõ chữ")
         g = rb.group(page, "Ô và trang tính")
         col = g.column()
         self._btn(g, col, side="top", icon="insert_row", text="Chèn hàng", command=self.insert_rows)
@@ -1270,9 +1362,6 @@ class SpreadsheetApp:
             self._btn(g, large=True, icon="chart_" + kind, text=f"{text}\n", label=f"Biểu đồ {text.lower()}",
                       command=lambda k=kind: self.insert_chart(k),
                       tooltip=f"Chèn biểu đồ {text.lower()}\nVẽ từ vùng dữ liệu đang chọn")
-        g = rb.group(page, "Minh họa")
-        self._btn(g, large=True, icon="picture", text="Ảnh\n", command=self.insert_picture,
-                  tooltip="Chèn ảnh\nẢnh PNG, GIF, JPEG từ máy tính, đặt nổi trên các ô")
         g = rb.group(page, "Liên kết")
         self._btn(g, large=True, icon="link", text="Liên\nkết", command=self.insert_hyperlink,
                   tooltip="Chèn liên kết (Ctrl+K)\nTới trang web, tệp, một ô trong sổ làm việc hoặc email")
@@ -1535,6 +1624,9 @@ class SpreadsheetApp:
 
     def _fit_ribbon(self, event=None):
         """Collapse parts of the Home tab when the window is too narrow (like Excel)."""
+        if self.ribbon.current == "Sơ đồ":
+            self._fit_diagram_tab()
+            return
         page = self.ribbon.pages.get("Trang chủ")
         if page is None or self.ribbon.current != "Trang chủ":
             return
@@ -2323,7 +2415,8 @@ class SpreadsheetApp:
         cv = self.canvas
         return (id(self.wb), id(self.sh), self.sheet, self.top, self.left, cv.winfo_width(), cv.winfo_height(),
                 self.px, self.edit_serial, self.is_editing(), self.show_grid, self.show_headings, self.show_formulas,
-                self.show_notes, self.hover_note, self.chart_sel, self.clip and self.clip["rect"],
+                self.show_notes, self.hover_note, self.chart_sel, tuple(sorted(self.more_sel)),
+                self.clip and self.clip["rect"],
                 self.header_w, self.header_h)
 
     def _draw_selection_tint(self, cv, W, H, rect, multi, areas, clear=False):
@@ -2429,11 +2522,19 @@ class SpreadsheetApp:
         return x, y, x + chart["size"][0] * self.px, y + chart["size"][1] * self.px
 
     def _draw_charts(self, cv, W, H):
+        """The floating objects: charts, pictures and shapes, in their stacking order, then what shows the
+        selected ones."""
         self._chart_boxes = []
-        if self.chart_sel is not None and self.chart_sel >= len(self.sh.charts):
+        n = len(self.sh.charts)
+        if self.chart_sel is not None and self.chart_sel >= n:
             self.chart_sel = None
+        self.more_sel = {i for i in self.more_sel if i < n}
+        self._prepare_shapes()
         for i, chart in enumerate(self.sh.charts):
-            box = self._chart_box(chart)
+            box = self._boxes[i]
+            if chart["type"] == fe.SHAPE:
+                self._draw_shape(cv, i, chart, box, W, H)
+                continue
             if box[2] < self.header_w or box[0] > W or box[3] < self.header_h or box[1] > H:
                 continue
             if chart["type"] == fe.PICTURE:
@@ -2443,12 +2544,7 @@ class SpreadsheetApp:
                 charts.draw_chart(cv, box, chart["type"], chart.get("title"), labels, series,
                                   self.font_for({"size": 14}), self.font_for({"size": 9}), self.px)
             self._chart_boxes.append((i, box))
-            if i == self.chart_sel:
-                x0, y0, x1, y1 = box
-                cv.create_rectangle(x0, y0, x1, y1, outline="#7a7a7a", width=max(1, round(self.px)))
-                s = max(3, round(4 * self.px))
-                for hx, hy in self._chart_handles(box).values():
-                    cv.create_rectangle(hx - s, hy - s, hx + s, hy + s, fill="#ffffff", outline="#5f5f5f")
+        self._draw_drawing_overlay(cv, W, H)
 
     def _draw_picture(self, cv, picture, box):
         x0, y0, x1, y1 = box
@@ -3000,6 +3096,9 @@ class SpreadsheetApp:
 
     def select_all(self):
         self.commit_edit()
+        if self._objects_selected():
+            self.select_all_objects()
+            return
         self.areas = []
         self.cur, self.ext = (0, 0), (MAX_ROWS - 1, MAX_COLS - 1)
         self.refresh()
@@ -3025,6 +3124,8 @@ class SpreadsheetApp:
 
     def on_key(self, e):
         ks = e.keysym
+        if self._drawing_key(e):
+            return "break"
         if self.chart_sel is not None and ks not in MODIFIER_KEYS:
             if ks in ("Delete", "BackSpace"):
                 self.delete_chart()
@@ -3089,6 +3190,8 @@ class SpreadsheetApp:
         self._hide_ribbon_peek()
         if self._list_button and self._inside(self._list_button, e.x, e.y):
             self.open_validation_list()
+            return "break"
+        if self._drawing_press(e):
             return "break"
         hit = self._chart_at(e.x, e.y)
         prot = self.sh.protection
@@ -3167,11 +3270,15 @@ class SpreadsheetApp:
         if not self.drag:
             return
         self._last_mouse = (e.x, e.y)
+        if self.drag["mode"].startswith("shape"):
+            self._drawing_drag(e.x, e.y, e.state)
+            return
         self._drag_to(e.x, e.y)
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
         outside = e.x < self.header_w or e.y < self.header_h or e.x > W or e.y > H
         if outside and self._autoscroll_job is None and not self.drag["mode"].startswith(("resize", "chart")):
-            self._autoscroll_job = self.root.after(50, self._autoscroll)
+            self._autoscroll_at, self._autoscroll_carry = time.perf_counter(), [0.0, 0.0]
+            self._autoscroll_job = self.root.after(AUTOSCROLL_MS, self._autoscroll)
 
     def _drag_to(self, x, y):
         d = self.drag
@@ -3204,26 +3311,53 @@ class SpreadsheetApp:
         self.update_status()
         self.update_name_box()
 
+    def _autoscroll_steps(self, axis, beyond, elapsed):
+        """Rows (axis 0) or columns (1) to scroll after `elapsed` seconds with the mouse `beyond` pixels past
+        the edge: as in Excel, the further out, the faster - a few rows a second close to the edge, thousands
+        far below it. Fractions are carried to the next step."""
+        unit = self.px * (18 if axis == 0 else 40)
+        per_second = (24 if axis == 0 else 16) * 2 ** min(beyond / unit, 10 if axis == 0 else 5)
+        steps = self._autoscroll_carry[axis] + per_second * elapsed
+        whole = int(steps)
+        self._autoscroll_carry[axis] = steps - whole
+        return whole
+
     def _autoscroll(self):
         self._autoscroll_job = None
         if not self.drag or self.drag["mode"].startswith("resize"):
             return
+        now = time.perf_counter()
+        elapsed, self._autoscroll_at = min(0.25, now - self._autoscroll_at), now
         x, y = self._last_mouse
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
         mode, moved = self.drag["mode"], False
         _, r1, _, c1 = self.frozen()
         if y > H and self.top < MAX_ROWS - 1:
-            self.top, moved = self.rows_from(self.top, 1), True
+            n = self._autoscroll_steps(0, y - H, elapsed)
+            if n:
+                self.top, moved = min(MAX_ROWS - 1, self.rows_from(self.top, n)), True
         elif y < self.header_h and self.top > r1 and mode != "colsel":
-            self.top, moved = max(r1, self.rows_from(self.top, -1)), True
+            n = self._autoscroll_steps(0, self.header_h - y, elapsed)
+            if n:
+                self.top, moved = max(r1, self.rows_from(self.top, -n)), True
+        else:
+            self._autoscroll_carry[0] = 0.0
         if x > W and self.left < MAX_COLS - 1:
-            self.left, moved = self.left + 1, True
+            n = self._autoscroll_steps(1, x - W, elapsed)
+            if n:
+                self.left, moved = min(MAX_COLS - 1, self.left + n), True
         elif x < self.header_w and self.left > c1 and mode != "rowsel":
-            self.left, moved = self.left - 1, True
+            n = self._autoscroll_steps(1, self.header_w - x, elapsed)
+            if n:
+                self.left, moved = max(c1, self.left - n), True
+        else:
+            self._autoscroll_carry[1] = 0.0
         if moved:
             self._drag_to(x, y)
             self.update_scrollbars()
-            self._autoscroll_job = self.root.after(50, self._autoscroll)
+        outside = x < self.header_w or y < self.header_h or x > W or y > H
+        if outside:
+            self._autoscroll_job = self.root.after(AUTOSCROLL_MS, self._autoscroll)
 
     def on_release(self, e):
         d, self.drag = self.drag, None
@@ -3233,6 +3367,9 @@ class SpreadsheetApp:
             self.root.after_cancel(self._autoscroll_job)
             self._autoscroll_job = None
         if not d:
+            return
+        if d["mode"].startswith("shape"):
+            self._drawing_release(d, e)
             return
         if d["mode"] == "fill" and d.get("target"):
             self.do_fill(d["target"])
@@ -3256,6 +3393,12 @@ class SpreadsheetApp:
         self.request_refresh(cells=False)
 
     def on_double(self, e):
+        if self.selected_shapes(lines=False) and not self.insert_tool:
+            self._prepare_shapes()
+            hit = next((i for i in range(len(self.sh.charts) - 1, -1, -1) if self._object_hit(i, e.x, e.y)), None)
+            if hit is not None and self.sh.charts[hit]["type"] == fe.SHAPE and not shapes.is_line(self.sh.charts[hit]):
+                self.edit_shape_text(hit)
+                return "break"
         if self._chart_at(e.x, e.y) is not None:
             self.edit_chart()
             return "break"
@@ -3291,9 +3434,13 @@ class SpreadsheetApp:
         kind, r, c = self.hit(e.x, e.y)
         anchor = self._anchor((r, c)) if kind == "cell" else None
         chart = self._chart_at(e.x, e.y)
-        self._set_hover_note((self.sheet, *anchor) if anchor in self.sh.notes and not chart else None)
+        shape_cursor = self._drawing_motion(e)
+        self._set_hover_note((self.sheet, *anchor) if anchor in self.sh.notes and not chart and not shape_cursor
+                             else None)
         border = self._border_hit(e.x, e.y)
-        if chart is not None:
+        if shape_cursor:
+            cursor = shape_cursor
+        elif chart is not None:
             cursor = {None: "fleur", "l": "sb_h_double_arrow", "r": "sb_h_double_arrow", "t": "sb_v_double_arrow",
                       "b": "sb_v_double_arrow", "lt": "top_left_corner", "rb": "bottom_right_corner",
                       "rt": "top_right_corner", "lb": "bottom_left_corner"}[chart[2]]
@@ -3355,6 +3502,17 @@ class SpreadsheetApp:
     def on_context(self, e):
         self.commit_edit()
         self.canvas.focus_set()
+        if self.insert_tool:
+            self.set_insert_tool(None)
+            return
+        self._prepare_shapes()
+        top = next((i for i in range(len(self.sh.charts) - 1, -1, -1) if self._object_hit(i, e.x, e.y)), None)
+        if top is not None and self.sh.charts[top]["type"] == fe.SHAPE:
+            if top not in self.selected_objects():
+                self.chart_sel = top
+            self.redraw()
+            self.shape_context_menu(e)
+            return
         hit = self._chart_at(e.x, e.y)
         if hit is not None:
             self.chart_sel = hit[0]
@@ -3566,6 +3724,8 @@ class SpreadsheetApp:
     @content_named
     def commit_edit(self, move=None, fill=False):
         """Store the text being edited; Ctrl+Enter (fill=True) writes it into every selected cell."""
+        if self.text_edit:
+            self._finish_text_edit()
         if not self.is_editing():
             return
         text = self.edit_var.get() if self.editor is not None else self.fx_var.get()
@@ -3962,6 +4122,9 @@ class SpreadsheetApp:
 
     def copy(self, cut=False):
         self.commit_edit()
+        if self._objects_selected():
+            self.copy_objects(cut)
+            return
         if self.areas:
             messagebox.showinfo(APP_NAME, "Không thể sao chép hoặc cắt nhiều vùng chọn rời nhau cùng lúc.",
                                 parent=self.root)
@@ -4048,12 +4211,17 @@ class SpreadsheetApp:
     def paste(self, mode="all", transpose=False, skip_blanks=False):
         """Paste the clipboard: mode is "all", "formulas", "values" or "formats"."""
         self.commit_edit()
+        if mode == "all" and self.objects_on_clipboard():
+            self.paste_objects()
+            return
         if self._pivot_guard(*self.sel_rect()):
             return
         try:
             text = self.root.clipboard_get()
         except tk.TclError:
             text = ""
+        if not text and mode == "all" and self.paste_picture():  # a screenshot or copied picture
+            return
         text = text.replace("\r\n", "\n").rstrip("\n")
         cs = ChangeSet(self.wb)
         clip = self.clip
@@ -4145,8 +4313,12 @@ class SpreadsheetApp:
     @undo_name(lambda self, update: format_name(update))
     def apply_format(self, update):
         """Merge `update` into the format of every selected cell (None/False removes a key). Cells that had
-        the same format get one shared new format; very large selections are written in one go."""
+        the same format get one shared new format; very large selections are written in one go. With
+        shapes selected their text (and fill) is formatted instead."""
         self.commit_edit()
+        if self.selected_shapes():
+            self.format_shapes_from_cells(update)
+            return
         formats = self.sh.formats
         made = {}
 
@@ -4180,7 +4352,8 @@ class SpreadsheetApp:
         self.canvas.focus_set()
 
     def _active_fmt(self):
-        return self.sh.formats.get(self.cur) or {}
+        fmt = self._shape_fmt()
+        return fmt if fmt is not None else self.sh.formats.get(self.cur) or {}
 
     def toggle_style(self, key):
         self.apply_format({key: not self._active_fmt().get(key)})
@@ -4596,6 +4769,9 @@ class SpreadsheetApp:
         self.clear_formats(contents=True)
 
     def fill_down(self):
+        if self._objects_selected():  # Ctrl+D with shapes selected: duplicate them, as Excel does
+            self.duplicate_objects()
+            return
         self._fill_from_edge(vertical=True)
 
     def fill_right(self):
@@ -5304,6 +5480,12 @@ class SpreadsheetApp:
             index, self.chart_sel = self.chart_sel, None
             self._structural(lambda: self.sh.charts.pop(index))
 
+    def insert_shape(self, kind):
+        """Insert > Shapes: draw `kind` with the next drag on the sheet (Excel's look); the Diagram tab, which
+        formats shapes, opens after."""
+        self.commit_edit()
+        self.set_insert_tool(kind, after=lambda: self.ribbon.select("Sơ đồ"))
+
     # ------------------------------------------------------------------ pictures
 
     def _ask_picture(self):
@@ -5330,13 +5512,31 @@ class SpreadsheetApp:
         found = self._ask_picture()
         if not found:
             return
-        data, fmt, size, name = found
+        self._add_picture(*found)
+
+    def _add_picture(self, data, fmt, size, name):
         r, c = self.cur
         picture = {"type": fe.PICTURE, "image": data, "format": fmt, "id": fe.new_picture_id(), "name": name,
                    "anchor": (r, c, 0, 0), "size": self._fit_picture(size), "native": list(size)}
         if self._structural(lambda: self.sh.charts.append(picture)):
             self.chart_sel = len(self.sh.charts) - 1
             self.redraw()
+            return True
+        return False
+
+    @undo_name("Dán ảnh")
+    def paste_picture(self):
+        """Ctrl+V with a picture on the clipboard (and no text): it floats over the cells at the active
+        cell, as Excel pastes a screenshot."""
+        try:
+            data = richclip.read_image(self.root.winfo_id())
+        except OSError:
+            data = None
+        info = images.image_info(data) if data else None
+        if not info:
+            return False
+        n = sum(1 for o in self.sh.charts if o["type"] == fe.PICTURE) + 1
+        return self._add_picture(base64.b64encode(data).decode("ascii"), info[0], info[1:], f"Ảnh {n}")
 
     def change_picture(self):
         if self.chart_sel is None:

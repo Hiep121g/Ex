@@ -119,6 +119,19 @@ def used_rect(wb, sheet):
     for chart in sh.charts:
         r, c = chart["anchor"][:2]
         w, h = chart["size"]
+        if chart["type"] == fe.SHAPE:  # a callout's tail, a turned shape: what it draws past its box
+            import shapes
+            ex = shapes.extent(chart, (0, 0, w, h))
+            w, h = max(w, ex[2]), max(h, ex[3])
+            up, left = -(chart["anchor"][3] + ex[1]), -(chart["anchor"][2] + ex[0])
+            r0, c0 = r, c
+            while up > 0 and r0 > 0:
+                r0 -= 1
+                up -= sh.row_heights.get(r0, fe.DEFAULT_ROW_HEIGHT)
+            while left > 0 and c0 > 0:
+                c0 -= 1
+                left -= sh.col_widths.get(c0, fe.DEFAULT_COL_WIDTH)
+            rects.append((r0, c0, r, c))
         c2, x = c, sh.col_widths.get(c, fe.DEFAULT_COL_WIDTH) - chart["anchor"][2]
         while x < w and c2 < fe.MAX_COLS - 1:
             c2 += 1
@@ -224,8 +237,8 @@ class PdfSurface:
     def descent(self, spec, size):
         return -self.font(spec).descent * size / 1000
 
-    def text(self, x, y, text, spec, size, color):
-        self.page.text(x, y, text, self.font(spec), size, color)
+    def text(self, x, y, text, spec, size, color, angle=0.0):
+        self.page.text(x, y, text, self.font(spec), size, color, angle)
 
     def picture(self, x0, y0, x1, y1, picture):
         doc = self.page.doc
@@ -295,6 +308,59 @@ class ChartCanvas:
 
     def bbox(self, item):
         return self.boxes[item]
+
+
+class ShapeCanvas:
+    """The bit of the Tk canvas API shapes.draw uses, drawing onto a surface (sizes in points)."""
+
+    def __init__(self, surface, scale):
+        self.s, self.scale = surface, scale
+
+    def font(self, spec):
+        return (spec.get("font") or DEFAULT_FONT, bool(spec.get("bold")), bool(spec.get("italic"))), \
+            (spec.get("size") or DEFAULT_SIZE) * self.scale
+
+    def create_polygon(self, *coords, fill="", outline="", width=0, dash=None, **kw):
+        points = list(zip(coords[0::2], coords[1::2]))
+        if fill:
+            self.s.polygon(points, fill=fill)
+        if outline and width:
+            self.s.polyline(points + points[:1], outline, width, dash)
+
+    def create_line(self, *coords, fill="#000000", width=1, dash=None, **kw):
+        self.s.polyline(list(zip(coords[0::2], coords[1::2])), fill or "#000000", width, dash)
+
+    def create_text(self, x, y, text="", fill="#000000", font=None, width=None, justify="center", anchor="center",
+                    angle=0.0, **kw):
+        import math
+        spec, size = font
+        lines = wrap(text, width, lambda t: self.s.measure(t, spec, size)) if width else text.split("\n")
+        asc, desc = self.s.ascent(spec, size), self.s.descent(spec, size)
+        step = (asc + desc) * 1.15
+        widths = [self.s.measure(line, spec, size) for line in lines]
+        w, h = max(widths, default=0), step * len(lines)
+        left = -w / 2 if anchor in ("center", "n", "s") else -w if "e" in anchor else 0.0
+        top = -h / 2 if anchor in ("center", "w", "e") else -h if anchor.startswith("s") else 0.0
+        a = math.radians(angle)
+        c, sn = math.cos(a), math.sin(a)
+        for i, (line, lw) in enumerate(zip(lines, widths)):
+            lx = left + ((w - lw) / 2 if justify == "center" else w - lw if justify == "right" else 0.0)
+            ly = top + i * step + asc
+            px, py = x + lx * c + ly * sn, y - lx * sn + ly * c  # turned counter-clockwise on the page
+            self.s.text(px, py, line, spec, size, fill or "#000000", angle)
+
+
+def draw_shapes(surface, sh, place, scale):
+    """Draw the sheet's shapes and connectors; place(object) gives an object's box on the page."""
+    import drawingml
+    import shapes
+    objs = sh.charts
+    boxes = [place(o) for o in objs]
+    paths = drawingml.connector_paths(objs, boxes, PT * scale)
+    canvas = ShapeCanvas(surface, scale)
+    for i, obj in enumerate(objs):
+        if obj["type"] == fe.SHAPE:
+            shapes.draw(canvas, obj, boxes[i], PT * scale, canvas.font, paths.get(i))
 
 
 # ------------------------------------------------------------------ drawing a page
@@ -454,10 +520,16 @@ def render_page(surface, layout, index, file_name=""):
         top_body = ys[rows[0]][0]
         surface.clip(x0, top_body, x0 + width, y0 + height)
         canvas = ChartCanvas(surface)
-        for chart in sh.charts:
-            r, c, dx, dy = chart["anchor"]
+
+        def place(obj):
+            r, c, dx, dy = obj["anchor"]
             cx, cy = edge_x(c) + dx * PT * s, edge_y(r) + dy * PT * s
-            w, h = chart["size"][0] * PT * s, chart["size"][1] * PT * s
+            return cx, cy, cx + obj["size"][0] * PT * s, cy + obj["size"][1] * PT * s
+        for chart in sh.charts:
+            if chart["type"] == fe.SHAPE:
+                continue
+            cx, cy, cx1, cy1 = place(chart)
+            w, h = cx1 - cx, cy1 - cy
             if cx > x0 + width or cx + w < x0 or cy > y0 + height or cy + h < top_body:
                 continue
             if chart["type"] == fe.PICTURE:
@@ -466,6 +538,8 @@ def render_page(surface, layout, index, file_name=""):
             labels, series = wb.chart_data(sheet, chart)
             charts.draw_chart(canvas, (cx, cy, cx + w, cy + h), chart["type"], chart.get("title"), labels, series,
                               canvas.font(14 * s), canvas.font(9 * s), PT * s)
+        if any(chart["type"] == fe.SHAPE for chart in sh.charts):
+            draw_shapes(surface, sh, place, s)
         surface.unclip()
 
     # header and footer, centred in the top and bottom margins

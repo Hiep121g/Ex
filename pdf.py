@@ -129,9 +129,21 @@ class Page:
         path = [f"{_n(cx)} {_n(cyp)} m", f"{_n(cx + rx * math.cos(a))} {_n(cyp + ry * math.sin(a))} l"]
         self.ops += ops + path + self._arc_path(cx, cy, rx, ry, start, extent, move=False) + ["h " + paint]
 
-    def text(self, x, y, text, font, size, color="#000000"):
-        """Draw text with its baseline at y, starting at x, falling back to other fonts per character."""
+    def text(self, x, y, text, font, size, color="#000000", angle=0.0):
+        """Draw text with its baseline at y, starting at x, falling back to other fonts per character;
+        `angle`: degrees counter-clockwise about (x, y), as Tk's."""
         self.ops.append(f"{_rgb(color)} rg")
+        if angle:
+            a = math.radians(angle)
+            c, s = math.cos(a), math.sin(a)
+            self.ops.append(f"q {_n(c)} {_n(s)} {_n(-s)} {_n(c)} {_n(x)} {_n(self._y(y))} cm")
+            dx = 0.0
+            for pfont, run in self.doc.runs(text, font):
+                self.fonts.add(pfont)
+                self.ops.append(f"BT /{pfont.resource} {_n(size)} Tf {_n(dx)} 0 Td {pfont.encode(run)} Tj ET")
+                dx += self.doc.run_width(pfont.font, run, size)
+            self.ops.append("Q")
+            return
         for pfont, run in self.doc.runs(text, font):
             self.fonts.add(pfont)
             self.ops.append(f"BT /{pfont.resource} {_n(size)} Tf {_n(x)} {_n(self._y(y))} Td {pfont.encode(run)} Tj ET")

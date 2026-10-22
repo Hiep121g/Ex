@@ -32,6 +32,8 @@ import statistics
 import sys
 import unicodedata
 from collections import Counter, namedtuple
+
+import drawingml
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal, InvalidOperation
 from fractions import Fraction
 
@@ -168,7 +170,7 @@ def quote_sheet(name):
 # what a protected sheet may still allow (Review > Protect Sheet)
 PROTECT_OPTIONS = (("format_cells", "Định dạng ô"), ("format_rows_cols", "Định dạng, ẩn hàng và cột"),
                    ("outline", "Thu gọn / mở rộng nhóm (dàn bài)"), ("filter", "Dùng Bộ lọc"),
-                   ("objects", "Sửa biểu đồ và ảnh"))
+                   ("objects", "Sửa biểu đồ, ảnh và hình vẽ"))
 
 
 def password_hash(password):
@@ -3409,10 +3411,23 @@ def dynamic_date_span(kind, today):
 
 CHART_TYPES = ("column", "bar", "line", "pie")
 PICTURE = "picture"  # a picture floating over the cells, kept with the charts
+SHAPE = "shape"      # a shape or connector drawn over the cells (see shapes.py), kept with the charts too
 
 
 def new_picture_id():
     return os.urandom(6).hex()
+
+
+def _shape_from_dict(d):
+    """A shape as read from a .pyxl file (lists back to tuples, an id when it had none)."""
+    shape = dict(d, anchor=tuple(d.get("anchor", (0, 0, 0, 0))), size=tuple(d.get("size", (96, 96))),
+                 id=d.get("id") or new_picture_id())
+    if shape.get("tip"):
+        shape["tip"] = tuple(shape["tip"])
+    for end in ("start", "end"):
+        if end in shape and not isinstance(shape[end], dict):
+            shape[end] = None
+    return shape
 CHART_SIZE = (480, 288)  # Excel's default 5 x 3 inches
 VALIDATION_TYPES = ("any", "whole", "decimal", "list", "date", "length", "custom")
 VALIDATION_OPS = ("between", "notbetween", "=", "<>", ">", "<", ">=", "<=")
@@ -5036,6 +5051,9 @@ class Workbook:
                     ps[key] = [int(i) - 1 for i in ps.get(key, [])]
                 sh.page_setup = ps
             for ch in sd.get("charts", []):
+                if ch.get("type") == SHAPE:
+                    sh.charts.append(_shape_from_dict(ch))
+                    continue
                 if ch.get("type") == PICTURE and ch.get("image"):
                     sh.charts.append(dict(ch, id=ch.get("id") or new_picture_id(),
                                           anchor=tuple(ch.get("anchor", (0, 0, 0, 0))),
@@ -5987,6 +6005,8 @@ class XlsxCells:
                 parts = {part: title for title, part in self.sheets.items() if title != PIVOT_STORE}
                 for info in z.infolist():
                     raw = z.read(info.filename)
+                    if _DRAWING_PART.fullmatch(info.filename):
+                        raw = _drop_shapes(raw)
                     if info.filename in parts:
                         xml = raw.decode("utf-8")
                         m = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>(.*?)</sheetData>", xml, re.S)
@@ -6118,6 +6138,29 @@ class XlsxCells:
         return self._value(kind, v.group(1) if v else None, inner, strings)
 
 
+_DRAWING_PART = re.compile(r"xl/drawings/[^/]+\.xml")
+_ANCHOR = re.compile(rb"<((?:[\w-]+:)?)(twoCellAnchor|oneCellAnchor|absoluteAnchor)\b.*?</\1\2>", re.S)
+_SHAPE_EL = re.compile(rb"<(?:[\w-]+:)?(?:sp|cxnSp|grpSp)[\s>/]")
+
+
+def _drop_shapes(xml):
+    """A drawing part without its shapes (anchors of pictures and charts stay): openpyxl, which reads the
+    rest, has no use for them and fails on some valid shape XML. PyExcel reads them itself."""
+    return _ANCHOR.sub(lambda m: b"" if _SHAPE_EL.search(m.group(0)) else m.group(0), xml)
+
+
+def _without_shapes(path):
+    """A copy of an .xlsx file (in memory) with the shapes taken out of its drawing parts."""
+    import zipfile
+    out = io.BytesIO()
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as dst:
+        for info in src.infolist():
+            raw = src.read(info.filename)
+            dst.writestr(info.filename, _drop_shapes(raw) if _DRAWING_PART.fullmatch(info.filename) else raw)
+    out.seek(0)
+    return out
+
+
 def _drop_spilled(cells, arrays):
     """The values Excel saved in the rest of each array formula's range (what it spilled, or the cells of an
     old Ctrl+Shift+Enter formula) go: the formula in the first cell spills them again."""
@@ -6161,13 +6204,19 @@ def _load_xlsx(path):
         fast = XlsxCells(path)
     except Exception:  # an unusual file: openpyxl reads all of it
         fast = None
-    book = openpyxl.load_workbook(fast.stripped if fast else path)  # formulas are kept as text
+    try:
+        source = fast.stripped if fast else _without_shapes(path)
+    except Exception:  # not even a readable zip: openpyxl says what is wrong
+        source = path
+    book = openpyxl.load_workbook(source)  # formulas are kept as text
     wb = Workbook(())
+    sheet_names = {}  # sheet titles in the file -> names here
     store = book[PIVOT_STORE] if PIVOT_STORE in book.sheetnames else None
     for ws in book.worksheets:
         if ws is store:
             continue
         name = wb.add_sheet(ws.title if wb.check_sheet_name(ws.title) is None else None)
+        sheet_names[ws.title] = name
         sh = wb.sheets[name]
         row_dims = ws.row_dimensions.items()
         stored = getattr(ws, "_cells", None)  # only the cells the file has (iter_rows also makes the gaps)
@@ -6295,6 +6344,9 @@ def _load_xlsx(path):
                 wb.define_name(name, "=" + ref, comment)
             except ValueError:
                 pass
+    found = _shapes_from_xlsx(path, {title: _geometry(wb.sheets[name]) for title, name in sheet_names.items()})
+    for title, objects in found.items():
+        wb.sheets[sheet_names[title]].charts.extend(objects)
     titles = [ws.title for ws in book.worksheets if ws is not store]
     names = list(wb.sheets)
     if not wb.visible_sheets():
@@ -6529,19 +6581,36 @@ _DYNAMIC_ARRAY_METADATA = (
 _ARRAY_CELL_RE = re.compile(r'<c ((?:(?!cm=)[^>/])*)>(<f t="array")')
 
 
-def _put_sheet_data(buffer, path, sheets, dynamic=False):
+def _put_sheet_data(buffer, path, sheets, dynamic=False, drawings=None):
     """Write the .xlsx openpyxl made (in buffer) to path with the cell XML of `sheets` put in. With
     `dynamic`, array formulas are marked as dynamic arrays (cm="1" and the metadata part it points to), so
-    Excel 365 spills them rather than treating them as old Ctrl+Shift+Enter formulas."""
+    Excel 365 spills them rather than treating them as old Ctrl+Shift+Enter formulas. `drawings`: {sheet
+    name: DrawingML anchors of its shapes}, added to the sheet's drawing part (made when it has none)."""
     import zipfile
 
     with zipfile.ZipFile(buffer) as src:
         parts = _sheet_parts(src)
+        names = set(src.namelist())
         wanted = {parts[title]: xml for title, xml in sheets.items() if title in parts}
+        append, created = {}, {}  # drawing part -> anchors; sheet part -> (new drawing part, anchors)
+        n = 1
+        for title, anchors in (drawings or {}).items():
+            part = parts.get(title)
+            if not part:
+                continue
+            existing = [d for d in drawingml.drawing_parts(src, part) if d in names]
+            if existing:
+                append[existing[0]] = anchors
+            else:
+                while f"xl/drawings/drawing{n}.xml" in names:
+                    n += 1
+                created[part] = (f"xl/drawings/drawing{n}.xml", anchors)
+                names.add(created[part][0])
+        rels_of = {f"{p.rsplit('/', 1)[0]}/_rels/{p.rsplit('/', 1)[1]}.rels": p for p in created}
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as dst:
             for info in src.infolist():
                 data = src.read(info.filename)
-                if info.filename in wanted or (dynamic and info.filename in parts.values()):
+                if info.filename in wanted or (dynamic and info.filename in parts.values()) or info.filename in created:
                     xml = data.decode("utf-8")
                     if info.filename in wanted:
                         body, dimension = wanted[info.filename]
@@ -6550,17 +6619,84 @@ def _put_sheet_data(buffer, path, sheets, dynamic=False):
                         xml = re.sub(r'<dimension ref="[^"]*"\s*/>', f'<dimension ref="{dimension}"/>', xml, count=1)
                     if dynamic:
                         xml = _ARRAY_CELL_RE.sub(r'<c \1 cm="1">\2', xml)
+                    if info.filename in created:
+                        xml = _with_drawing_element(xml)
                     data = xml.encode("utf-8")
-                elif dynamic and info.filename == "[Content_Types].xml":
-                    data = data.replace(b"</Types>", b'<Override PartName="/xl/metadata.xml" ContentType="application/'
-                                        b'vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/></Types>')
+                elif info.filename in append:
+                    xml = data.decode("utf-8")
+                    m = re.search(r"</[\w:]*wsDr>\s*$", xml)
+                    if m:
+                        xml = xml[:m.start()] + append[info.filename] + xml[m.start():]
+                    data = xml.encode("utf-8")
+                elif info.filename in rels_of:
+                    target = created[rels_of[info.filename]][0].split("/", 1)[1]
+                    data = data.replace(b"</Relationships>", _drawing_rel(target) + b"</Relationships>")
+                elif info.filename == "[Content_Types].xml" and (dynamic or created):
+                    extra = b""
+                    if dynamic:
+                        extra += (b'<Override PartName="/xl/metadata.xml" ContentType="application/'
+                                  b'vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/>')
+                    for drawing, _ in created.values():
+                        extra += (f'<Override PartName="/{drawing}" ContentType="{drawingml.DRAWING_CONTENT_TYPE}"/>'
+                                  .encode("utf-8"))
+                    data = data.replace(b"</Types>", extra + b"</Types>")
                 elif dynamic and info.filename == "xl/_rels/workbook.xml.rels":
                     data = data.replace(b"</Relationships>", b'<Relationship Id="rIdPyExcelMeta" Type="http://schemas.'
                                         b'openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" '
                                         b'Target="metadata.xml"/></Relationships>')
                 dst.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+            for rels, part in rels_of.items():
+                if rels not in src.namelist():
+                    target = created[part][0].split("/", 1)[1]
+                    dst.writestr(rels, b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="'
+                                 b'http://schemas.openxmlformats.org/package/2006/relationships">' + _drawing_rel(target)
+                                 + b"</Relationships>", compress_type=zipfile.ZIP_DEFLATED)
+            for drawing, anchors in created.values():
+                xml = drawingml.empty_drawing().replace("></xdr:wsDr>", f">{anchors}</xdr:wsDr>")
+                dst.writestr(drawing, xml.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
             if dynamic:
                 dst.writestr("xl/metadata.xml", _DYNAMIC_ARRAY_METADATA, compress_type=zipfile.ZIP_DEFLATED)
+
+
+def _drawing_rel(target):
+    return (f'<Relationship Id="rIdPyShapes" Type="{drawingml.DRAWING_REL}" Target="../{target}"/>').encode("utf-8")
+
+
+_AFTER_DRAWING = re.compile(r"<(?:legacyDrawing|legacyDrawingHF|drawingHF|picture|oleObjects|controls|"
+                            r"webPublishItems|tableParts|extLst)\b|</worksheet>")
+
+
+def _with_drawing_element(xml):
+    """A worksheet's XML with <drawing> pointing at its new drawing part, where the schema wants it."""
+    m = _AFTER_DRAWING.search(xml)
+    if not m:
+        return xml
+    element = f'<drawing xmlns:r="{drawingml.NS["r"]}" r:id="rIdPyShapes"/>'
+    return xml[:m.start()] + element + xml[m.start():]
+
+
+def _geometry(sh):
+    """Pixel positions of a sheet's rows and columns, for placing its shapes in files."""
+    return drawingml.SheetGeometry(sh, DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, MAX_ROWS, MAX_COLS)
+
+
+def _shapes_from_xlsx(path, sheet_names):
+    """{sheet name: [shape dicts]} of the shapes in an .xlsx file's drawing parts (openpyxl skips them)."""
+    import zipfile
+    found = {}
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            for title, part in _sheet_parts(z).items():
+                if title not in sheet_names:
+                    continue
+                for drawing in drawingml.drawing_parts(z, part):
+                    if drawing in names:
+                        found.setdefault(title, []).extend(drawingml.shapes_from_drawing(
+                            z.read(drawing), sheet_names[title], new_picture_id))
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return {}
+    return found
 
 
 def _sheet_parts(z):
@@ -6589,7 +6725,7 @@ def _save_xlsx(wb, path, active=None):
 
     from openpyxl.worksheet.formula import ArrayFormula
 
-    fast_sheets, dynamic = {}, False
+    fast_sheets, dynamic, drawings = {}, False, {}
     for sh in wb.sheets.values():
         ws = book.create_sheet(sh.name)
         arrays = wb.spill_areas(sh.name)
@@ -6665,8 +6801,12 @@ def _save_xlsx(wb, path, active=None):
                 picture = _xl_picture(chart)
                 if picture is not None:
                     ws.add_image(picture)
+            elif chart["type"] == SHAPE:
+                continue  # written into the drawing part afterwards (openpyxl has no shapes)
             else:
                 ws.add_chart(_xl_chart(wb, sh.name, ws, chart))
+        if any(chart["type"] == SHAPE for chart in sh.charts):
+            drawings[ws.title] = drawingml.anchors_xml(sh.charts, _geometry(sh))
         if sh.page_setup:
             _xl_page_setup(ws, sh.page_setup)
         for rule in reversed(sh.cond_formats):  # Excel: the first rule added gets the top priority
@@ -6684,9 +6824,9 @@ def _save_xlsx(wb, path, active=None):
     book.active = list(wb.sheets).index(active)
     for ws in book.worksheets:  # Excel opens on the active sheet; others must not look selected
         ws.sheet_view.tabSelected = ws is book.active
-    if not fast_sheets and not dynamic:
+    if not fast_sheets and not dynamic and not drawings:
         book.save(path)
         return
     buffer = io.BytesIO()
     book.save(buffer)
-    _put_sheet_data(buffer, path, fast_sheets, dynamic)
+    _put_sheet_data(buffer, path, fast_sheets, dynamic, drawings)

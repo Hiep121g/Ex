@@ -211,6 +211,8 @@ class _Gdi:
             (user32, "OpenClipboard"): ([w.HWND], w.BOOL), (user32, "EmptyClipboard"): ([], w.BOOL),
             (user32, "CloseClipboard"): ([], w.BOOL), (user32, "SetClipboardData"): ([w.UINT, handle], handle),
             (user32, "RegisterClipboardFormatW"): ([w.LPCWSTR], w.UINT),
+            (user32, "GetClipboardData"): ([w.UINT], handle), (user32, "IsClipboardFormatAvailable"): ([w.UINT], w.BOOL),
+            (kernel32, "GlobalSize"): ([handle], ctypes.c_size_t),
             (user32, "GetDC"): ([w.HWND], handle), (user32, "ReleaseDC"): ([w.HWND, handle], ctypes.c_int),
             (user32, "FillRect"): ([handle, prect, handle], ctypes.c_int),
             (user32, "DrawTextW"): ([handle, w.LPCWSTR, ctypes.c_int, prect, w.UINT], ctypes.c_int),
@@ -384,3 +386,40 @@ def copy_to_clipboard(hwnd, text, table):
     finally:
         gdi.CloseClipboard()
     return True
+
+
+def read_image(hwnd):
+    """PNG data of a picture on the Windows clipboard (a screenshot, a picture copied from a web page or
+    Paint), or None when there is none (or not on Windows)."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    import images
+
+    gdi = _Gdi(ctypes)
+    png = gdi.RegisterClipboardFormatW("PNG")
+    kinds = [k for k in (png, 17, 8) if gdi.IsClipboardFormatAvailable(k)]  # PNG, CF_DIBV5, CF_DIB
+    if not kinds or not gdi.OpenClipboard(hwnd):
+        return None
+    try:
+        for kind in kinds:
+            handle = gdi.GetClipboardData(kind)
+            if not handle:
+                continue
+            size = gdi.GlobalSize(handle)
+            ptr = gdi.GlobalLock(handle)
+            if not ptr:
+                continue
+            try:
+                data = ctypes.string_at(ptr, size)
+            finally:
+                gdi.GlobalUnlock(handle)
+            if kind == png and data[:8] == b"\x89PNG\r\n\x1a\n":
+                return data
+            if kind != png:
+                found = images.png_from_dib(data)
+                if found:
+                    return found
+    finally:
+        gdi.CloseClipboard()
+    return None

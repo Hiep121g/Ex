@@ -125,3 +125,58 @@ def follow_monitor_dpi(per_monitor=True):
     except (AttributeError, OSError):
         pass
     return False
+
+
+def grab_screen(x, y, width, height):
+    """What the screen shows in a rectangle, as PPM image data Tk can show without Pillow; None when it
+    can't be read (only Windows here). Used to cross-fade the window while it is drawn again."""
+    if sys.platform != "win32" or width <= 0 or height <= 0:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u, gdi = user32(), ctypes.WinDLL("gdi32")
+        u.GetDC.argtypes, u.GetDC.restype = [wintypes.HWND], wintypes.HDC
+        u.ReleaseDC.argtypes, u.ReleaseDC.restype = [wintypes.HWND, wintypes.HDC], ctypes.c_int
+        gdi.CreateCompatibleDC.argtypes, gdi.CreateCompatibleDC.restype = [wintypes.HDC], wintypes.HDC
+        gdi.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+        gdi.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+        gdi.SelectObject.argtypes, gdi.SelectObject.restype = [wintypes.HDC, wintypes.HGDIOBJ], wintypes.HGDIOBJ
+        gdi.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+        gdi.BitBlt.restype = wintypes.BOOL
+        gdi.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, ctypes.c_void_p,
+                                  ctypes.c_void_p, wintypes.UINT]
+        gdi.GetDIBits.restype = ctypes.c_int
+        gdi.DeleteObject.argtypes, gdi.DeleteObject.restype = [wintypes.HGDIOBJ], wintypes.BOOL
+        gdi.DeleteDC.argtypes, gdi.DeleteDC.restype = [wintypes.HDC], wintypes.BOOL
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
+                        ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD),
+                        ("biCompression", wintypes.DWORD), ("biSizeImage", wintypes.DWORD),
+                        ("biXPelsPerMeter", ctypes.c_long), ("biYPelsPerMeter", ctypes.c_long),
+                        ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD)]
+        screen = u.GetDC(None)
+        if not screen:
+            return None
+        memory = gdi.CreateCompatibleDC(screen)
+        bitmap = gdi.CreateCompatibleBitmap(screen, width, height)
+        try:
+            old = gdi.SelectObject(memory, bitmap)
+            ok = gdi.BitBlt(memory, 0, 0, width, height, screen, x, y, 0x00CC0020)  # SRCCOPY
+            gdi.SelectObject(memory, old)
+            header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), width, -height, 1, 32, 0)  # top-down
+            pixels = ctypes.create_string_buffer(width * height * 4)
+            if not ok or gdi.GetDIBits(memory, bitmap, 0, height, pixels, ctypes.byref(header), 0) != height:
+                return None
+        finally:
+            gdi.DeleteObject(bitmap)
+            gdi.DeleteDC(memory)
+            u.ReleaseDC(None, screen)
+        bgra = pixels.raw
+        rgb = bytearray(width * height * 3)
+        rgb[0::3], rgb[1::3], rgb[2::3] = bgra[2::4], bgra[1::4], bgra[0::4]
+        return b"P6 %d %d 255\n" % (width, height) + bytes(rgb)
+    except (AttributeError, OSError, ValueError, MemoryError):
+        return None

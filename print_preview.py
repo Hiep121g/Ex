@@ -4,6 +4,7 @@ Pages are drawn by printing.render_page, the code that writes the PDF, onto a Tk
 CanvasSurface, so what the preview shows is what gets printed.
 """
 
+import math
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
@@ -91,7 +92,14 @@ class CanvasSurface:
                                                slant="italic" if spec[2] else "roman")
         return font
 
-    def text(self, x, y, text, spec, size, color):
+    def text(self, x, y, text, spec, size, color, angle=0.0):
+        if angle:  # (shapes' text) no clipping: Tk turns the text about its start
+            font = self._tk_font(spec, size)
+            a = math.radians(angle)
+            up = font.metrics("ascent")
+            self.cv.create_text(self.ox + x * self.z - up * math.sin(a), self.oy + y * self.z - up * math.cos(a),
+                                text=text, font=font, fill=color, anchor="nw", angle=angle)
+            return
         if self._box:
             x0, y0, x1, y1 = self._box
             if y - self.ascent(spec, size) >= y1 or y + self.descent(spec, size) <= y0:

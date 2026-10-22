@@ -2085,5 +2085,216 @@ class ScrollOverFilteredRowsTests(unittest.TestCase):
             self.assertFalse(session.Settings(tmp).per_monitor_dpi)
 
 
+
+class ShapeTests(unittest.TestCase):
+    """Shapes and diagrams (Insert > Shapes, the Diagram tab): geometry, connectors and files."""
+
+    def test_every_kind_has_an_outline(self):
+        import shapes
+        for kind in shapes.KINDS:
+            if kind in shapes.LINE_KINDS:
+                continue
+            geo = shapes.local_geometry({"kind": kind}, 120, 60)
+            self.assertTrue(geo.paths and any(closed for _, closed, _ in geo.paths), kind)
+            self.assertGreaterEqual(len(geo.sites), 2, kind)
+            l, t, r, b = geo.text
+            self.assertTrue(0 <= l < r <= 120 and 0 <= t < b <= 60, (kind, geo.text))
+            for x, y, a in geo.sites:
+                self.assertTrue(-0.01 <= x <= 120.01 and -0.01 <= y <= 60.01, (kind, x, y))
+
+    def test_rotation_flips_and_sites(self):
+        import shapes
+        rect = shapes.new_shape("rect", (0, 0, 0, 0), (100, 50))
+        box = (0, 0, 100, 50)
+        top, left, bottom, right = shapes.sites(rect, box)
+        self.assertEqual([tuple(round(v) for v in s) for s in (top, left, bottom, right)],
+                         [(50, 0, 270), (0, 25, 180), (50, 50, 90), (100, 25, 0)])
+        turned = dict(rect, rot=90)
+        top = shapes.sites(turned, box)[0]  # the top side now faces right
+        self.assertEqual(tuple(round(v) for v in top), (75, 25, 0))
+        flipped = shapes.sites(dict(rect, flip_h=True), box)
+        self.assertEqual(tuple(round(v) for v in flipped[1]), (100, 25, 0))  # "left" is on the right
+        self.assertEqual(tuple(round(v) for v in shapes.rotated_box(turned, box)), (25, -25, 75, 75))
+
+    def test_elbow_routes_go_round_shapes(self):
+        import shapes
+        a, b = (0, 0, 100, 50), (0, 150, 100, 200)
+        route = shapes.elbow_route((50, 50), 90, (50, 150), 270, a, b)
+        self.assertEqual(route, [(50, 50), (50, 150)])
+        route = shapes.elbow_route((50, 50), 90, (200, 175), 180, a, (200, 150, 300, 200))
+        self.assertTrue(all(p[0] == q[0] or p[1] == q[1] for p, q in zip(route, route[1:])))
+        # from the bottom of the lower shape back to the top of the upper one: round the side, not through
+        route = shapes.elbow_route((50, 200), 90, (50, 0), 270, b, a)
+        for p, q in zip(route[1:-2], route[2:-1]):
+            for box in (a, b):
+                self.assertFalse(shapes._crosses(p, q, box), route)
+        self.assertGreater(max(x for x, _ in route), 100)
+
+    def test_hits_handles_and_resizing(self):
+        import shapes
+        box = (10, 10, 110, 60)
+        filled = shapes.new_shape("ellipse", (0, 0, 0, 0), (100, 50))
+        self.assertTrue(shapes.hit(filled, box, 60, 35, 3))
+        self.assertFalse(shapes.hit(filled, box, 12, 12, 3))  # the box's corner is outside the ellipse
+        empty = dict(filled, fill=None)
+        self.assertFalse(shapes.hit(empty, box, 60, 35, 3))
+        self.assertTrue(shapes.hit(empty, box, 60, 10, 3))  # on its line
+        line = shapes.new_shape("line", (0, 0, 0, 0), (0, 0))
+        self.assertTrue(shapes.hit(line, (0, 0, 100, 100), 50, 51, 3))
+        self.assertFalse(shapes.hit(line, (0, 0, 100, 100), 50, 70, 3))
+        self.assertEqual(set(shapes.handles(line, (0, 0, 100, 100), 1)), {"start", "end"})
+        # resizing a turned shape keeps the opposite corner where it is on the screen
+        turned = dict(filled, rot=90)
+        before = shapes.handles(turned, box, 1)["lt"]
+        new = shapes.resize(turned, box, "rb", 200, 200)
+        after = shapes.handles(turned, new, 1)["lt"]
+        self.assertAlmostEqual(before[0], after[0], 6)
+        self.assertAlmostEqual(before[1], after[1], 6)
+        pts, heads = shapes.with_arrows([(0, 0), (100, 0)], None, "triangle", 2)
+        self.assertLess(pts[-1][0], 100)
+        self.assertEqual(len(heads), 1)
+
+    def _diagram(self):
+        import shapes
+        wb = Workbook(("Sơ đồ",))
+        sh = wb.sheets["Sơ đồ"]
+
+        def add(kind, anchor, size, style=None, **kw):
+            obj = shapes.new_shape(kind, anchor, size, style, id=fe.new_picture_id(), **kw)
+            sh.charts.append(obj)
+            return obj
+        a = add("flowChartTerminator", (2, 1, 10, 0), (120, 50), shapes.DIAGRAM_STYLE, text="Bắt đầu")
+        b = add("flowChartDecision", (6, 1, 10, 0), (120, 80), shapes.DIAGRAM_STYLE, text="x > 0?")
+        g = add("gateAnd", (2, 5, 0, 0), (80, 50), shapes.DIAGRAM_STYLE)
+        add("elbow", (0, 0, 0, 0), (0, 0), shapes.DIAGRAM_LINE, start={"id": a["id"], "site": 2},
+            end={"id": b["id"], "site": 0})
+        add("curve", (0, 0, 0, 0), (0, 0), dict(shapes.DIAGRAM_LINE, dash="dash"), start={"id": b["id"], "site": 3},
+            end={"id": g["id"], "site": 1})
+        add("textBox", (12, 1, 0, 0), (150, 30), None, text="Ghi chú\ndòng 2")
+        add("wedgeRectCallout", (12, 5, 0, 0), (130, 70), None, text="Chú thích", tip=(0.2, 1.5), rot=15.0)
+        sh.notes[(0, 0)] = "ghi chú ô"
+        return wb
+
+    def test_xlsx_round_trip(self):
+        import zipfile
+        wb = self._diagram()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sodo.xlsx")
+            fe.save_workbook(wb, path)
+            with zipfile.ZipFile(path) as z:
+                sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+                self.assertLess(sheet.index("<drawing"), sheet.index("<legacyDrawing"))  # the schema's order
+                drawing = z.read("xl/drawings/drawing1.xml").decode("utf-8")
+            self.assertIn('prst="flowChartDecision"', drawing)
+            self.assertIn('descr="PyExcel:gateAnd"', drawing)  # no preset for it: a custom outline
+            self.assertRegex(drawing, r'<a:stCxn id="1000" idx="2"/><a:endCxn id="1001" idx="0"/>')
+            again = fe.load_workbook(path).sheets["Sơ đồ"].charts
+        old = wb.sheets["Sơ đồ"].charts
+        self.assertEqual([o["kind"] for o in again], [o["kind"] for o in old])
+        for o, n in zip(old, again):
+            for key in ("text", "anchor", "size", "fill", "line", "dash", "head", "tail", "rot", "align", "valign"):
+                if key in ("anchor", "size") and o["kind"] in ("elbow", "curve"):
+                    continue  # connectors are stored where they run
+                self.assertEqual(n.get(key), o.get(key), (o["kind"], key))
+        ids = {o["id"]: k for k, o in enumerate(again)}
+        self.assertEqual((ids[again[3]["start"]["id"]], again[3]["start"]["site"], ids[again[3]["end"]["id"]]), (0, 2, 1))
+        self.assertEqual(ids[again[4]["end"]["id"]], 2)
+        self.assertEqual(again[6]["tip"], (0.2, 1.5))
+
+    def test_opening_excel_shapes(self):
+        """Shapes as Excel writes them: colours from the theme style, a group, a glued connector."""
+        import zipfile
+        import openpyxl
+        a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        xdr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+
+        def sp(nid, prst, x, y, w, h, text=""):
+            body = (f'<xdr:txBody><a:bodyPr anchor="t"/><a:p><a:pPr algn="l"/><a:r><a:rPr sz="1400" b="1"/>'
+                    f'<a:t>{text}</a:t></a:r></a:p></xdr:txBody>') if text else ""
+            return (f'<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="{nid}" name="S{nid}"/><xdr:cNvSpPr/>'
+                    f'</xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{w}" cy="{h}"/></a:xfrm>'
+                    f'<a:prstGeom prst="{prst}"><a:avLst/></a:prstGeom></xdr:spPr><xdr:style>'
+                    f'<a:lnRef idx="2"><a:schemeClr val="accent1"><a:shade val="50000"/></a:schemeClr></a:lnRef>'
+                    f'<a:fillRef idx="1"><a:schemeClr val="accent1"/></a:fillRef><a:effectRef idx="0">'
+                    f'<a:schemeClr val="accent1"/></a:effectRef><a:fontRef idx="minor"><a:schemeClr val="lt1"/>'
+                    f'</a:fontRef></xdr:style>{body}</xdr:sp>')
+        group = ('<xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="10" name="G"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>'
+                 '<xdr:grpSpPr><a:xfrm><a:off x="952500" y="190500"/><a:ext cx="1905000" cy="952500"/>'
+                 '<a:chOff x="0" y="0"/><a:chExt cx="1905000" cy="952500"/></a:xfrm></xdr:grpSpPr>'
+                 + sp(2, "ellipse", 0, 0, 952500, 952500, "Một") + sp(3, "rect", 952500, 0, 952500, 476250)
+                 + '</xdr:grpSp>')
+        cxn = ('<xdr:cxnSp macro=""><xdr:nvCxnSpPr><xdr:cNvPr id="4" name="C"/><xdr:cNvCxnSpPr>'
+               '<a:stCxn id="2" idx="4"/><a:endCxn id="5" idx="0"/></xdr:cNvCxnSpPr></xdr:nvCxnSpPr><xdr:spPr>'
+               '<a:xfrm><a:off x="0" y="0"/><a:ext cx="952500" cy="952500"/></a:xfrm>'
+               '<a:prstGeom prst="bentConnector3"><a:avLst/></a:prstGeom><a:ln w="19050"><a:solidFill>'
+               '<a:srgbClr val="FF0000"/></a:solidFill><a:tailEnd type="arrow"/></a:ln></xdr:spPr></xdr:cxnSp>')
+
+        def anchor(child, col, row):
+            return (f'<xdr:twoCellAnchor><xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row}'
+                    f'</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>{col + 2}</xdr:col><xdr:colOff>0'
+                    f'</xdr:colOff><xdr:row>{row + 4}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>{child}'
+                    f'<xdr:clientData/></xdr:twoCellAnchor>')
+        drawing = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="{xdr}" xmlns:a="{a}">'
+                   + anchor(group, 1, 1) + anchor(sp(5, "flowChartProcess", 0, 2857500, 952500, 476250), 1, 15)
+                   + anchor(cxn, 1, 6) + '</xdr:wsDr>')
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = os.path.join(tmp, "plain.xlsx")
+            book = openpyxl.Workbook()
+            book.active.title = "Sheet1"
+            book.save(plain)
+            path = os.path.join(tmp, "excel.xlsx")
+            with zipfile.ZipFile(plain) as src, zipfile.ZipFile(path, "w") as dst:
+                for info in src.infolist():
+                    data = src.read(info.filename)
+                    if info.filename == "xl/worksheets/sheet1.xml":
+                        data = data.replace(b"</worksheet>", b'<drawing xmlns:r="http://schemas.openxmlformats.org/'
+                                            b'officeDocument/2006/relationships" r:id="rId9"/></worksheet>')
+                    elif info.filename == "[Content_Types].xml":
+                        data = data.replace(b"</Types>", b'<Override PartName="/xl/drawings/drawing1.xml" ContentType'
+                                            b'="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>')
+                    dst.writestr(info.filename, data)
+                dst.writestr("xl/worksheets/_rels/sheet1.xml.rels", '<?xml version="1.0" encoding="UTF-8"?>'
+                             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                             '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                             'relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>')
+                dst.writestr("xl/drawings/drawing1.xml", drawing)
+            objs = fe.load_workbook(path).sheets["Sheet1"].charts
+        kinds = [o["kind"] for o in objs]
+        self.assertEqual(kinds, ["ellipse", "rect", "flowChartProcess", "elbow"])
+        ellipse, rect, process, line = objs
+        self.assertEqual((ellipse["fill"], ellipse["line"], ellipse["line_w"]), ("#4472c4", "#223962", 1.0))
+        self.assertEqual((ellipse["text"], ellipse["font"]["color"], ellipse["font"]["size"], ellipse["font"]["bold"],
+                          ellipse["align"], ellipse["valign"]), ("Một", "#ffffff", 14, True, "left", "top"))
+        self.assertEqual((ellipse["anchor"], ellipse["size"]), ((1, 1, 0, 0), (100, 100)))
+        self.assertEqual((rect["anchor"], rect["size"]), ((1, 2, 20, 0), (100, 50)))  # inside the group
+        self.assertEqual((line["line"], line["line_w"], line["tail"]), ("#ff0000", 1.5, "arrow"))
+        self.assertEqual((line["start"], line["end"]), ({"id": ellipse["id"], "site": 4}, {"id": process["id"], "site": 0}))
+
+    def test_native_file_and_printing(self):
+        import printing
+        import ttf
+        wb = self._diagram()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sodo.pyxl")
+            fe.save_workbook(wb, path)
+            again = fe.load_workbook(path).sheets["Sơ đồ"].charts
+            self.assertEqual(again, wb.sheets["Sơ đồ"].charts)
+            pdf_path = os.path.join(tmp, "sodo.pdf")
+            self.assertEqual(printing.export_pdf(wb, ["Sơ đồ"], pdf_path, ttf.FontLibrary()), 1)
+            self.assertGreater(os.path.getsize(pdf_path), 1000)
+        # the printed area reaches the callout's tail below its box (rows 12..15, the tail into row 16)
+        self.assertEqual(printing.used_rect(wb, "Sơ đồ")[2], 16)
+
+    def test_clipboard_picture(self):
+        import struct
+        import images
+        rows = [bytes([255, 255, 255, 0, 0, 0, 0, 0, 128, 128, 128, 0]), bytes([0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0])]
+        dib = struct.pack("<IiiHHIIiiII", 40, 3, 2, 1, 32, 0, 0, 0, 0, 0, 0) + b"".join(rows)  # bottom row first
+        png = images.png_from_dib(dib)
+        self.assertEqual(images.image_info(png), ("png", 3, 2))
+        self.assertEqual(images.decode_png(png)[2].hex(), "ff000000ff000000ffffffff000000808080")
+        self.assertIsNone(images.png_from_dib(b"\0" * 10))
+
+
 if __name__ == "__main__":
     unittest.main()
