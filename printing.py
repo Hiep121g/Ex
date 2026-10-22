@@ -445,13 +445,25 @@ def render_page(surface, layout, index, file_name=""):
         avail = cc - a - 2 * pad - indent
         if fe.is_number(value) and surface.measure(text, spec, size) > avail:
             text = "#" * max(1, int(avail // max(0.1, surface.measure("#", spec, size))))
-        clip_right = cc
-        if not m and align == "left" and isinstance(value, str) and not fmt.get("wrap"):
-            k = cols.index(c)  # run on over empty cells to the right, as on screen
-            while (surface.measure(text, spec, size) > clip_right - a - 2 * pad - indent and k + 1 < len(cols)
-                   and (r, cols[k + 1]) not in sh.cells and not sh.merge_at(r, cols[k + 1])):
-                k += 1
-                clip_right = xs[cols[k]][1]
+        clip_left, clip_right = a, cc
+        if not m and isinstance(value, str) and not fmt.get("wrap"):
+            # run on over empty cells as on screen: rightwards when left-aligned, leftwards when right-aligned,
+            # both ways when centred
+            k = j = cols.index(c)
+            mid, need = (a + cc) / 2, surface.measure(text, spec, size) + 2 * pad + indent
+
+            def free(i):
+                return 0 <= i < len(cols) and (r, cols[i]) not in sh.cells and not sh.merge_at(r, cols[i])
+            while (2 * min(mid - clip_left, clip_right - mid) if align == "center" else clip_right - clip_left) < need:
+                grow_r, grow_l = align in ("left", "center") and free(k + 1), align in ("right", "center") and free(j - 1)
+                if not (grow_r or grow_l) or (align == "center" and not (grow_r and grow_l)):
+                    break
+                if grow_r:
+                    k += 1
+                    clip_right = xs[cols[k]][1]
+                if grow_l:
+                    j -= 1
+                    clip_left = xs[cols[j]][0]
         if fmt.get("wrap") or "\n" in text:
             lines = wrap(text, max(4.0, avail), lambda t: surface.measure(t, spec, size))
         else:
@@ -462,7 +474,7 @@ def render_page(surface, layout, index, file_name=""):
         valign = fmt.get("valign") or "bottom"
         top = {"top": b + 1, "center": (b + d - block) / 2}.get(valign, d - 1.5 - block)
         color = style.get("fg") or fmt.get("fg") or "#000000"
-        surface.clip(a, b, clip_right, d)
+        surface.clip(clip_left, b, clip_right, d)
         for i, line in enumerate(lines):
             w = surface.measure(line, spec, size)
             lx = {"center": (a + cc - w) / 2, "right": cc - pad - indent - w}.get(align, a + pad + indent)

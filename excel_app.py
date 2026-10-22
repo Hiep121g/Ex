@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import webbrowser
 import tkinter as tk
@@ -31,6 +32,8 @@ import drawing
 import formula_engine as fe
 import images
 import pivot as pv
+import pdf_import
+import pdfread
 import printing
 import richclip
 import screens
@@ -288,7 +291,22 @@ HÌNH VẼ VÀ SƠ ĐỒ (tab Sơ đồ)
     trước / ra sau, căn trái/giữa/phải, phân phối đều, xoay, lật. Bắt dính lưới: hình bám vào cạnh ô.
   • Trang sơ đồ mới: thêm một trang tính riêng để vẽ, bật sẵn Chọn đối tượng và Bắt dính lưới.
   • Hình được lưu trong .xlsx đúng kiểu của Excel (mở bằng Excel vẫn sửa được, đường nối vẫn dính hình) và
-    được in / xuất PDF. Cổng logic không có sẵn trong Excel nên được lưu dạng hình tự do.
+    được in / xuất PDF. Đường gấp khúc / cong được lưu bằng chính loại đường nối của Excel, vẽ đúng đường đi
+    như trong PyExcel. Cổng logic không có sẵn trong Excel nên được lưu dạng hình tự do có điểm nối, kèm văn
+    bản thay thế "PyExcel:..." — mở lại bằng PyExcel (kể cả sau khi đã sửa và lưu bằng Excel) vẫn là cổng
+    logic và đường nối như cũ, sửa tiếp được.
+
+TIỆN ÍCH (tab Tiện ích)
+  • Nhập PDF: chuyển tệp PDF thành trang tính — chữ vào đúng ô theo vị trí trên trang, bảng có đường kẻ thành
+    ô có viền (ô gộp theo khung), số / ngày / phần trăm thành số thật để tính được, phông, cỡ, đậm, nghiêng,
+    màu chữ và màu nền ô được giữ; các hình vẽ còn lại (lưu đồ, mũi tên...) thành hình vẽ, chữ trong hình
+    thành hộp văn bản; ảnh trong PDF thành ảnh trên trang tính.
+  • Chọn trang (ví dụ 1-3, 5), mỗi trang một trang tính hay gộp tất cả vào một trang tính, có lấy viền / hình
+    vẽ / ảnh / chuyển số hay không. Tệp lớn được nhập ở nền, thanh trạng thái báo tiến độ; Esc để dừng (giữ
+    các trang đã xong). Ctrl+Z bỏ cả lần nhập.
+  • PDF là ảnh chụp / bản quét thì không có chữ để lấy (chưa có nhận dạng chữ OCR) — chỉ nhập được ảnh của
+    trang. PDF có mật khẩu mở chưa hỗ trợ (PDF chỉ cấm sửa/in vẫn nhập được).
+  • Xuất PDF và Trang sơ đồ mới cũng có ở đây.
 
 MẢNG ĐỘNG (như Excel 365)
   • Công thức cho ra nhiều giá trị sẽ tự "tràn" sang các ô bên dưới / bên phải: =SORT(FILTER(A2:C99,B2:B99="Bắc"))
@@ -304,8 +322,8 @@ MẢNG ĐỘNG (như Excel 365)
     Chưa hỗ trợ tham chiếu cả cột/hàng (A:A, 1:1) và toán tử @ (dùng hàm SINGLE).
 
 CHUỘT
-  • Kéo để chọn vùng; Shift+nhấp mở rộng vùng; nhấp tiêu đề để chọn cả cột/hàng. Kéo ra ngoài mép để cuộn
-    theo: chuột càng xa mép thì cuộn càng nhanh.
+  • Kéo để chọn vùng; Shift+nhấp mở rộng vùng; nhấp tiêu đề để chọn cả cột/hàng. Kéo ra ngoài mép trên/dưới
+    để cuộn theo: chuột càng xa mép thì cuộn càng nhanh; sang trái/phải cuộn đều từng cột.
   • Kéo mép tiêu đề cột/hàng để đổi kích thước; nhấp đúp mép để tự khớp.
   • Kéo ô vuông nhỏ ở góc vùng chọn để sao chép hoặc điền chuỗi (1, 2 → 3, 4...; "Mục 1" → "Mục 2").
   • Chổi "Sao chép định dạng": nhấp một lần để dán định dạng một lần, nhấp đúp để dán nhiều lần.
@@ -463,6 +481,19 @@ class ChangeSet:
 
     def changes(self):
         return [(key, *item) for key, item in self.items.items() if item[0] != item[1] or item[2] != item[3]]
+
+
+def _icon_pdf_import(cv, P, k, c):
+    """A PDF page going into a sheet."""
+    cv.create_polygon(*P(1, 1, 7, 1, 9, 3, 9, 11, 1, 11), fill="#ffffff", outline="#7f7f7f")
+    cv.create_rectangle(*P(0, 6, 7, 9.5), fill="#c00000", outline="")
+    cv.create_text(*P(3.5, 7.8), text="PDF", fill="#ffffff", font=("Segoe UI", -max(5, round(3.2 * k)), "bold"))
+    cv.create_rectangle(*P(8, 7, 15, 15), fill="#ffffff", outline="#217346")
+    for v in (9.7, 11.3, 13.0):
+        cv.create_line(*P(8, v + 0.3, 15, v + 0.3), fill="#217346")
+    cv.create_line(*P(11.5, 7, 11.5, 15), fill="#217346")
+    cv.create_line(*P(5, 12, 5, 14.5, 7.5, 14.5), fill="#217346", width=max(1, round(1.2 * k)), arrow="last",
+                   arrowshape=(3 * k, 3 * k, 1.2 * k))
 
 
 class SpreadsheetApp(drawing.DrawingTools):
@@ -700,10 +731,14 @@ class SpreadsheetApp(drawing.DrawingTools):
         self.header_font = tkfont.Font(root=self.root, family=self.ui_family, size=size)
         self.header_bold = tkfont.Font(root=self.root, family=self.ui_family, size=size, weight="bold")
         self._head_h0 = round(fe.DEFAULT_ROW_HEIGHT * self.px) if self.show_headings else 0
-        self._head_w0 = self.header_font.measure("100000") + round(8 * self.px) if self.show_headings else 0
-        self._outline_metrics()
+        # row numbers take 3/5 of the room six digits need; the column widens when the rows in view have
+        # longer numbers (as in Excel)
+        self._digit_w = self.header_font.measure("0")
+        self._head_w0 = round((self.header_font.measure("100000") + round(8 * self.px)) * 3 / 5) \
+            if self.show_headings else 0
         self.pad = max(1, round(3 * self.px))
         self.default_row_px = max(1, round(fe.DEFAULT_ROW_HEIGHT * self.px))
+        self._outline_metrics()
 
     def _outline_metrics(self):
         """Room for the outline symbols left of the row headings and above the column headings."""
@@ -713,8 +748,19 @@ class SpreadsheetApp(drawing.DrawingTools):
         self.outline_step = round(16 * self.scale)
         self.outline_w = (rows + 1) * self.outline_step + 2 if rows else 0
         self.outline_h = (cols + 1) * self.outline_step + 2 if cols else 0
-        self.header_w = max(self._head_w0, self.outline_step if cols else 0) + self.outline_w
+        self.header_w = max(self._row_heading_w(), self.outline_step if cols else 0) + self.outline_w
         self.header_h = max(self._head_h0, self.outline_step if rows else 0) + self.outline_h
+
+    def _row_heading_w(self):
+        """Width of the row numbers: wide enough for the longest number among the rows in view."""
+        if not self.show_headings:
+            return 0
+        try:
+            height = self.canvas.winfo_height()
+            last = self.rows_from(self.top, max(1, height // max(1, self.default_row_px)) + 1)
+        except (AttributeError, KeyError, tk.TclError):  # (while the window is being built or rebuilt)
+            last = 0
+        return max(self._head_w0, len(str(last + 1)) * self._digit_w + round(8 * self.px))
 
     def font_for(self, fmt):
         fmt = fmt or {}
@@ -750,17 +796,17 @@ class SpreadsheetApp(drawing.DrawingTools):
                 chars[ch] = font.measure(ch)
             return sum(map(chars.__getitem__, text))
 
-    def clip_text(self, text, font, width):
-        """The start of `text` that fits `width` pixels."""
+    def clip_text(self, text, font, width, tail=False):
+        """The start (with tail, the end: right-aligned text) of `text` that fits `width` pixels."""
         if width <= 0:
             return ""
         if self.text_width(font, text) <= width:
             return text
         chars, total = self._char_widths[font.name], 0
-        for i, ch in enumerate(text):
+        for i, ch in enumerate(reversed(text) if tail else text):
             total += chars[ch]
             if total > width:
-                return text[:i]
+                return text[len(text) - i:] if tail else text[:i]
         return text
 
     def wrap_lines(self, text, font, width):
@@ -909,6 +955,7 @@ class SpreadsheetApp(drawing.DrawingTools):
         self._build_data_tab(rb.add_tab("Dữ liệu"))
         self._build_review_tab(rb.add_tab("Xem lại"))
         self._build_view_tab(rb.add_tab("Xem"))
+        self._build_tools_tab(rb.add_tab("Tiện ích"))
         self._build_help_tab(rb.add_tab("Trợ giúp"))
         rb.select("Trang chủ")
         self._build_tell_me(rb.extra)
@@ -1558,6 +1605,21 @@ class SpreadsheetApp(drawing.DrawingTools):
         self.commands.append(("Bỏ cố định ngăn", lambda: self.freeze_panes(None)))
         self._btn(g, large=True, icon="freeze", text="Cố định\nngăn", menu=freeze_menu,
                   tooltip="Cố định ngăn\nGiữ hàng và cột tiêu đề luôn hiển thị khi cuộn")
+
+    def _build_tools_tab(self, page):
+        """Tiện ích: PyExcel's own tools, beyond what Excel has - first of all reading PDFs into sheets."""
+        import ribbon
+        ribbon.ICONS.setdefault("pdf_import", _icon_pdf_import)
+        rb = self.ribbon
+        g = rb.group(page, "PDF")
+        self._btn(g, large=True, icon="pdf_import", text="Nhập\nPDF", label="Nhập PDF", command=self.import_pdf,
+                  tooltip="Nhập PDF\nĐưa các trang PDF vào trang tính: chữ vào ô đúng chỗ, đường kẻ bảng thành viền, "
+                          "hình vẽ và ảnh giữ lại. PDF là ảnh quét thì không lấy được chữ")
+        self._btn(g, large=True, icon="pdf", text="Xuất\nPDF", label="Xuất PDF", command=self.export_pdf,
+                  tooltip="Xuất PDF\nLưu trang tính thành tệp PDF")
+        g = rb.group(page, "Sơ đồ")
+        self._btn(g, large=True, icon="diagram_sheet", text="Trang sơ\nđồ mới", label="Trang sơ đồ mới",
+                  command=self.new_diagram_sheet, tooltip="Trang sơ đồ mới\nMột trang tính riêng để vẽ sơ đồ logic")
 
     def _build_help_tab(self, page):
         g = self.ribbon.group(page, "Trợ giúp")
@@ -2286,18 +2348,37 @@ class SpreadsheetApp(drawing.DrawingTools):
             else:
                 text = text.replace("\r", " ").replace("\n", " ")
                 if not is_num:
-                    if spill and align == "left" and isinstance(value, str):
-                        needed, end, nc = self.text_width(font, text), x1, c + 1
-                        while (needed > end - x0 - 2 * pad - indent and nc in col_pos and (r, nc) not in cells
-                               and (r, nc) not in spilled and (r, nc) not in covered and not sh.merge_at(r, nc)
-                               and not (f and r == f["range"][0] and nc in filter_cols)):
+                    if spill and isinstance(value, str):
+                        # text runs on over empty cells like Excel: rightwards when left-aligned, leftwards when
+                        # right-aligned, both ways when centred
+                        def free(nc):
+                            return (nc in col_pos and (r, nc) not in cells and (r, nc) not in spilled
+                                    and (r, nc) not in covered and not sh.merge_at(r, nc)
+                                    and not (f and r == f["range"][0] and nc in filter_cols))
+
+                        def join(left):  # the gridline between column `left` and the next one goes
                             if self.show_grid:
-                                boundary = col_pos[nc][0] - 1
-                                cv.create_line(boundary, y0, boundary, y1 - 1, fill=fill_of(r, nc - 1))
-                                tinted.add((r, nc - 1))
-                            end, nc = col_pos[nc][1], nc + 1
-                        avail = end - x0 - 2 * pad - indent
-                    text = self.clip_text(text, font, avail)
+                                boundary = col_pos[left + 1][0] - 1
+                                cv.create_line(boundary, y0, boundary, y1 - 1, fill=fill_of(r, left))
+                                tinted.add((r, left))
+
+                        needed, start, end, lc, nc = self.text_width(font, text), x0, x1, c - 1, c + 1
+                        mid = (x0 + x1) / 2
+                        while True:
+                            room = (2 * min(mid - start, end - mid) if align == "center" else end - start) - 2 * pad
+                            if needed <= room - indent:
+                                break
+                            grow_r, grow_l = align in ("left", "center") and free(nc), align in ("right", "center") and free(lc)
+                            if not (grow_r or grow_l) or (align == "center" and not (grow_r and grow_l)):
+                                break
+                            if grow_r:
+                                join(nc - 1)
+                                end, nc = col_pos[nc][1], nc + 1
+                            if grow_l:
+                                join(lc)
+                                start, lc = col_pos[lc][0], lc - 1
+                        avail = (2 * min(mid - start, end - mid) if align == "center" else end - start) - 2 * pad - indent
+                    text = self.clip_text(text, font, avail, tail=align == "right")
                 lines = [text]
             block = len(lines) * ls
             ty = {"top": y0 + 1 + block / 2, "center": (y0 + y1) / 2, "bottom": y1 - 2 - block / 2}[valign]
@@ -3124,6 +3205,9 @@ class SpreadsheetApp(drawing.DrawingTools):
 
     def on_key(self, e):
         ks = e.keysym
+        if ks == "Escape" and getattr(self, "_pdf_job", None):
+            self._pdf_job["stop"] = True
+            return "break"
         if self._drawing_key(e):
             return "break"
         if self.chart_sel is not None and ks not in MODIFIER_KEYS:
@@ -3313,10 +3397,12 @@ class SpreadsheetApp(drawing.DrawingTools):
 
     def _autoscroll_steps(self, axis, beyond, elapsed):
         """Rows (axis 0) or columns (1) to scroll after `elapsed` seconds with the mouse `beyond` pixels past
-        the edge: as in Excel, the further out, the faster - a few rows a second close to the edge, thousands
-        far below it. Fractions are carried to the next step."""
-        unit = self.px * (18 if axis == 0 else 40)
-        per_second = (24 if axis == 0 else 16) * 2 ** min(beyond / unit, 10 if axis == 0 else 5)
+        the edge. Rows as in Excel: the further out, the faster - a few rows a second close to the edge,
+        thousands far below it; columns (wide, few) at a steady 20 a second. Fractions carry over."""
+        if axis == 0:
+            per_second = 24 * 2 ** min(beyond / (self.px * 18), 10)
+        else:
+            per_second = 20
         steps = self._autoscroll_carry[axis] + per_second * elapsed
         whole = int(steps)
         self._autoscroll_carry[axis] = steps - whole
@@ -6684,6 +6770,122 @@ class SpreadsheetApp(drawing.DrawingTools):
         selection = (self.sheet, self.sel_rect()) if scope == "selection" else None
         sheets = self.wb.visible_sheets() if scope == "book" else [self.sheet]
         return printing.export_pdf(self.wb, sheets, path, self.font_library, self.file_label(), selection)
+
+    # ------------------------------------------------------------------ PDF into sheets
+
+    def import_pdf(self, path=None):
+        """Tiện ích > Nhập PDF: the chosen pages of a PDF as new sheets (read in the background; Esc stops)."""
+        self.commit_edit()
+        if getattr(self, "_pdf_job", None):
+            return
+        path = path or filedialog.askopenfilename(parent=self.root, title="Nhập PDF",
+                                                  filetypes=[("PDF", "*.pdf"), ("Tất cả các tệp", "*.*")])
+        if not path:
+            return
+        try:
+            doc = pdfread.Document(path)
+            pages = doc.pages()
+        except (pdfread.PDFError, OSError, ValueError, MemoryError) as err:
+            messagebox.showerror(APP_NAME, f"Không mở được PDF:\n{path}\n\n{err}", parent=self.root)
+            return
+        if not pages:
+            messagebox.showinfo(APP_NAME, "PDF không có trang nào.", parent=self.root)
+            return
+        name = os.path.splitext(os.path.basename(path))[0]
+        options = dialogs.PdfImportDialog(self.root, os.path.basename(path), len(pages),
+                                          pdf_import.page_kinds(doc, pages)).show()
+        if not options:
+            return
+        options.families = {pdf_import._squash(f): f for f in tkfont.families(self.root)}
+        if not options.one_sheet and len(options.pages) > 60 and not messagebox.askyesno(
+                APP_NAME, f"Sẽ tạo {len(options.pages)} trang tính. Tiếp tục?", parent=self.root):
+            return
+        job = self._pdf_job = {"done": 0, "total": len(options.pages), "stop": False, "result": None, "error": None}
+
+        def progress(done, total):
+            job["done"] = done
+            return not job["stop"]
+
+        def work():
+            try:
+                job["result"] = pdf_import.convert(doc, options.pages, options, self._sheet_base(name), progress)
+            except Exception as err:  # noqa: BLE001 - a broken PDF must not leave the program waiting
+                job["error"] = err
+        threading.Thread(target=work, name="PyExcel PDF", daemon=True).start()
+        self._watch_pdf_job(job)
+
+    def _sheet_base(self, name):
+        name = re.sub(r"[\[\]:*?/\\']", " ", name).strip() or "PDF"
+        return name[:20].strip()
+
+    def _watch_pdf_job(self, job):
+        if job["result"] is None and job["error"] is None:
+            self.set_mode(f"Đang nhập PDF: trang {job['done']}/{job['total']} — Esc để dừng")
+            self.root.after(120, self._watch_pdf_job, job)
+            return
+        self._pdf_job = None
+        self.set_mode("Sẵn sàng")
+        if job["error"] is not None:
+            messagebox.showerror(APP_NAME, f"Không đọc được PDF:\n{job['error']}", parent=self.root)
+            return
+        self._apply_pdf(job["result"], job["stop"])
+
+    @undo_name("Nhập PDF")
+    def _apply_pdf(self, result, stopped=False):
+        created = []
+        shared = {}
+
+        def unique(name):
+            name = name[:31]
+            n = 2
+            base = name
+            while self.wb.check_sheet_name(name) is not None:
+                name = f"{base[:26]} ({n})"
+                n += 1
+            return name
+
+        def change():
+            index = len(self.wb.sheets)
+            for sd in result.sheets:
+                name = unique(sd.name)
+                self.wb.add_sheet(name, index=index)
+                index += 1
+                created.append(name)
+                items = []
+                for key in set(sd.cells) | set(sd.formats):
+                    fmt = sd.formats.get(key)
+                    if fmt:
+                        sig = repr(sorted(fmt.items()))
+                        fmt = shared.setdefault(sig, fmt)  # cells with one look share one format
+                    items.append((name, key[0], key[1], sd.cells.get(key), fmt or None))
+                self.wb.write_cells(items)
+                sh = self.wb.sheets[name]
+                sh.col_widths.update(sd.col_widths)
+                sh.row_heights.update(sd.row_heights)
+                sh.custom_rows.update(sd.row_heights)
+                sh.set_merges(sd.merges)
+                sh.charts.extend(sd.objects)
+                if sd.landscape:
+                    sh.page_setup = {"orientation": "landscape"}
+        if not result.sheets or not self._structural(change):
+            return
+        self.switch_sheet(created[0])
+        def n(v):
+            return f"{v:,}".replace(",", ".")
+        lines = [f"Đã nhập {result.pages} trang vào {len(created)} trang tính: {n(result.cells)} ô chữ, "
+                 f"{n(result.lines)} đường kẻ, {n(result.shapes)} hình vẽ, {n(result.pictures)} ảnh."]
+        if stopped:
+            lines.append("Đã dừng giữa chừng theo yêu cầu.")
+        if result.scanned:
+            pages = ", ".join(map(str, result.scanned[:12])) + ("..." if len(result.scanned) > 12 else "")
+            lines.append(f"Trang {pages} chỉ có ảnh (bản quét): không có chữ để lấy - cần nhận dạng chữ (OCR), "
+                         "PyExcel chưa có.")
+        if result.skipped_pictures:
+            lines.append(f"{result.skipped_pictures} ảnh ở dạng PyExcel chưa đọc được (JPEG 2000, ảnh fax...) "
+                         "nên bị bỏ qua.")
+        if result.trimmed:
+            lines.append("Một số trang có quá nhiều nét vẽ (bản vẽ CAD...): chỉ lấy một phần hình vẽ.")
+        messagebox.showinfo(APP_NAME, "\n\n".join(lines), parent=self.root)
 
     def export_pdf(self, scope="sheet", parent=None):
         """File > Export PDF: write the pages to a PDF file and offer to open it."""

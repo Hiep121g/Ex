@@ -6272,7 +6272,7 @@ def _load_xlsx(path):
                 continue
             for c in range(lo - 1, min(dim.max or lo, MAX_COLS)):
                 if dim.width:
-                    sh.col_widths[c] = max(MIN_COL_WIDTH, round(dim.width * 7 + 5))
+                    sh.col_widths[c] = max(MIN_COL_WIDTH, round(dim.width * 7))  # (the width counts the padding)
                 if dim.hidden:
                     sh.hidden_cols.add(c)
                 if dim.outlineLevel:
@@ -6753,8 +6753,11 @@ def _save_xlsx(wb, path, active=None):
                     if text:
                         cell.data_type = "s"
                 _xl_apply_style(cell, fmt, fmt.get("num") or implied)
+        # widths in Excel's unit, 1/7 of the default font's digit cell (padding included), and PyExcel's
+        # default column width as the sheet's, so things placed over the cells sit where they do here
+        ws.sheet_format.defaultColWidth = round(DEFAULT_COL_WIDTH / 7, 4)
         for c, width in sh.col_widths.items():
-            ws.column_dimensions[col_name(c)].width = max(1.0, (width - 5) / 7)
+            ws.column_dimensions[col_name(c)].width = max(1.0, width / 7)
         for c in sh.hidden_cols:
             ws.column_dimensions[col_name(c)].hidden = True
         if ws.title not in fast_sheets:  # (the fast writer puts these on its <row> elements)

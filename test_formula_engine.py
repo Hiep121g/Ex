@@ -1,7 +1,9 @@
 """Unit tests for the PyExcel formula engine.  Run:  python -m unittest -v"""
 
 import importlib.util
+import math
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -1173,6 +1175,48 @@ class PrintingTests(unittest.TestCase):
         self.assertEqual(printing.title_rows_text((1, 2)), "$2:$3")
         self.assertEqual(printing.header_text("&A - Trang &P / &N", 2, 5, "Thép", "a.xlsx"), "Thép - Trang 2 / 5")
 
+    def test_text_runs_on_over_empty_cells(self):
+        import printing
+
+        class Recorder:  # a surface that keeps the clip boxes of the text it is given
+            def __init__(self):
+                self.clips, self.texts = [], []
+
+            def measure(self, text, spec, size):
+                return len(text) * size * 0.5
+
+            def ascent(self, spec, size):
+                return size * 0.8
+
+            def descent(self, spec, size):
+                return size * 0.2
+
+            def clip(self, *box):
+                self.clips.append(box)
+
+            def text(self, x, y, text, *rest, **kw):
+                self.texts.append((text, self.clips[-1]))
+
+            def __getattr__(self, name):
+                return lambda *a, **kw: None
+
+        wb = make({"A1": "x", "H1": "y", "C2": "căn phải rất dài", "E3": "căn giữa rất dài",
+                   "B4": "chặn", "C4": "căn phải bị chặn"})
+        for r, c, align in ((1, 2, "right"), (2, 4, "center"), (3, 2, "right")):
+            wb.set_format("Sheet1", r, c, {"align": align})
+        layout = printing.Layout(wb, "Sheet1", printing.setup_of(wb.sheets["Sheet1"]))
+        surface = Recorder()
+        printing.render_page(surface, layout, 0)
+        boxes = {text: tuple(round(v, 6) for v in box) for text, box in surface.texts}
+        left, _, right, _ = boxes["x"]  # column A
+
+        def col(i):
+            return round(left + i * (right - left), 6)
+        self.assertEqual(boxes["căn phải rất dài"][::2], (col(1), col(3)))   # C2 runs left over B2
+        self.assertEqual(boxes["căn giữa rất dài"][::2], (col(3), col(6)))   # E3 over D3 and F3
+        self.assertEqual(boxes["căn phải bị chặn"][::2], (col(2), col(3)))   # B4 is not empty
+
+
     def test_pdf_export(self):
         import printing
         import ttf
@@ -2186,7 +2230,13 @@ class ShapeTests(unittest.TestCase):
                 self.assertLess(sheet.index("<drawing"), sheet.index("<legacyDrawing"))  # the schema's order
                 drawing = z.read("xl/drawings/drawing1.xml").decode("utf-8")
             self.assertIn('prst="flowChartDecision"', drawing)
-            self.assertIn('descr="PyExcel:gateAnd"', drawing)  # no preset for it: a custom outline
+            self.assertIn('descr="PyExcel:gateAnd"', drawing)  # no preset for it: a freeform
+            self.assertIn('<a:cxn ang="10800000"><a:pos x="connsiteX0" y="connsiteY0"/>', drawing)
+            # connectors only as Excel's own kinds (Excel can't open a connector with a freeform outline)
+            for m in re.finditer(r"<xdr:cxnSp\b.*?</xdr:cxnSp>", drawing, re.S):
+                self.assertNotIn("custGeom", m.group(0))
+            self.assertIn('prst="curvedConnector3"', drawing)
+            self.assertIn('defaultColWidth', sheet)  # Excel's columns as wide as PyExcel's
             self.assertRegex(drawing, r'<a:stCxn id="1000" idx="2"/><a:endCxn id="1001" idx="0"/>')
             again = fe.load_workbook(path).sheets["Sơ đồ"].charts
         old = wb.sheets["Sơ đồ"].charts
@@ -2270,6 +2320,30 @@ class ShapeTests(unittest.TestCase):
         self.assertEqual((line["line"], line["line_w"], line["tail"]), ("#ff0000", 1.5, "arrow"))
         self.assertEqual((line["start"], line["end"]), ({"id": ellipse["id"], "site": 4}, {"id": process["id"], "site": 0}))
 
+    def test_connectors_as_excel_draws_them(self):
+        """Elbow routes are written as Excel's bent connectors (turned, flipped, adjusted) that Excel draws
+        exactly along the same route."""
+        import random
+        import drawingml
+        import shapes
+        rng = random.Random(5)
+        rect = shapes.new_shape("rect", (0, 0, 0, 0), (0, 0))
+        for _ in range(400):
+            a, b = (rng.uniform(0, 300), rng.uniform(0, 300)), (rng.uniform(0, 300), rng.uniform(0, 300))
+            A = (a[0], a[1], a[0] + rng.uniform(40, 120), a[1] + rng.uniform(30, 80))
+            B = (b[0], b[1], b[0] + rng.uniform(40, 120), b[1] + rng.uniform(30, 80))
+            s0, s1 = rng.choice(shapes.sites(rect, A)), rng.choice(shapes.sites(rect, B))
+            route = shapes.simplify(shapes.elbow_route(s0[:2], s0[2], s1[:2], s1[2], A, B, 16))
+            prst, rot, fh, fv, box, adj = drawingml.fit_connector("elbow", route)
+            if len(route) == 2:
+                self.assertEqual(prst, "straightConnector1")
+                continue
+            self.assertEqual(prst, f"bentConnector{len(route) - 1}", route)
+            point, _ = shapes.transform({"rot": rot, "flip_h": fh, "flip_v": fv}, box)
+            drawn = [point(*p) for p in drawingml.preset_connector(prst, box[2] - box[0], box[3] - box[1], adj)]
+            for p, q in zip(drawn, route):
+                self.assertLess(math.dist(p, q), 1.6)
+
     def test_native_file_and_printing(self):
         import printing
         import ttf
@@ -2294,6 +2368,231 @@ class ShapeTests(unittest.TestCase):
         self.assertEqual(images.image_info(png), ("png", 3, 2))
         self.assertEqual(images.decode_png(png)[2].hex(), "ff000000ff000000ffffffff000000808080")
         self.assertIsNone(images.png_from_dib(b"\0" * 10))
+
+
+def _make_pdf(objects, trailer=b"", broken_xref=False):
+    """A PDF file of the objects (numbered from 1, the first the catalog) with an xref table."""
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for i, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R %s >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1, trailer, xref + 7 if broken_xref else xref)
+    return bytes(out)
+
+
+def _pdf_stream(d, data, flate=True):
+    import zlib
+    if flate:
+        data = zlib.compress(data)
+        d += b" /Filter /FlateDecode"
+    return b"<< " + d + b" /Length %d >>\nstream\n" % len(data) + data + b"\nendstream"
+
+
+# a 300x200pt page: a 2x2 table with lines, a red triangle, a 2x2 picture and text in WinAnsi
+_TABLE_PAGE = "\n".join([
+    "1 w 0 0 0 RG",
+    "20 150 m 220 150 l S", "20 130 m 220 130 l S", "20 110 m 220 110 l S",
+    "20 110 m 20 150 l S", "120 110 m 120 150 l S", "220 110 m 220 150 l S",
+    "q 1 0 0 rg 240 20 m 280 20 l 260 60 l h f Q",
+    "q 40 0 0 30 240 150 cm /Im1 Do Q",
+    "BT /F1 10 Tf 25 136 Td (T\xean) Tj ET",
+    "BT /F2 10 Tf 125 136 Td (Gi\xe1) Tj ET",
+    "BT /F1 10 Tf 25 116 Td (T\xe1o) Tj ET",
+    "BT /F1 10 Tf 125 116 Td [(1,23) -20 (4.5)] TJ ET",
+    "BT /F1 9 Tf 0 0 1 rg 20 80 Td (Ghi ch\xfa) Tj ET",
+]).encode("latin-1")
+
+
+def _table_pdf(encrypt=None):
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 4 0 R /F2 8 0 R >> "
+        b"/XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        _TABLE_PAGE,
+        (b"/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+         bytes([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255])),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /XObject << /Im1 6 0 R >> >> "
+        b"/Contents 9 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+        b"q 300 0 0 200 0 0 cm /Im1 Do Q",  # a "scanned" page: only a picture
+    ]
+    trailer = b""
+    if encrypt:
+        trailer, crypt = encrypt
+        objs = [crypt(i, o) for i, o in enumerate(objs, 1)] + [trailer[1]]
+        trailer = trailer[0] % (len(objs))
+    else:
+        objs = [o if isinstance(o, bytes) and o.startswith(b"<<") else
+                _pdf_stream(*(o if isinstance(o, tuple) else (b"", o)), flate=not isinstance(o, tuple))
+                for o in objs]
+    return _make_pdf(objs, trailer)
+
+
+class PdfImportTests(unittest.TestCase):
+    """Tiện ích > Nhập PDF: reading PDF files (pdfread) and rebuilding pages as sheets (pdf_import)."""
+
+    def test_filters(self):
+        import base64
+        import zlib
+        import pdfread
+        self.assertEqual(pdfread.decode(zlib.compress(b"abc" * 50), ["FlateDecode"], [{}]), b"abc" * 50)
+        self.assertEqual(pdfread.decode(base64.a85encode(b"Hello, PDF world!", adobe=True), ["A85"], [{}]),
+                         b"Hello, PDF world!")
+        self.assertEqual(pdfread.decode(b"48 65 6c 6C 6f 7>", ["AHx"], [{}]), b"Hellop")
+        self.assertEqual(pdfread.decode(b"\x02abc\xfdx\x80", ["RunLengthDecode"], [{}]), b"abcxxxx")
+        # the example of the PDF reference
+        self.assertEqual(pdfread.decode(bytes.fromhex("800B6050220C0C8501"), ["LZWDecode"], [{}]),
+                         bytes([45] * 5 + [65] + [45] * 3 + [66]))
+        # PNG "Up" predictor, rows of 3 bytes
+        rows = bytes([2, 1, 2, 3, 2, 1, 1, 1])
+        self.assertEqual(pdfread.decode(zlib.compress(rows), ["FlateDecode"], [{"Predictor": 12, "Columns": 3}]),
+                         bytes([1, 2, 3, 2, 3, 4]))
+
+    def test_ciphers(self):
+        import pdfread
+        self.assertEqual(pdfread._rc4(b"Key", b"Plaintext").hex(), "bbf316e8d940af0ad3")
+        key = bytes(range(16))  # FIPS-197 appendix C.1
+        self.assertEqual(pdfread.aes_cbc_decrypt(key, bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a"),
+                                                 iv=bytes(16), unpad=False).hex(),
+                         "00112233445566778899aabbccddeeff")
+        key256 = bytes(range(32))  # C.3
+        self.assertEqual(pdfread.aes_cbc_decrypt(key256, bytes.fromhex("8ea2b7ca516745bfeafc49904b496089"),
+                                                 iv=bytes(16), unpad=False).hex(),
+                         "00112233445566778899aabbccddeeff")
+
+    def test_glyph_names_and_cmaps(self):
+        import pdfread
+        self.assertEqual(pdfread.glyph_text("Aacute"), "Á")
+        self.assertEqual(pdfread.glyph_text("ohornhookabove"), "ở")
+        self.assertEqual(pdfread.glyph_text("uni00410042"), "AB")
+        self.assertEqual(pdfread.glyph_text("u1EA1"), "ạ")
+        self.assertEqual(pdfread.glyph_text("a.sc"), "a")
+        cmap = pdfread.CMap(b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+                            b"2 beginbfchar <0003> <0020> <0011> <00410301> endbfchar\n"
+                            b"1 beginbfrange <0020> <0022> <0061> endbfrange\n"
+                            b"1 beginbfrange <0030> <0031> [<1EA0> <1EA1>] endbfrange\n")
+        codes = [c for c, _ in cmap.split(b"\x00\x20\x00\x22\x00\x03\x00\x11\x00\x31")]
+        self.assertEqual("".join(cmap.text[c] for c in codes), "ac Áạ")
+        self.assertEqual(pdfread._codec_for("90ms-RKSJ-H"), "cp932")
+        self.assertEqual(pdfread._codec_for("UniGB-UCS2-H"), "utf-16-be")
+
+    def test_page_numbers_and_numbers(self):
+        import pdf_import
+        self.assertEqual(pdf_import.parse_pages("", 3), [0, 1, 2])
+        self.assertEqual(pdf_import.parse_pages("1-3, 5", 10), [0, 1, 2, 4])
+        self.assertEqual(pdf_import.parse_pages("8-", 10), [7, 8, 9])
+        self.assertEqual(pdf_import.parse_pages("2; 2 4", 10), [1, 3])
+        self.assertIsNone(pdf_import.parse_pages("3-1", 10))
+        self.assertIsNone(pdf_import.parse_pages("a", 10))
+        self.assertEqual(pdf_import._number("1,234"), (1234.0, "#,##0"))
+        self.assertEqual(pdf_import._number("-12.5"), (-12.5, None))
+        self.assertEqual(pdf_import._number("(1,234.50)"), (-1234.5, "#,##0.00;(#,##0.00)"))
+        for text in ("007", "12%", "$5", "abc", "1.2.3", ""):
+            self.assertIsNone(pdf_import._number(text), text)
+        self.assertEqual(pdf_import._raw("21/10/2026", True), ("'21/10/2026", None))  # dates stay as written
+        self.assertEqual(pdf_import._squash("Times New Roman"), "timesnewroman")
+
+    def _check_table(self, doc):
+        import pdf_import
+        pages = doc.pages()
+        self.assertEqual(len(pages), 2)
+        spans, paths, images = pages[0].read()
+        self.assertEqual([s.text for s in spans], ["Tên", "Giá", "Táo", "1,234.5", "Ghi chú"])
+        self.assertEqual((len(paths), len(images)), (7, 1))
+        self.assertTrue(spans[1].bold and not spans[0].bold)
+        self.assertEqual(pdf_import.page_kinds(doc, pages), (1, 1))
+        result = pdf_import.convert(doc, [0, 1], pdf_import.Options(), "PDF")
+        self.assertEqual([sd.name for sd in result.sheets], ["PDF - Tr.1", "PDF - Tr.2"])
+        self.assertEqual(result.scanned, [2])
+        sd = result.sheets[0]
+        cells = {sd.cells[k]: k for k in sd.cells}
+        (r0, c0), (r1, c1) = cells["Tên"], cells["1234.5"]
+        self.assertEqual((cells["Giá"], cells["Táo"]), ((r0, c1), (r1, c0)))
+        self.assertEqual((r1 - r0, c1 - c0), (1, 1))
+        self.assertEqual(sd.formats[(r1, c1)]["num"], "#,##0.0")
+        self.assertTrue(sd.formats[(r0, c1)]["bold"])
+        self.assertNotIn("fg", sd.formats[(r0, c0)])
+        self.assertEqual(sd.formats[cells["Ghi chú"]]["fg"], "#0000ff")
+        self.assertGreater(cells["Ghi chú"][0], r1)
+        # the table's lines are cell borders all round each cell
+        def border(r, c, side):
+            f = sd.formats.get((r, c), {})
+            other = {"bt": ((r - 1, c), "bb"), "bb": ((r + 1, c), "bt"),
+                     "bl": ((r, c - 1), "br"), "br": ((r, c + 1), "bl")}[side]
+            return f.get(side) or sd.formats.get(other[0], {}).get(other[1])
+        for r, c in ((r0, c0), (r0, c1), (r1, c0), (r1, c1)):
+            for side in ("bt", "bb", "bl", "br"):
+                self.assertEqual(border(r, c, side), ["thin", "#000000"], (r, c, side))
+        self.assertEqual(result.lines, 6)
+        kinds = [o.get("kind", o.get("type")) for o in sd.objects]
+        self.assertEqual(sorted(kinds), ["custom", fe.PICTURE])
+        triangle = next(o for o in sd.objects if o.get("kind") == "custom")
+        self.assertEqual(triangle["fill"], "#ff0000")
+        picture = next(o for o in sd.objects if o.get("type") == fe.PICTURE)
+        self.assertEqual((picture["format"], picture["native"], picture["size"]), ("png", [2, 2], (53, 40)))
+        # everything on one sheet: the second page goes below the first
+        one = pdf_import.convert(doc, [0, 1], pdf_import.Options(one_sheet=True, pictures=False), "PDF")
+        self.assertEqual(len(one.sheets), 1)
+        self.assertFalse(any(o.get("type") == fe.PICTURE for o in one.sheets[0].objects))
+
+    def test_import_a_table_page(self):
+        import pdfread
+        doc = pdfread.Document(_table_pdf())
+        self._check_table(doc)
+        # a file whose xref offset is wrong is read by finding its objects
+        broken = _table_pdf().replace(b"startxref\n", b"startxref\n9")
+        self._check_table(pdfread.Document(broken))
+        with self.assertRaises(pdfread.PDFError):
+            pdfread.Document(b"not a pdf")
+
+    def test_encrypted_files(self):
+        import hashlib
+        import struct
+        import pdfread
+        o_value, ids = bytes(range(32)), b"0123456789abcdef"
+        for rev in (2, 4):
+            n = 5 if rev == 2 else 16
+            key = hashlib.md5(pdfread._PAD + o_value + struct.pack("<i", -4) + ids).digest()[:n]
+            if rev >= 3:
+                for _ in range(50):
+                    key = hashlib.md5(key).digest()[:n]
+
+            def crypt(num, data, key=key, rev=rev):
+                k = hashlib.md5(key + struct.pack("<I", num)[:3] + b"\0\0" + (b"sAlT" if rev == 4 else b"")).digest()
+                k = k[:min(16, len(key) + 5)]
+                if rev == 2:
+                    return pdfread._rc4(k, data)
+                pad = 16 - len(data) % 16
+                iv = bytes(range(16))
+                return iv + pdfread._aes_cbc_encrypt_nopad(k, data + bytes([pad]) * pad, iv)
+
+            def encrypt_object(num, body):
+                if isinstance(body, tuple):
+                    d, data = body
+                    return b"<< " + d + b" /Length %d >>\nstream\n" % len(crypt(num, data)) + crypt(num, data) + \
+                           b"\nendstream"
+                if body.startswith(b"<<"):
+                    return body
+                data = crypt(num, body)
+                return b"<< /Length %d >>\nstream\n" % len(data) + data + b"\nendstream"
+            if rev == 2:
+                enc = b"<< /Filter /Standard /V 1 /R 2 /O <%s> /U <%s> /P -4 >>" % (o_value.hex().encode(),
+                                                                                bytes(32).hex().encode())
+            else:
+                enc = (b"<< /Filter /Standard /V 4 /R 4 /Length 128 /O <%s> /U <%s> /P -4 "
+                       b"/CF << /StdCF << /CFM /AESV2 /Length 16 /AuthEvent /DocOpen >> >> /StmF /StdCF /StrF /StdCF >>"
+                       % (o_value.hex().encode(), bytes(32).hex().encode()))
+            trailer = (b"/Encrypt %d 0 R /ID [<" + ids.hex().encode() + b"> <" + ids.hex().encode() + b">]", enc)
+            data = _table_pdf(encrypt=(trailer, encrypt_object))
+            self.assertNotIn(b"Td (T", data)
+            self._check_table(pdfread.Document(data))
 
 
 if __name__ == "__main__":

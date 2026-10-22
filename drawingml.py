@@ -145,12 +145,21 @@ def _path_xml(paths, w, h, scale=EMU):
 
 
 def _custom_geometry(obj, w, h):
+    """A freeform as Excel and PowerPoint write one: the outline as paths, and connection points and the
+    text area as guides scaled with the shape (so they follow it when it is resized in Excel)."""
     geo = shapes.local_geometry(obj, w, h)
-    sites = "".join(f'<a:cxn ang="{round((a % 360) * 60000)}"><a:pos x="{round(x * EMU)}" y="{round(y * EMU)}"/></a:cxn>'
-                    for x, y, a in geo.sites)
-    l, t, r, b = (round(v * EMU) for v in geo.text)
-    return (f'<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst>{sites}</a:cxnLst>'
-            f'<a:rect l="{l}" t="{t}" r="{r}" b="{b}"/><a:pathLst>{_path_xml(geo.paths, w, h)}</a:pathLst></a:custGeom>')
+    W, H = max(1, round(w * EMU)), max(1, round(h * EMU))
+    guides, sites = [], []
+    for i, (x, y, a) in enumerate(geo.sites):
+        guides.append(f'<a:gd name="connsiteX{i}" fmla="*/ {round(x * EMU)} w {W}"/>'
+                      f'<a:gd name="connsiteY{i}" fmla="*/ {round(y * EMU)} h {H}"/>')
+        sites.append(f'<a:cxn ang="{round((a % 360) * 60000)}"><a:pos x="connsiteX{i}" y="connsiteY{i}"/></a:cxn>')
+    l, t, r, b = geo.text
+    for name, v, d, size in (("textL", l, "w", W), ("textT", t, "h", H), ("textR", r, "w", W), ("textB", b, "h", H)):
+        guides.append(f'<a:gd name="{name}" fmla="*/ {round(v * EMU)} {d} {size}"/>')
+    return (f'<a:custGeom><a:avLst/><a:gdLst>{"".join(guides)}</a:gdLst><a:ahLst/><a:cxnLst>{"".join(sites)}</a:cxnLst>'
+            f'<a:rect l="textL" t="textT" r="textR" b="textB"/><a:pathLst>{_path_xml(geo.paths, w, h)}</a:pathLst>'
+            f'</a:custGeom>')
 
 
 def _geometry(obj, w, h):
@@ -190,15 +199,30 @@ def _text(obj):
             f'anchor="{anchor}"/><a:lstStyle/>{"".join(paras)}</xdr:txBody>')
 
 
-def _from(geom, x, y):
+def _cell(geom, tag, x, y):
     r, c, dx, dy = geom.anchor(x, y)
-    return (f'<xdr:from><xdr:col>{c}</xdr:col><xdr:colOff>{round(dx * EMU)}</xdr:colOff>'
-            f'<xdr:row>{r}</xdr:row><xdr:rowOff>{round(dy * EMU)}</xdr:rowOff></xdr:from>')
+    return (f'<xdr:{tag}><xdr:col>{c}</xdr:col><xdr:colOff>{round(dx * EMU)}</xdr:colOff>'
+            f'<xdr:row>{r}</xdr:row><xdr:rowOff>{round(dy * EMU)}</xdr:rowOff></xdr:{tag}>')
+
+
+def _turned(rot):
+    """Whether Excel anchors a shape turned by `rot` degrees by its turned bounds (45-135 and 225-315)."""
+    return 45 <= (rot or 0) % 180 < 135
+
+
+def _anchor(geom, x, y, w, h, rot, body):
+    """<xdr:twoCellAnchor editAs="oneCell"> (as Excel writes shapes) around `body` for a shape whose box is
+    (x, y, w, h) before turning; a shape turned about a quarter is anchored by its turned bounds, as in Excel."""
+    if _turned(rot):
+        cx, cy = x + w / 2, y + h / 2
+        x, y, w, h = cx - h / 2, cy - w / 2, h, w
+    return (f'<xdr:twoCellAnchor {_DECLARE} editAs="oneCell">{_cell(geom, "from", x, y)}'
+            f'{_cell(geom, "to", x + w, y + h)}{body}<xdr:clientData/></xdr:twoCellAnchor>')
 
 
 def anchors_xml(objects, geom, first_id=1000):
-    """The <xdr:oneCellAnchor> elements of the shapes among a sheet's floating objects (each declaring its
-    namespaces, so they can join a drawing part written by someone else)."""
+    """The anchor elements of the shapes among a sheet's floating objects (each declaring its namespaces,
+    so they can join a drawing part written by someone else)."""
     boxes = [geom.box(o) if o.get("type") == shapes.SHAPE else (0, 0, 0, 0) for o in objects]
     paths = connector_paths(objects, boxes)
     ids, n = {}, first_id
@@ -222,9 +246,92 @@ def anchors_xml(objects, geom, first_id=1000):
         sp = (f'<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="{nid}" name={name}{descr}/>'
               f'<xdr:cNvSpPr{box_attr}/></xdr:nvSpPr><xdr:spPr>{_xfrm(obj, x0, y0, w, h)}{_geometry(obj, w, h)}'
               f'{_color(obj.get("fill"))}{_line(obj)}</xdr:spPr>{_text(obj)}</xdr:sp>')
-        out.append(f'<xdr:oneCellAnchor {_DECLARE}>{_from(geom, x0, y0)}'
-                   f'<xdr:ext cx="{round(w * EMU)}" cy="{round(h * EMU)}"/>{sp}<xdr:clientData/></xdr:oneCellAnchor>')
+        out.append(_anchor(geom, x0, y0, w, h, obj.get("rot"), sp))
     return "".join(out)
+
+
+def preset_connector(prst, w, h, adj=None):
+    """Points of Excel's connector preset `prst` in a w x h box, before flips and turning: every bent
+    connector leaves the top-left corner sideways and ends at the bottom-right one."""
+    adj = adj or {}
+
+    def a(i):
+        return adj.get(i, 50000) / 100000
+    if prst == "bentConnector2":
+        return [(0, 0), (w, 0), (w, h)]
+    if prst == "bentConnector3":
+        x1 = w * a(1)
+        return [(0, 0), (x1, 0), (x1, h), (w, h)]
+    if prst == "bentConnector4":
+        x1, y2 = w * a(1), h * a(2)
+        return [(0, 0), (x1, 0), (x1, y2), (w, y2), (w, h)]
+    if prst == "bentConnector5":
+        x1, y2, x3 = w * a(1), h * a(2), w * a(3)
+        return [(0, 0), (x1, 0), (x1, y2), (x3, y2), (x3, h), (w, h)]
+    if prst and prst.startswith("curvedConnector"):
+        x2 = w * a(1)
+        return [(0, 0)] + shapes._cubic((0, 0), (x2 / 2, 0), (x2, h / 4), (x2, h / 2), 12) + \
+            shapes._cubic((x2, h / 2), (x2, h * 3 / 4), ((w + x2) / 2, h), (w, h), 12)
+    return [(0, 0), (w, h)]
+
+
+def _frames(p0, p1):
+    """Boxes for a connector from p0 to p1: (rot, flip_h, flip_v, box, to screen, to box) for each turn
+    and flip that puts the box's top-left corner on p0 and its bottom-right one on p1."""
+    cx, cy = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
+    dx, dy = abs(p1[0] - p0[0]), abs(p1[1] - p0[1])
+    for rot in (0, 90, 180, 270):
+        w, h = (dx, dy) if rot in (0, 180) else (dy, dx)
+        w, h = max(w, 1.0), max(h, 1.0)  # a flat box can't carry the route's other points
+        box = (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+        for fh in (False, True):
+            for fv in (False, True):
+                frame = {"rot": rot, "flip_h": fh, "flip_v": fv}
+                point, _ = shapes.transform(frame, box)
+                if math.dist(point(0, 0), p0) > 1.01 or math.dist(point(w, h), p1) > 1.01:
+                    continue
+                a = math.radians(rot)
+
+                def back(x, y, w=w, h=h, a=a, fh=fh, fv=fv):
+                    rx, ry = x - cx, y - cy
+                    lx = rx * math.cos(a) + ry * math.sin(a) + w / 2
+                    ly = -rx * math.sin(a) + ry * math.cos(a) + h / 2
+                    return (w - lx if fh else lx), (h - ly if fv else ly)
+                yield rot, fh, fv, box, point, back
+
+
+def fit_connector(kind, path):
+    """How Excel can draw a connector's route: (preset, rot, flip_h, flip_v, box, adjustments). Elbow
+    routes of up to five legs become bent connectors drawn exactly as here; curves become a curved
+    connector between the same ends."""
+    route = shapes.simplify(path)
+    p0, p1 = route[0], route[-1]
+    legs = len(route) - 1
+    if kind == "curve" and math.dist(p0, p1) > 1:
+        first = path[min(3, len(path) - 1)]
+        across = abs(first[0] - p0[0]) >= abs(first[1] - p0[1])
+        for rot, fh, fv, box, point, back in _frames(p0, p1):
+            if (rot in (0, 180)) == across:
+                return "curvedConnector3", rot, fh, fv, box, {}
+    if kind == "elbow" and 2 <= legs <= 5:
+        prst = f"bentConnector{legs}"
+        for rot, fh, fv, box, point, back in _frames(p0, p1):
+            local = [back(*q) for q in route]
+            if abs(local[1][1]) > 0.5:  # the first leg must run along the box's top
+                continue
+            w, h = box[2] - box[0], box[3] - box[1]
+            adj = {}
+            if legs >= 3:
+                adj[1] = round(local[1][0] / w * 100000)
+            if legs >= 4:
+                adj[2] = round(local[2][1] / h * 100000)
+            if legs == 5:
+                adj[3] = round(local[3][0] / w * 100000)
+            drawn = [point(*q) for q in preset_connector(prst, w, h, adj)]
+            if len(drawn) == len(route) and all(math.dist(a, b) <= 1.5 for a, b in zip(drawn, route)):
+                return prst, rot, fh, fv, box, adj
+    (x0, y0, x1, y1), fh, fv = shapes.box_for_ends(p0, p1)
+    return "straightConnector1", 0, fh, fv, (x0, y0, x1, y1), {}
 
 
 def _connector_xml(obj, path, geom, nid, name, ids):
@@ -233,24 +340,15 @@ def _connector_xml(obj, path, geom, nid, name, ids):
         g = obj.get(end)
         if g and g.get("id") in ids:
             glue += f'<a:{tag} id="{ids[g["id"]]}" idx="{int(g.get("site", 0))}"/>'
-    if obj.get("kind") == "line" or len(path) == 2:
-        (x0, y0, x1, y1), fh, fv = shapes.box_for_ends(path[0], path[-1])
-        prst = {"elbow": "bentConnector3", "curve": "curvedConnector3"}.get(obj.get("kind"), "straightConnector1")
-        geometry = f'<a:prstGeom prst="{prst}"><a:avLst/></a:prstGeom>'
-        xfrm = _xfrm(dict(obj, flip_h=fh, flip_v=fv, rot=0), x0, y0, x1 - x0, y1 - y0)
-    else:  # the route as drawn, as a custom path in its bounds
-        x0, y0, x1, y1 = shapes.bounds(path)
-        w, h = max(x1 - x0, 0.01), max(y1 - y0, 0.01)
-        local = [(x - x0, y - y0) for x, y in path]
-        geometry = (f'<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="0" t="0" r="r" b="b"/>'
-                    f'<a:pathLst>{_path_xml([(local, False, "none")], w, h)}</a:pathLst></a:custGeom>')
-        xfrm = _xfrm(dict(obj, flip_h=False, flip_v=False, rot=0), x0, y0, w, h)
-    w, h = max(x1 - x0, 0), max(y1 - y0, 0)
+    prst, rot, fh, fv, (x0, y0, x1, y1), adj = fit_connector(obj.get("kind"), path)
+    w, h = x1 - x0, y1 - y0
+    av = "".join(f'<a:gd name="adj{k}" fmla="val {v}"/>' for k, v in sorted(adj.items()))
+    geometry = f'<a:prstGeom prst="{prst}"><a:avLst>{av}</a:avLst></a:prstGeom>'
+    xfrm = _xfrm(dict(obj, flip_h=fh, flip_v=fv, rot=rot), x0, y0, w, h)
     descr = f' descr="{TAG}{obj["kind"]}"' if obj.get("kind") != "line" else ""
     sp = (f'<xdr:cxnSp macro=""><xdr:nvCxnSpPr><xdr:cNvPr id="{nid}" name={name}{descr}/><xdr:cNvCxnSpPr>{glue}'
           f'</xdr:cNvCxnSpPr></xdr:nvCxnSpPr><xdr:spPr>{xfrm}{geometry}<a:noFill/>{_line(obj)}</xdr:spPr></xdr:cxnSp>')
-    return (f'<xdr:oneCellAnchor {_DECLARE}>{_from(geom, x0, y0)}<xdr:ext cx="{round(w * EMU)}" cy="{round(h * EMU)}"/>'
-            f'{sp}<xdr:clientData/></xdr:oneCellAnchor>')
+    return _anchor(geom, x0, y0, w, h, rot, sp)
 
 
 def connector_paths(objects, boxes, px=1.0):
@@ -526,6 +624,10 @@ def _shape_from_xml(sp, box, geom, new_id):
         obj["text"] = text
         obj["font"] = dict(base, **{k: v for k, v in font.items() if v is not None})
         obj.update(para)
+    if line and xfrm is not None and _number(xfrm, "rot"):  # a turned connector: kept as its two ends
+        turned = {"rot": _number(xfrm, "rot") / 60000, "flip_h": obj["flip_h"], "flip_v": obj["flip_v"]}
+        point, _ = shapes.transform(turned, box)
+        box, obj["flip_h"], obj["flip_v"] = shapes.box_for_ends(point(0, 0), point(box[2] - box[0], box[3] - box[1]))
     x0, y0, x1, y1 = box
     obj["anchor"] = geom.anchor(x0, y0)
     obj["size"] = (max(0, round(x1 - x0)), max(0, round(y1 - y0)))
@@ -622,7 +724,10 @@ def shapes_from_drawing(data, geom, new_id):
             tb = _xfrm_box(top) if top is not None else None
             if tb is None:
                 continue
-            # placed at its anchor cell (column widths may differ from Excel's), sized as Excel drew it
+            # placed at its anchor cell (column widths may differ from Excel's), sized as Excel drew it; a
+            # shape turned about a quarter is anchored by its turned bounds
+            if top is not None and _turned(_number(top, "rot") / 60000):
+                origin = (origin[0] + (tb[3] - tb[2]) / 2, origin[1] + (tb[2] - tb[3]) / 2)
             shift = (origin[0] - tb[0], origin[1] - tb[1])
 
             def mapping(x, y, w, h, shift=shift):

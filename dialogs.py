@@ -2297,3 +2297,65 @@ class TextImportDialog(Dialog):
 
     def collect(self):
         return self.options()
+
+
+class PdfImportDialog(Dialog):
+    """Tiện ích > Nhập PDF: which pages, one sheet each or all on one, and what to take besides the text.
+    collect() gives pdf_import.Options."""
+
+    def __init__(self, master, name, count, kinds):
+        super().__init__(master, "Nhập PDF")
+        import pdf_import
+        self.count, self.pdf_import = count, pdf_import
+        f = self.body
+        ttk.Label(f, text=f"{name}  —  {count} trang", font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        text, scanned = kinds
+        row = 1
+        if scanned and not text:
+            ttk.Label(f, foreground="#c00000", wraplength=420, justify="left",
+                      text="PDF này có vẻ là bản quét (mỗi trang là một ảnh): không có chữ để lấy - nhận dạng chữ "
+                           "(OCR) chưa có trong PyExcel. Ảnh các trang sẽ được chèn vào trang tính.").grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row += 1
+        ttk.Label(f, text="Trang:").grid(row=row, column=0, sticky="w", pady=(10, 2))
+        self.pages = tk.StringVar(value="" if count <= 50 else "1-50")
+        entry = ttk.Entry(f, textvariable=self.pages, width=24)
+        entry.grid(row=row, column=1, sticky="w", pady=(10, 2))
+        self.entry = entry
+        ttk.Label(f, text="để trống = tất cả; ví dụ 1-3, 5", foreground="#666").grid(
+            row=row + 1, column=1, sticky="w")
+        self.one = tk.BooleanVar(value=count > 5)
+        box = ttk.LabelFrame(f, text="Đặt vào", padding=6)
+        box.grid(row=row + 2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Radiobutton(box, text="Mỗi trang PDF thành một trang tính", value=False, variable=self.one).pack(anchor="w")
+        ttk.Radiobutton(box, text="Tất cả vào một trang tính, trang nọ nối trang kia", value=True,
+                        variable=self.one).pack(anchor="w")
+        box = ttk.LabelFrame(f, text="Lấy thêm", padding=6)
+        box.grid(row=row + 3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.flags = {}
+        for key, label in (("borders", "Đường kẻ bảng thành viền ô, ô tô màu thành màu nền"),
+                           ("drawings", "Hình vẽ khác (đường xiên, đường cong, hình) thành hình vẽ"),
+                           ("pictures", "Ảnh trong PDF thành ảnh"),
+                           ("numbers", "Chữ số thành số (1,234.5 → 1234,5) để tính toán được")):
+            self.flags[key] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(box, text=label, variable=self.flags[key]).pack(anchor="w")
+        ttk.Label(f, foreground="#666", wraplength=420, justify="left",
+                  text="Bố cục giữ như trong PDF: cột và hàng đặt theo vị trí chữ và đường kẻ. Chữ trong ô bảng "
+                       "được gộp ô và căn lề như bản gốc.").grid(row=row + 4, column=0, columnspan=2, sticky="w",
+                                                                 pady=(8, 0))
+        self.error = ttk.Label(f, foreground="#c00000")
+        self.error.grid(row=row + 5, column=0, columnspan=2, sticky="w")
+        self.add_buttons("Nhập")
+
+    def show(self):
+        return super().show(self.entry)
+
+    def collect(self):
+        pages = self.pdf_import.parse_pages(self.pages.get(), self.count)
+        if pages is None:
+            self.error.configure(text="Không đọc được danh sách trang (ví dụ: 1-3, 5).")
+            self.bell()
+            return None
+        flags = {k: v.get() for k, v in self.flags.items()}
+        return self.pdf_import.Options(pages=pages, one_sheet=self.one.get(), **flags)
