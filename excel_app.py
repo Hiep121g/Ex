@@ -328,6 +328,9 @@ CHUỘT
   • Kéo ô vuông nhỏ ở góc vùng chọn để sao chép hoặc điền chuỗi (1, 2 → 3, 4...; "Mục 1" → "Mục 2").
   • Chổi "Sao chép định dạng": nhấp một lần để dán định dạng một lần, nhấp đúp để dán nhiều lần.
   • Ctrl + lăn chuột để phóng to/thu nhỏ.
+  • Cửa sổ (Windows): kéo thanh tiêu đề lên mép trên màn hình để phóng to, sang mép trái/phải để chia đôi
+    màn hình; nhấp đúp thanh tiêu đề để phóng to/khôi phục; Windows 11: rê chuột lên nút Phóng to để chọn
+    bố cục chia màn hình (Snap Layouts). Win+mũi tên và chuột phải trên thanh tiêu đề (menu hệ thống) cũng dùng được.
 
 PHÍM TẮT
   Ctrl+C / X / V      Sao chép / Cắt / Dán         Ctrl+Z / Y        Hoàn tác / Làm lại
@@ -712,7 +715,7 @@ class SpreadsheetApp(drawing.DrawingTools):
         self._zoom_busy = False
         self.zoom_label.config(text=f"{round(self.zoom * 100)}%")
         if maximized:
-            if self.titlebar.custom:
+            if self.titlebar.custom and not self.titlebar.native:  # (Windows keeps a maximised window so itself)
                 x, y, w, h = screens.work_area(root)
                 root.geometry(f"{w}x{h}+{x}+{y}")
         else:  # the same size on the new monitor as on the old one
@@ -983,6 +986,7 @@ class SpreadsheetApp(drawing.DrawingTools):
                 button.pack(side="left")
         GlyphButton(self.titlebar.qat, self.ui, "customize", self._qat_menu,
                     "Tùy chỉnh Thanh công cụ Truy nhập Nhanh", width=self.ui.px(18)).pack(side="left")
+        self.titlebar.buttons_changed()
         self._update_undo_buttons()
 
     def _qat_menu(self, button):

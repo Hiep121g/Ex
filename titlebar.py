@@ -4,8 +4,10 @@ middle, then the user's name, the ribbon display options and the window buttons.
 With custom=True (the default on Windows) PyExcel draws the whole window frame itself: the system title
 bar is removed and this bar moves the window (drag it; drag to the top of the screen to maximise, to a
 side to fill half of it), maximises it to the screen's work area (double-click), minimises and closes
-it, and thin edges around the window resize it. Otherwise the system title bar stays and this bar only
-holds the toolbar and the buttons next to it.
+it, and thin edges around the window resize it. On Windows the window keeps a hidden system frame
+(winframe.py), so all of that is Windows' own: its animations, Aero Snap and the snap bar, Snap Layouts
+over the maximise button, Win+arrow keys and the system menu. Otherwise the system title bar stays and
+this bar only holds the toolbar and the buttons next to it.
 """
 
 import getpass
@@ -14,6 +16,12 @@ import tkinter as tk
 
 from ribbon import RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, Tooltip
 from screens import user32, work_area
+
+if sys.platform == "win32":
+    import winframe
+    _SNAP_LAYOUTS = sys.getwindowsversion().build >= 22000  # Windows 11
+else:
+    _SNAP_LAYOUTS = False
 
 BAR_HEIGHT = 30   # px at 100 %, like Excel's
 EDGE = 4          # px at 100 %: width of the window edges that resize it
@@ -178,6 +186,9 @@ class TitleBar(tk.Frame):
         self._geometry_job = self._pending_geometry = None
         self.band = 0         # height of the green tab strip the side edges continue
         self.text = ""
+        self.native = None    # winframe.Frame: Windows moves, sizes and snaps the window (see winframe)
+        self._start_zoomed = False
+        self._hwnds = None
 
         self.qat = tk.Frame(self, bg=TAB_BAR_BG)
         self.qat.pack(side="left", fill="y", padx=(ui.px(4), 0))
@@ -216,19 +227,21 @@ class TitleBar(tk.Frame):
                 edge.bind("<ButtonRelease-1>", lambda e: setattr(self, "_resize", None))
             self._show_edges()
             if window:
-                self.maximized, self._normal, self._snap = window
+                self.maximized, self._normal, self._snap, self.native = window
                 if self.maximized:
                     self._set_maximized(True)
+                if self.native:
+                    self._attach_native()
             elif sys.platform == "win32":
                 root.after(10, self._fix_taskbar)
 
     def window_state(self):
-        """What a new bar needs to carry on: maximised, the size to restore, a half-screen snap."""
-        return self.maximized, self._normal, self._snap
+        """What a new bar needs to carry on: maximised, the size to restore, a half-screen snap, the frame."""
+        return self.maximized, self._normal, self._snap, self.native
 
     def busy(self):
         """True while the window is being dragged or resized."""
-        return bool(self._drag or self._resize)
+        return bool(self._drag or self._resize or (self.native and self.native.moving))
 
     # -------------------------------------------------------------- title
 
@@ -266,11 +279,16 @@ class TitleBar(tk.Frame):
         x, y, w, h = work_area(self.root)
         self._normal = f"{width}x{height}+{x + max(0, (w - width) // 2)}+{y + max(0, (h - height) // 2)}"
         self.root.geometry(self._normal)
-        if maximized:  # (not maximize(): the window isn't shown yet, so its geometry isn't the one to go back to)
+        if maximized and sys.platform == "win32" and not self.root.winfo_ismapped():
+            self._start_zoomed = True  # by Windows once the window has its frame (see _fix_taskbar)
+        elif maximized:  # (not maximize(): the window isn't shown yet, so its geometry isn't the one to go back to)
             self._set_maximized(True)
             self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     def maximize(self, point=None):
+        if self.native:
+            self.native.show(winframe.SW_MAXIMIZE)
+            return
         if not self.maximized and self._resize is None:
             if self._normal is None or not self._snapped():
                 self._normal = self.root.geometry()
@@ -279,14 +297,23 @@ class TitleBar(tk.Frame):
             self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     def restore(self):
+        if self.native:
+            self.native.show(winframe.SW_RESTORE)
+            return
         if self.maximized:
             self._set_maximized(False)
             self.root.geometry(self._normal or "")
 
     def toggle_maximize(self):
+        if self.native:
+            self.native.toggle()
+            return
         self.restore() if self.maximized else self.maximize()
 
     def minimize(self):
+        if self.native:
+            self.native.show(winframe.SW_MINIMIZE)
+            return
         if sys.platform == "win32":
             try:
                 user32().ShowWindow(user32().GetParent(self.root.winfo_id()), 6)  # SW_MINIMIZE
@@ -320,17 +347,96 @@ class TitleBar(tk.Frame):
         if not self.root.winfo_ismapped():  # the window's frame (whose styles change) exists once it is shown
             self.root.after(20, self._fix_taskbar)
             return
-        try:
-            show_in_taskbar(self.root)
-        except (AttributeError, OSError, ValueError):
-            return
+        self.native = winframe.install(self.root)
+        if self.native:
+            self._attach_native()
+        else:
+            try:
+                show_in_taskbar(self.root)
+            except (AttributeError, OSError, ValueError):
+                return
         # Windows applies the new styles when the window is shown again
         self.root.withdraw()
         self.root.after(10, self._reshow)
 
     def _reshow(self):
         self.root.deiconify()
+        if self._start_zoomed:
+            self._start_zoomed = False
+            if self.native:
+                self.native.show(winframe.SW_MAXIMIZE)
+            else:
+                self.maximize()
         self.root.event_generate("<<WindowShown>>")
+
+    # -------------------------------------------------------------- Windows' own frame (winframe)
+
+    def _attach_native(self):
+        """Have the window's system frame ask this bar where its caption, maximise button and edges are."""
+        n = self.native
+        n.forget_old()
+        n.hit, n.on_change = self._hit, self._native_changed
+        self._hwnds = (self.winfo_id(), self.caption["maximize"].winfo_id())
+        self._band, self._corner = self._edge_px(), self.ui.px(16)
+        for widget in (self.root, self, self.title, self.user, self.qat, self.tools):
+            n.let_through(widget)  # (the root's own window lies under the others)
+        n.let_through(self.caption["maximize"], winframe.RESIZE | {winframe.HTMAXBUTTON})
+        for widget in [self.caption["minimize"], self.caption["close"]] + list(self.edges.values()):
+            n.let_through(widget, winframe.RESIZE)
+        self.after_idle(self.buttons_changed)
+        if not getattr(n, "watched", False):  # (once: the bar is made again at another scale)
+            n.watched = True
+            self.root.bind("<Configure>", lambda e: e.widget is self.root and n.on_change and n.on_change(), add="+")
+        self._native_changed()
+
+    def buttons_changed(self):
+        """The toolbar's buttons were made again: the top edge over them still sizes the window."""
+        if self.native and self.winfo_exists():
+            for frame in (self.qat, self.tools):
+                for child in frame.winfo_children():
+                    self.native.let_through(child, winframe.RESIZE, deep=True)
+
+    def _hit(self, x, y):
+        """The part of the window at a screen point for its frame (runs in a window procedure: no Tk calls)."""
+        n = self.native
+        win = n.rect_of(n.hwnd)
+        left, top, right, bottom = win.left, win.top, win.right, win.bottom
+        if not n.zoomed():
+            b, c = self._band, self._corner
+            if y < top + b:
+                return winframe.HTTOPLEFT if x < left + c else winframe.HTTOPRIGHT if x >= right - c else winframe.HTTOP
+            if y >= bottom - b:
+                return (winframe.HTBOTTOMLEFT if x < left + c else winframe.HTBOTTOMRIGHT if x >= right - c
+                        else winframe.HTBOTTOM)
+            if x < left + b:
+                return winframe.HTBOTTOMLEFT if y >= bottom - c else winframe.HTLEFT
+            if x >= right - b:
+                return winframe.HTBOTTOMRIGHT if y >= bottom - c else winframe.HTRIGHT
+        bar, button = self._hwnds
+        if winframe._inside(n.rect_of(button), x, y):
+            return winframe.HTMAXBUTTON
+        if winframe._inside(n.rect_of(bar), x, y):
+            return winframe.HTCAPTION
+        return None
+
+    def _native_changed(self):
+        """Show the frame's state: maximised or not, the maximise button under the pointer or pressed."""
+        n = self.native
+        if not n or not self.winfo_exists():
+            return
+        zoomed = n.zoomed()
+        if zoomed != self.maximized:
+            self._set_maximized(zoomed)
+        button = self.caption["maximize"]
+        if (button.hover, button.pressed) != (n.hover, n.pressed):
+            if not _SNAP_LAYOUTS and n.hover != button.hover:  # (Windows 11 shows its Snap Layouts there instead)
+                if n.hover:
+                    button.tip._schedule()
+                else:
+                    button.tip._hide()
+            if n.pressed:
+                button.tip._hide()
+            button._set(hover=n.hover, pressed=n.pressed)
 
     def _system_menu(self, e):
         menu = tk.Menu(self, tearoff=0)
