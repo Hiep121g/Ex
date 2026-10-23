@@ -11,6 +11,7 @@ sizes in pixels at 96 DPI and merges in table coordinates. A cell is {"text": st
 """
 
 import html
+import re
 import sys
 
 DEFAULT_FONT = "Calibri"
@@ -33,6 +34,7 @@ def _merge_info(table):
 
 def _css(cell):
     fmt = cell["fmt"]
+    number = fmt.get("num")
     style = [f"font-family:'{fmt.get('font') or DEFAULT_FONT}'", f"font-size:{fmt.get('size') or DEFAULT_SIZE}pt",
              f"text-align:{cell['align']}", f"vertical-align:{'middle' if fmt.get('valign') == 'center' else fmt.get('valign') or 'bottom'}",
              "white-space:normal" if fmt.get("wrap") else "white-space:nowrap"]
@@ -52,6 +54,8 @@ def _css(cell):
         if spec:
             kind = {"double": "double", "dashed": "dashed", "dotted": "dotted"}.get(spec[0], "solid")
             style.append(f"border-{side}:{BORDER_PT.get(spec[0], 0.5)}pt {kind} {spec[1] if len(spec) > 1 else '#000000'}")
+    if number:  # Excel's own property: the number format (backslash-escaped, as Excel writes it)
+        style.append('mso-number-format:"' + re.sub(r"([^\w\s])", r"\\\1", number) + '"')
     return ";".join(style)
 
 
@@ -67,7 +71,9 @@ def html_table(table):
             rs, cs = spans.get((r, c), (1, 1))
             attrs = (f" rowspan={rs}" if rs > 1 else "") + (f" colspan={cs}" if cs > 1 else "")
             text = html.escape(cell["text"]).replace("\n", "<br>")
-            out.append(f'<td{attrs} style="{_css(cell)}">{text}</td>')
+            if cell.get("value") is not None:  # the number itself, which Excel reads instead of the text shown
+                attrs += f' x:num="{cell["value"]!r}"'
+            out.append(f'<td{attrs} style="{html.escape(_css(cell))}">{text}</td>')
         out.append("</tr>")
     out.append("</table>")
     return "\n".join(out)
@@ -76,7 +82,8 @@ def html_table(table):
 def html_clipboard(table):
     """The table in Windows' "HTML Format": UTF-8 behind a header giving byte offsets."""
     header = "Version:0.9\r\nStartHTML:{:010d}\r\nEndHTML:{:010d}\r\nStartFragment:{:010d}\r\nEndFragment:{:010d}\r\n"
-    before = '<html><head><meta charset="utf-8"></head><body><!--StartFragment-->'
+    before = ('<html xmlns:x="urn:schemas-microsoft-com:office:excel"><head><meta charset="utf-8"></head><body>'
+              "<!--StartFragment-->")
     after = "<!--EndFragment--></body></html>"
     fragment = html_table(table).encode("utf-8")
     start_html = len(header.format(0, 0, 0, 0))
@@ -168,7 +175,8 @@ def rtf_table(table):
             align = {"center": "\\qc", "right": "\\qr"}.get(cell["align"], "\\ql")
             body.append(f"\\pard\\intbl{align}{{{style} {_rtf_text(cell['text'])}}}\\cell")
         body.append("\\row")
-    font_table = "".join(f"{{\\f{i}\\fnil\\fcharset0 {name};}}" for i, name in enumerate(fonts))
+    # (names like 游ゴシック go through \\u escapes too: RTF is 7-bit)
+    font_table = "".join(f"{{\\f{i}\\fnil\\fcharset0 {_rtf_text(name)};}}" for i, name in enumerate(fonts))
     color_table = ";" + "".join(f"\\red{int(c[1:3], 16)}\\green{int(c[3:5], 16)}\\blue{int(c[5:7], 16)};"
                                 for c in colors)
     return (f"{{\\rtf1\\ansi\\ansicpg1252\\deff0{{\\fonttbl{font_table}}}{{\\colortbl{color_table}}}\n"
@@ -386,6 +394,42 @@ def copy_to_clipboard(hwnd, text, table):
     finally:
         gdi.CloseClipboard()
     return True
+
+
+def read_cells(hwnd):
+    """The cell formats another program put on the Windows clipboard: {"xml": Excel's XML Spreadsheet,
+    "html": HTML Format} (bytes; those present), or {} (also off Windows)."""
+    if sys.platform != "win32":
+        return {}
+    import ctypes
+
+    gdi = _Gdi(ctypes)
+    kinds = {key: gdi.RegisterClipboardFormatW(name) for key, name in (("xml", "XML Spreadsheet"),
+                                                                        ("html", "HTML Format"))}
+    kinds = {key: kind for key, kind in kinds.items() if kind and gdi.IsClipboardFormatAvailable(kind)}
+    if not kinds:
+        return {}
+    for _ in range(10):  # another program may hold the clipboard for a moment
+        if gdi.OpenClipboard(hwnd):
+            break
+        import time
+        time.sleep(0.02)
+    else:
+        return {}
+    found = {}
+    try:
+        for key, kind in kinds.items():
+            handle = gdi.GetClipboardData(kind)
+            ptr = gdi.GlobalLock(handle) if handle else None
+            if not ptr:
+                continue
+            try:
+                found[key] = ctypes.string_at(ptr, gdi.GlobalSize(handle)).rstrip(b"\0")
+            finally:
+                gdi.GlobalUnlock(handle)
+    finally:
+        gdi.CloseClipboard()
+    return found
 
 
 def read_image(hwnd):

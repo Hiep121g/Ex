@@ -744,11 +744,27 @@ class RichClipboardTests(unittest.TestCase):
         self.assertIn("border-bottom:0.5pt solid #000000", out)
         self.assertIn("font-weight:700", out)
         data = richclip.html_clipboard(self.TABLE)
-        header = data[:data.index(b"<html>")].decode("ascii")
+        header = data[:data.index(b"<html")].decode("ascii")
         offsets = dict(line.split(":") for line in header.split())
         fragment = data[int(offsets["StartFragment"]):int(offsets["EndFragment"])].decode("utf-8")
         self.assertTrue(fragment.startswith("<table") and fragment.endswith("</table>"))
         self.assertEqual(int(offsets["EndHTML"]), len(data))
+
+    def test_html_reads_back_with_its_formats(self):
+        import clipcells
+        import richclip
+        table = dict(self.TABLE, cells=[list(row) for row in self.TABLE["cells"]])
+        table["cells"][1][1] = dict(table["cells"][1][1], value=1250.0, fmt=dict(table["cells"][1][1]["fmt"], num="#,##0"))
+        block = clipcells.from_html(richclip.html_clipboard(table))
+        self.assertEqual((block.h, block.w, block.merges), (3, 2, [(0, 0, 0, 1)]))
+        self.assertEqual(block.col_widths, {0: 80, 1: 120})
+        self.assertEqual(block.values, {(0, 0): "Bảng giá", (1, 0): "Thép <D10>", (1, 1): "1250",
+                                        (2, 0): "Dòng 1\nDòng 2"})
+        f = block.formats
+        self.assertTrue(f[(0, 0)]["bold"] and f[(0, 0)]["bg"] == "#ddebf7" and f[(0, 0)]["bb"] == ["thin", "#000000"])
+        self.assertEqual((f[(1, 0)]["font"], f[(1, 0)]["size"]), ("Arial", 10))
+        self.assertEqual((f[(1, 1)]["fg"], f[(1, 1)]["br"], f[(1, 1)]["num"]), ("#ff0000", ["double", "#000000"], "#,##0"))
+        self.assertTrue(f[(2, 0)]["wrap"])
 
     def test_rtf(self):
         import richclip
@@ -761,6 +777,9 @@ class RichClipboardTests(unittest.TestCase):
         self.assertIn("\\line ", out)
         self.assertEqual(out.count("\\row"), 3)
         self.assertIn("{\\f1\\fnil\\fcharset0 Arial;}", out)
+        table = dict(self.TABLE, cells=[[dict(self.TABLE["cells"][0][0], fmt={"font": "游ゴシック"})] + self.TABLE["cells"][0][1:]]
+                     + self.TABLE["cells"][1:])
+        richclip.rtf_table(table).encode("ascii")  # a Japanese font name is escaped too
 
     def test_windows_clipboard_calls(self):
         """Run the Win32 code path against a stand-in for user32/gdi32/kernel32 that records calls."""
@@ -2593,6 +2612,157 @@ class PdfImportTests(unittest.TestCase):
             data = _table_pdf(encrypt=(trailer, encrypt_object))
             self.assertNotIn(b"Td (T", data)
             self._check_table(pdfread.Document(data))
+
+
+_EXCEL_XML = """<?xml version="1.0"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:html="http://www.w3.org/TR/REC-html40">
+ <Styles>
+  <Style ss:ID="Default" ss:Name="Normal"><Alignment ss:Vertical="Center"/><Borders/>
+   <Font ss:FontName="游ゴシック" x:CharSet="128" ss:Size="11" ss:Color="#000000"/><Interior/><NumberFormat/><Protection/>
+  </Style>
+  <Style ss:ID="s62"><Alignment ss:Horizontal="Center" ss:Vertical="Center" ss:WrapText="1"/>
+   <Borders><Border ss:Position="Bottom" ss:LineStyle="Continuous" ss:Weight="1"/>
+    <Border ss:Position="Top" ss:LineStyle="Continuous" ss:Weight="2" ss:Color="#FF0000"/></Borders>
+   <Font ss:FontName="Arial" ss:Size="12" ss:Color="#FFFFFF" ss:Bold="1"/><Interior ss:Color="#1F4E78" ss:Pattern="Solid"/>
+  </Style>
+  <Style ss:ID="s63"><Borders><Border ss:Position="Left" ss:LineStyle="Double" ss:Weight="3"/></Borders></Style>
+  <Style ss:ID="s64" ss:Parent="s63"><NumberFormat ss:Format="#,##0.00_ ;[Red]\\-#,##0.00\\ "/></Style>
+  <Style ss:ID="s65"><Font ss:FontName="Calibri" ss:Size="11" ss:Italic="1" ss:Underline="Double"/>
+   <NumberFormat ss:Format="Short Date"/></Style>
+  <Style ss:ID="s66"><NumberFormat ss:Format="@"/></Style>
+ </Styles>
+ <Worksheet ss:Name="Sheet1">
+  <Table ss:ExpandedColumnCount="3" ss:ExpandedRowCount="5" ss:DefaultColumnWidth="54">
+   <Column ss:Width="120"/><Column ss:Index="3" ss:Width="60"/>
+   <Row ss:Height="30">
+    <Cell ss:MergeAcross="1" ss:StyleID="s62"><Data ss:Type="String">Tên hàng</Data></Cell>
+    <Cell ss:StyleID="s62"><Data ss:Type="String">Giá</Data></Cell>
+   </Row>
+   <Row>
+    <Cell ss:StyleID="s63"><ss:Data ss:Type="String" xmlns="http://www.w3.org/TR/REC-html40"><B>Xi</B> măng</ss:Data>
+     <Comment ss:Author="A"><ss:Data xmlns="http://www.w3.org/TR/REC-html40">Ghi chú</ss:Data></Comment></Cell>
+    <Cell><Data ss:Type="Number">45</Data></Cell>
+    <Cell ss:StyleID="s64" ss:Formula="=RC[-1]*2000.5"><Data ss:Type="Number">90022.5</Data></Cell>
+   </Row>
+   <Row>
+    <Cell ss:Index="2" ss:Formula="=SUM(R[-1]C:R[-1]C[1])"><Data ss:Type="Number">90067.5</Data></Cell>
+    <Cell ss:StyleID="s65"><Data ss:Type="DateTime">2026-10-22T00:00:00.000</Data></Cell>
+   </Row>
+   <Row>
+    <Cell ss:StyleID="s66"><Data ss:Type="String">00123</Data></Cell>
+    <Cell ss:Formula="=Sheet2!R1C1"><Data ss:Type="Number">5</Data></Cell>
+    <Cell ss:HRef="https://example.com/"><Data ss:Type="String">Trang</Data></Cell>
+   </Row>
+   <Row><Cell><Data ss:Type="Boolean">1</Data></Cell><Cell><Data ss:Type="DateTime">1899-12-31T12:00:00.000</Data></Cell>
+    <Cell ss:Formula="=Price*2"><Data ss:Type="Number">10</Data></Cell></Row>
+  </Table>
+ </Worksheet>
+</Workbook>
+"""
+
+_EXCEL_HTML = """Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000009999\r\nStartFragment:0000000000\r
+EndFragment:0000000000\r\n<html xmlns:x="urn:schemas-microsoft-com:office:excel"><head><style>
+<!--td {color:black; font-size:11.0pt; font-family:游ゴシック, monospace; mso-number-format:General;
+ vertical-align:middle; border:none; white-space:nowrap;}
+.xl65 {color:white; font-weight:700; font-family:Arial, sans-serif; text-align:center; border:.5pt solid windowtext;
+ background:#1F4E78; white-space:normal;}
+.xl66 {mso-number-format:"\\#\\,\\#\\#0"; border-top:1.0pt solid red; border-bottom:2.0pt double windowtext;}
+.xl67 {mso-number-format:"\\@";}
+--></style></head><body><table border=0 cellpadding=0 cellspacing=0><!--StartFragment-->
+ <col width=160 style='width:120pt'><col width=80 span=2 style='width:60pt'>
+ <tr height=40><td colspan=2 class=xl65>Tên<br>
+   hàng</td><td class=xl65>Giá</td></tr>
+ <tr><td class=xl67>00123</td><td class=xl66 align=right x:num="1234.5">1,235</td><td>=x</td></tr>
+ <tr><td><a href="https://example.com/">Trang</a></td><td>1,250</td><td><b>Đậm</b></td></tr>
+<!--EndFragment--></table></body></html>"""
+
+
+class ClipboardCellsTests(unittest.TestCase):
+    """Pasting cells copied in Excel (XML Spreadsheet) or another program (HTML), with their formats."""
+
+    def test_r1c1_formulas(self):
+        import clipcells
+        self.assertEqual(clipcells.a1_formula("=RC[-2]*RC[-1]", 9, 3), "=B10*C10")
+        self.assertEqual(clipcells.a1_formula("=SUM(R[-3]C:R[-1]C)", 4, 3), "=SUM(D2:D4)")
+        self.assertEqual(clipcells.a1_formula("=R1C1+R[1]C2+R2C[1]", 0, 0), "=$A$1+$B2+B$2")
+        self.assertEqual(clipcells.a1_formula('=IF(RC[1]>0,"R1C1",ROUND(RC[1],2))', 0, 0), '=IF(B1>0,"R1C1",ROUND(B1,2))')
+        self.assertEqual(clipcells.a1_formula("=_xlfn.XLOOKUP(RC[-1],R1C1:R9C1,R1C2:R9C2)", 0, 1),
+                         "=XLOOKUP(A1,$A$1:$A$9,$B$1:$B$9)")
+        self.assertEqual(clipcells.a1_formula("=R[0]C[-1]*2", 1, 1), "=A2*2")  # Google Sheets writes [0]
+        for formula in ("=Sheet2!R1C1", "='My sheet'!R1C1", "=[1]Sheet1!R1C1", "=SUM(C[-1])", "=SUM(R1)",
+                        "=R[-5]C", "=Price*2", "=NOSUCHFUNCTION(1)", "=Table1[Col]"):
+            self.assertIsNone(clipcells.a1_formula(formula, 2, 2), formula)
+        self.assertEqual(clipcells.a1_formula("=Price*2", 2, 2, {"PRICE"}), "=PRICE*2")
+
+    def test_excel_xml(self):
+        import clipcells
+        b = clipcells.from_spreadsheet_xml(_EXCEL_XML.encode("utf-8") + b"\0")
+        self.assertEqual((b.h, b.w, b.merges), (5, 3, [(0, 0, 0, 1)]))
+        self.assertEqual((b.col_widths, b.default_width, b.row_heights), ({0: 160, 2: 80}, 72, {0: 40}))
+        self.assertEqual([[b.raw(i, j, 9 + i, 1 + j) for j in range(3)] for i in range(5)], [
+            ["Tên hàng", None, "Giá"],
+            ["Xi măng", "45", "=C11*2000.5"],
+            [None, "=SUM(C11:D11)", "46317"],
+            ["00123", "5", "Trang"],
+            ["TRUE", "0.5", "10"]])
+        f = b.formats
+        self.assertEqual(f[(0, 0)], {"font": "Arial", "size": 12, "fg": "#ffffff", "valign": "center", "bold": True,
+                                     "bg": "#1f4e78", "align": "center", "wrap": True, "bb": ["thin", "#000000"],
+                                     "bt": ["medium", "#ff0000"]})
+        self.assertIs(f[(0, 0)], f[(0, 2)])  # one dict per style
+        self.assertEqual(f[(1, 0)], {"font": "游ゴシック", "valign": "center", "bl": ["double", "#000000"]})
+        self.assertEqual(f[(1, 2)]["num"], "#,##0.00;-#,##0.00")
+        self.assertEqual(f[(1, 2)]["bl"], ["double", "#000000"])  # from its parent style
+        self.assertEqual(f[(2, 2)], {"valign": "center", "italic": True, "underline": "double", "num": "dd/mm/yyyy"})
+        self.assertEqual((f[(3, 0)]["num"], b.values[(3, 0)]), ("@", "00123"))
+        self.assertEqual(f[(1, 1)], {"font": "游ゴシック", "valign": "center"})  # the Normal style
+        self.assertEqual((b.notes, b.links), ({(1, 0): "Ghi chú"}, {(3, 2): {"target": "https://example.com/"}}))
+        t = b.transposed()
+        self.assertEqual((t.h, t.w, t.merges, t.values[(1, 1)]), (3, 5, [(0, 0, 1, 0)], "45"))
+        self.assertIsNone(clipcells.from_spreadsheet_xml(b"<not xml"))
+
+    def test_html_tables(self):
+        import clipcells
+        b = clipcells.from_html(_EXCEL_HTML.encode("utf-8"))
+        self.assertEqual((b.h, b.w, b.merges, b.col_widths), (3, 3, [(0, 0, 0, 1)], {0: 160, 1: 80, 2: 80}))
+        self.assertEqual([[b.raw(i, j, i, j) for j in range(3)] for i in range(3)], [
+            ["Tên\nhàng", None, "Giá"], ["00123", "1234.5", "'=x"], ["Trang", "1,250", "Đậm"]])
+        f = b.formats
+        self.assertEqual(f[(0, 0)], {"fg": "#ffffff", "font": "Arial", "valign": "center", "bold": True,
+                                     "align": "center", "bt": ["thin", "#000000"], "bb": ["thin", "#000000"],
+                                     "bl": ["thin", "#000000"], "br": ["thin", "#000000"], "bg": "#1f4e78",
+                                     "wrap": True})
+        self.assertEqual((f[(1, 1)]["num"], f[(1, 1)]["bt"], f[(1, 1)]["bb"], f[(1, 1)]["align"]),
+                         ("#,##0", ["medium", "#ff0000"], ["double", "#000000"], "right"))
+        self.assertEqual(f[(1, 0)]["num"], "@")
+        self.assertTrue(f[(2, 2)]["bold"])
+        self.assertEqual(b.links, {(2, 0): {"target": "https://example.com/"}})
+        google = ('<meta charset="utf-8"><google-sheets-html-origin><style type="text/css"><!--td {border: 1px solid '
+                  '#cccccc;}--></style><table style="font-size:10pt;font-family:Arial"><colgroup><col width="100"/>'
+                  '<col width="120"/></colgroup><tbody><tr><td style="font-weight:bold;background-color:#ffff00;'
+                  'border:1px solid #000000;">Tên</td><td data-sheets-value="{&quot;1&quot;:3,&quot;3&quot;:1234.5}"'
+                  ' data-sheets-numberformat="{&quot;1&quot;:2,&quot;2&quot;:&quot;#,##0.00&quot;}">1,234.50</td>'
+                  '</tr><tr><td style="color:rgb(255,0,0)">B</td><td data-sheets-formula="=R[-1]C[0]*2">2,469.00'
+                  '</td></tr></tbody></table>')
+        g = clipcells.from_html(google)
+        self.assertEqual([[g.raw(i, j, i, j) for j in range(2)] for i in range(2)], [["Tên", "1234.5"], ["B", "=B1*2"]])
+        self.assertEqual(g.formats[(0, 0)], {"size": 10, "font": "Arial", "bold": True, "bg": "#ffff00",
+                                             "bt": ["thin", "#000000"], "bb": ["thin", "#000000"],
+                                             "bl": ["thin", "#000000"], "br": ["thin", "#000000"]})
+        self.assertEqual(g.formats[(1, 0)]["fg"], "#ff0000")  # no grey gridline borders from Google's style sheet
+        self.assertNotIn("bt", g.formats[(1, 0)])
+        self.assertEqual(g.formats[(0, 1)]["num"], "#,##0.00")
+        self.assertIsNone(clipcells.from_html("<p>no table here</p>"))
+
+    def test_number_formats_from_excel(self):
+        self.assertEqual(fe.excel_number_format("m/d/yyyy"), "dd/mm/yyyy")
+        self.assertEqual(fe.excel_number_format("h:mm AM/PM"), "hh:mm")
+        self.assertEqual(fe.excel_number_format('#,##0_ ;[Red]\\-#,##0\\ '), "#,##0;-#,##0")
+        self.assertEqual(fe.excel_number_format("0.0%"), "0.0%")
+        self.assertIsNone(fe.excel_number_format("General"))
 
 
 if __name__ == "__main__":

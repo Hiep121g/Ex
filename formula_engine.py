@@ -5343,11 +5343,18 @@ def _xl_hex(color):
 
 
 def _numfmt_from_xlsx(cell):
-    nf = cell.number_format or "General"
+    return excel_number_format(cell.number_format or "General", getattr(cell, "is_date", False))
+
+
+def excel_number_format(nf, is_date=None):
+    """PyExcel's number format for an Excel format code (from an .xlsx file or the clipboard); is_date: whether
+    it shows dates or times (None: tell from the code)."""
     if nf in ("General", "@"):
         return None if nf == "General" else "@"
     low = nf.lower()
-    if getattr(cell, "is_date", False):
+    if is_date is None:
+        is_date = bool(re.search(r"[dyhs]", re.sub(r'"[^"]*"|\\.|\[[^\]]*\]|_.|\*.', "", low)))
+    if is_date:
         if "h" in low:
             return "dd/mm/yyyy hh:mm" if ("d" in low or "y" in low) else "hh:mm"
         return "dd/mm/yyyy"

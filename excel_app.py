@@ -27,6 +27,7 @@ import unicodedata
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import charts
+import clipcells
 import dialogs
 import drawing
 import formula_engine as fe
@@ -167,6 +168,7 @@ MENU_ICONS = {
     "Thay ảnh": "picture", "Bảo vệ Trang tính": "protect", "Khóa ô": "lock_cell",
     "Cắt": "cut", "Sao chép": "copy", "Dán": "paste", "Tùy chọn dán": "paste", "Dán công thức": "paste_formulas",
     "Dán giá trị": "paste_values", "Dán định dạng": "paste_formats", "Dán chuyển vị": "paste_transpose",
+    "Dán giá trị và định dạng số": "paste_values", "Dán không có viền": "paste", "Dán giữ độ rộng cột nguồn": "col_size",
     "Dán đặc biệt": "paste_special", "Gạch chân": "underline", "Gạch chân kép": "underline_double",
     "Hợp nhất & Căn giữa": "merge", "Hợp nhất ngang hàng": "merge_across", "Hợp nhất ô": "merge_cells",
     "Bỏ hợp nhất ô": "merge_unmerge", "Định dạng kế toán khác": "format_cells", "Định dạng ô": "format_cells",
@@ -389,9 +391,17 @@ IN VÀ XUẤT PDF
   • PDF dùng phông chữ TrueType có trên máy (nhúng phần cần dùng) nên giữ đúng tiếng Việt; biểu đồ, viền,
     màu nền, thanh dữ liệu đều được in. Các thiết lập trang được lưu cùng tệp .xlsx / .pyxl.
 
-SAO CHÉP SANG PHẦN MỀM KHÁC (Windows)
-  Ctrl+C đưa vùng chọn lên bộ nhớ tạm như Excel: chữ, bảng (HTML, RTF) và hình vẽ (EMF, bitmap).
-  Dán được vào Word, AutoCAD...; trong AutoCAD dùng Ctrl+V, hoặc lệnh PASTESPEC để chọn dạng dán.
+SAO CHÉP VÀ DÁN VỚI PHẦN MỀM KHÁC
+  • Ctrl+C đưa vùng chọn lên bộ nhớ tạm như Excel (Windows): chữ, bảng (HTML có cả định dạng số, RTF) và hình
+    vẽ (EMF, bitmap). Dán được vào Excel, Word, AutoCAD...; trong AutoCAD dùng Ctrl+V, hoặc lệnh PASTESPEC.
+  • Chép ô trong Excel rồi Ctrl+V trong PyExcel: giữ định dạng như khi dán trong Excel — phông, cỡ chữ, đậm,
+    nghiêng, gạch chân, màu chữ, màu tô, viền, căn lề, xuống dòng, xoay chữ, định dạng số, ô gộp, công thức
+    (tham chiếu tự đổi theo chỗ dán), ghi chú và liên kết. Bảng chép từ Google Sheets, LibreOffice hay trang
+    web cũng giữ định dạng. Công thức trỏ sang trang tính khác, tệp khác hoặc tên vùng mà PyExcel không có
+    thì được dán thành giá trị.
+  • Sau khi dán, nút (Ctrl) cạnh góc vùng vừa dán (hoặc nhấn rồi thả riêng phím Ctrl) mở Tùy chọn dán như
+    Excel: giữ định dạng nguồn, chỉ công thức, không có viền, giữ độ rộng cột nguồn, chuyển vị, chỉ giá trị,
+    giá trị và định dạng số, chỉ định dạng. Các lựa chọn này cũng có ở nút Dán ▾ và Dán đặc biệt.
 """
 
 KEEP = object()
@@ -486,6 +496,48 @@ class ChangeSet:
         return [(key, *item) for key, item in self.items.items() if item[0] != item[1] or item[2] != item[3]]
 
 
+class _CopiedBlock(clipcells.Block):
+    """The cells PyExcel itself copied (SpreadsheetApp.clip) as a Block: as typed, formulas moving with
+    where they are pasted (not when cut: moved formulas keep pointing where they did)."""
+
+    def __init__(self, clip):
+        rows = clip["cells"]
+        super().__init__(len(rows), len(rows[0]))
+        self.source, self.moving = "PyExcel", clip["cut"]
+        r0, c0 = clip["rect"][:2]
+        self.typed, self.origin = {}, {}
+        for i, row in enumerate(rows):
+            for j, (raw, fmt) in enumerate(row):
+                self.origin[(i, j)] = (r0 + i, c0 + j)
+                if raw is not None:
+                    self.typed[(i, j)] = raw
+                if fmt:
+                    self.formats[(i, j)] = fmt
+                if clip["values"][i][j] is not None:
+                    self.values[(i, j)] = clip["values"][i][j]
+        self.merges = list(clip.get("merges", ()))
+        self.col_widths = dict(enumerate(clip.get("widths", ())))
+
+    def raw(self, i, j, row, col, names=()):
+        raw = self.typed.get((i, j))
+        if raw and not self.moving:
+            src_r, src_c = self.origin[(i, j)]
+            return fe.shift_formula(raw, row - src_r, col - src_c)
+        return raw
+
+    def empty(self, i, j):
+        return (i, j) not in self.typed
+
+
+PASTE_OPTIONS = (  # the Paste Options button's menu: (heading or None, label, paste() arguments)
+    ("Dán", "Dán (giữ định dạng nguồn)", {}), (None, "Công thức", {"mode": "formulas"}),
+    (None, "Không có viền", {"mode": "no_borders"}), (None, "Giữ độ rộng cột nguồn", {"widths": True}),
+    (None, "Chuyển vị", {"transpose": True}),
+    ("Dán giá trị", "Giá trị", {"mode": "values"}), (None, "Giá trị và định dạng số", {"mode": "values_num"}),
+    ("Tùy chọn dán khác", "Định dạng", {"mode": "formats"}),
+)
+
+
 def _icon_pdf_import(cv, P, k, c):
     """A PDF page going into a sheet."""
     cv.create_polygon(*P(1, 1, 7, 1, 9, 3, 9, 11, 1, 11), fill="#ffffff", outline="#7f7f7f")
@@ -538,6 +590,9 @@ class SpreadsheetApp(drawing.DrawingTools):
         self.show_notes = False        # every note shown, not just the one under the pointer
         self.hover_note = None         # (sheet, row, col) of the note shown under the pointer
         self._list_button = None       # canvas box of the active cell's validation-list arrow
+        self.paste_info = None         # the last paste, for its Paste Options button (see _paste_options_shown)
+        self._paste_button = None      # canvas box of that button
+        self._lone_ctrl = False        # Ctrl pressed alone (letting go of it opens the Paste Options)
         self.chart_sel = None          # index of the selected chart, picture or shape on this sheet
         self._init_drawing()
         self.show_pivot_fields = True  # the PivotTable Fields pane appears in a pivot report
@@ -1194,7 +1249,11 @@ class SpreadsheetApp(drawing.DrawingTools):
         g = rb.group(page, "Bộ nhớ tạm")
         paste_menu = self._make_menu([
             ("Dán", self.paste, "Ctrl+V"), ("Dán công thức", lambda: self.paste(mode="formulas")),
-            ("Dán giá trị", lambda: self.paste(mode="values")), ("Dán định dạng", lambda: self.paste(mode="formats")),
+            ("Dán giá trị", lambda: self.paste(mode="values")),
+            ("Dán giá trị và định dạng số", lambda: self.paste(mode="values_num")),
+            ("Dán định dạng", lambda: self.paste(mode="formats")),
+            ("Dán không có viền", lambda: self.paste(mode="no_borders")),
+            ("Dán giữ độ rộng cột nguồn", lambda: self.paste(widths=True)),
             ("Dán chuyển vị", lambda: self.paste(transpose=True)), None, ("Dán đặc biệt...", self.paste_special)])
         self._btn(g, large=True, icon="paste", text="Dán", command=self.paste, menu=paste_menu, split=True,
                   tooltip="Dán (Ctrl+V)")
@@ -1819,8 +1878,11 @@ class SpreadsheetApp(drawing.DrawingTools):
 
     def _build_context_menus(self):
         paste_options = [("Dán", self.paste), ("Dán giá trị", lambda: self.paste(mode="values")),
+                         ("Dán giá trị và định dạng số", lambda: self.paste(mode="values_num")),
                          ("Dán công thức", lambda: self.paste(mode="formulas")),
                          ("Dán định dạng", lambda: self.paste(mode="formats")),
+                         ("Dán không có viền", lambda: self.paste(mode="no_borders")),
+                         ("Dán giữ độ rộng cột nguồn", lambda: self.paste(widths=True)),
                          ("Dán chuyển vị", lambda: self.paste(transpose=True))]
         self.cell_menu = self._make_menu([
             ("Cắt", self.cut, "Ctrl+X"), ("Sao chép", self.copy, "Ctrl+C"), ("Tùy chọn dán", paste_options),
@@ -1860,6 +1922,9 @@ class SpreadsheetApp(drawing.DrawingTools):
     def _bind_keys(self):
         cv = self.canvas
         cv.bind("<Key>", self.on_key)
+        for side in ("L", "R"):  # Ctrl pressed and let go alone opens the Paste Options, as in Excel
+            cv.bind(f"<KeyPress-Control_{side}>", lambda e: setattr(self, "_lone_ctrl", True))
+            cv.bind(f"<KeyRelease-Control_{side}>", self._ctrl_released)
         canvas_keys = {
             "c": self.copy, "x": self.cut, "v": self.paste, "z": self.undo, "y": self.redo, "a": self.select_all,
             "b": lambda: self.toggle_style("bold"), "i": lambda: self.toggle_style("italic"),
@@ -1895,8 +1960,13 @@ class SpreadsheetApp(drawing.DrawingTools):
         self.root.bind_all("<F1>", lambda e: self._key_action(self.show_help))
         self.root.bind_all("<Shift-F11>", lambda e: self._key_action(self.add_sheet))
 
-    @staticmethod
-    def _key_action(func):
+    def _ctrl_released(self, e):
+        if self._lone_ctrl and self._paste_button:
+            self._lone_ctrl = False
+            self.paste_options()
+
+    def _key_action(self, func):
+        self._lone_ctrl = False
         func()
         return "break"
 
@@ -2700,7 +2770,9 @@ class SpreadsheetApp(drawing.DrawingTools):
         self.redraw()
 
     def _draw_cell_extras(self, cv, W, H, col_pos, row_pos):
-        """The validation-list arrow and input message of the active cell, and note callouts."""
+        """The validation-list arrow and input message of the active cell, note callouts and the Paste
+        Options button."""
+        self._draw_paste_button(cv, W, H)
         self._list_button = None
         r, c = self.cur
         box = self._rect_bbox(*self._cell_box(r, c))
@@ -3209,6 +3281,7 @@ class SpreadsheetApp(drawing.DrawingTools):
 
     def on_key(self, e):
         ks = e.keysym
+        self._lone_ctrl = False
         if ks == "Escape" and getattr(self, "_pdf_job", None):
             self._pdf_job["stop"] = True
             return "break"
@@ -3254,6 +3327,9 @@ class SpreadsheetApp(drawing.DrawingTools):
         elif ks == "BackSpace":
             self.start_edit(initial="", mode="enter")
         elif ks == "Escape":
+            if self._paste_options_shown():
+                self.paste_info = None
+                self.redraw_selection()
             if self.painter:
                 self.stop_painter()
             elif self.clip:
@@ -3276,6 +3352,10 @@ class SpreadsheetApp(drawing.DrawingTools):
 
     def on_press(self, e):
         self._hide_ribbon_peek()
+        self._lone_ctrl = False
+        if self._paste_button and self._inside(self._paste_button, e.x, e.y):
+            self.paste_options()
+            return "break"
         if self._list_button and self._inside(self._list_button, e.x, e.y):
             self.open_validation_list()
             return "break"
@@ -4240,8 +4320,12 @@ class SpreadsheetApp(drawing.DrawingTools):
         if not rich:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
+        merges = [(m[0] - r1, m[1] - c1, m[2] - r1, m[3] - c1) for m in sh.merges
+                  if r1 <= m[0] and m[2] <= r2 and c1 <= m[1] and m[3] <= c2]
         self.clip = {"sheet": self.sheet, "rect": (r1, c1, r2, c2), "cells": block, "values": values,
-                     "cut": cut, "text": text}
+                     "cut": cut, "text": text, "merges": merges,
+                     "widths": [sh.col_widths.get(c, fe.DEFAULT_COL_WIDTH) for c in cols]}
+        self.paste_info = None
         self.set_mode("Chọn ô đích rồi nhấn Ctrl+V (Esc để hủy)")
         self.redraw()
 
@@ -4265,7 +4349,7 @@ class SpreadsheetApp(drawing.DrawingTools):
                 default = ("right" if fe.is_number(value) else
                            "center" if isinstance(value, (bool, fe.CellError)) else "left")
                 row.append({"text": self.wb.display_text(self.sheet, r, c), "align": fmt.get("align") or default,
-                            "fmt": fmt})
+                            "fmt": fmt, "value": value if fe.is_number(value) and not isinstance(value, bool) else None})
             cells.append(row)
         row_at, col_at = {r: i for i, r in enumerate(rows)}, {c: j for j, c in enumerate(cols)}
         merges = []
@@ -4298,8 +4382,11 @@ class SpreadsheetApp(drawing.DrawingTools):
         return targets
 
     @undo_name("Dán")
-    def paste(self, mode="all", transpose=False, skip_blanks=False):
-        """Paste the clipboard: mode is "all", "formulas", "values" or "formats"."""
+    def paste(self, mode="all", transpose=False, skip_blanks=False, widths=False):
+        """Paste the clipboard. mode: "all", "formulas", "values", "values_num" (values and their number
+        formats), "formats", "no_borders" (all but borders) or "widths" (column widths alone); widths: the
+        columns also take the copied ones' widths. Cells copied in Excel (or another spreadsheet, a web page)
+        come with their formats, merged cells, notes and links when it put them on the clipboard."""
         self.commit_edit()
         if mode == "all" and self.objects_on_clipboard():
             self.paste_objects()
@@ -4313,52 +4400,210 @@ class SpreadsheetApp(drawing.DrawingTools):
         if not text and mode == "all" and self.paste_picture():  # a screenshot or copied picture
             return
         text = text.replace("\r\n", "\n").rstrip("\n")
+        start = (self.cur, self.ext)
+        block = self._paste_block(text)
+        if block is None or not (block.h and block.w):
+            return
+        styled = block.source != "text"  # plain text leaves the cells' formats as they are
+        if not styled and mode == "formats":
+            return
+        moving = isinstance(block, _CopiedBlock) and block.moving and mode == "all" and not transpose
+        if transpose:
+            block = block.transposed()
+        sh, names, last = self.sh, set(self.wb.names), self.undo_stack[-1] if self.undo_stack else None
         cs = ChangeSet(self.wb)
         clip = self.clip
-        if clip and text == clip["text"].rstrip("\n"):
-            block, values = clip["cells"], clip["values"]
-            sr, sc = clip["rect"][0], clip["rect"][1]
-            if transpose:
-                block = [list(row) for row in zip(*block)]
-                values = [list(row) for row in zip(*values)]
-            moving = clip["cut"] and mode == "all" and not transpose
-            if moving and clip["sheet"] in self.wb.sheets:
-                for i, row in enumerate(block):
-                    for j in range(len(row)):
-                        cs.set(clip["sheet"], sr + i, sc + j, raw=None, fmt=None)
-            for r, c, i, j in self._paste_targets(len(block), len(block[0])):
-                raw, fmt = block[i][j]
-                if skip_blanks and raw is None:
-                    continue
-                src_r, src_c = (sr + j, sc + i) if transpose else (sr + i, sc + j)
-                if mode in ("all", "formulas"):
-                    cs.set(self.sheet, r, c, raw=raw if moving or not raw else fe.shift_formula(raw, r - src_r, c - src_c))
-                elif mode == "values":
-                    cs.set(self.sheet, r, c, raw=values[i][j])
-                if mode in ("all", "formats"):
-                    cs.set(self.sheet, r, c, fmt=fmt)
-            if moving:
-                self.clip = None
-                self.set_mode("Sẵn sàng")
-        elif text and mode != "formats":
-            rows = list(csv.reader(io.StringIO(text), delimiter="\t")) or [[""]]
-            width = max(len(row) for row in rows)
-            rows = [row + [""] * (width - len(row)) for row in rows]
-            if transpose:
-                rows = [list(row) for row in zip(*rows)]
-            for r, c, i, j in self._paste_targets(len(rows), len(rows[0])):
-                if not (skip_blanks and rows[i][j] == ""):
-                    cs.set(self.sheet, r, c, raw=rows[i][j])
+        if moving and clip["sheet"] in self.wb.sheets:
+            sr, sc = clip["rect"][:2]
+            for i in range(block.h):
+                for j in range(block.w):
+                    cs.set(clip["sheet"], sr + i, sc + j, raw=None, fmt=None)
+        targets = self._paste_targets(block.h, block.w)
+        with_raw = mode in ("all", "formulas", "no_borders")
+        with_fmt = styled and mode in ("all", "formats", "no_borders")
+        for r, c, i, j in targets:
+            if skip_blanks and block.empty(i, j):
+                continue
+            if with_raw:
+                cs.set(self.sheet, r, c, raw=block.raw(i, j, r, c, names))
+            elif mode in ("values", "values_num"):
+                cs.set(self.sheet, r, c, raw=block.values.get((i, j)))
+            fmt = block.formats.get((i, j))
+            if with_fmt:
+                if mode == "no_borders" and fmt:
+                    fmt = {k: v for k, v in fmt.items() if k not in fe.BORDER_KEYS}
+                cs.set(self.sheet, r, c, fmt=fmt)
+            elif mode == "values_num" and styled:  # the cell keeps its format, with the copied number format
+                new = dict(sh.formats.get((r, c)) or {})
+                if fmt and fmt.get("num"):
+                    new["num"] = fmt["num"]
+                else:
+                    new.pop("num", None)
+                cs.set(self.sheet, r, c, fmt=new)
+        tiles = [(r, c) for r, c, i, j in targets if (i, j) == (0, 0)]
+        a1, b1, a2, b2 = self.sel_rect()
+        merges = None
+        if with_fmt and (block.merges or any(m[0] <= a2 and m[2] >= a1 and m[1] <= b2 and m[3] >= b1
+                                             for m in sh.merges)):
+            merges = [m for m in sh.merges if not (m[0] <= a2 and m[2] >= a1 and m[1] <= b2 and m[3] >= b1)]
+            merges += [(r0 + i1, c0 + j1, r0 + i2, c0 + j2) for r0, c0 in tiles for i1, j1, i2, j2 in block.merges
+                       if r0 + i2 < MAX_ROWS and c0 + j2 < MAX_COLS]
+        col_widths = {}
+        if (widths or mode == "widths") and not transpose:
+            for r0, c0 in tiles:
+                for j in range(min(block.w, MAX_COLS - c0)):
+                    col_widths[c0 + j] = block.col_widths.get(j) or block.default_width or fe.DEFAULT_COL_WIDTH
+        extras = mode == "all" and (block.notes or block.links)
+        if merges is None and not col_widths and not extras:
+            self.commit(cs)
         else:
-            return
-        self.commit(cs)
+            def apply():
+                self._apply_changes(cs.changes(), forward=True)
+                if merges is not None:
+                    sh.set_merges(merges)
+                for c, width in col_widths.items():
+                    sh.col_widths[c] = max(fe.MIN_COL_WIDTH, round(width))
+                if extras:
+                    for r0, c0 in tiles:
+                        sh.notes.update(((r0 + i, c0 + j), note) for (i, j), note in block.notes.items())
+                        sh.links.update(((r0 + i, c0 + j), dict(link)) for (i, j), link in block.links.items())
+            self._structural(apply)
+        if moving:
+            self.clip = None
+            self.set_mode("Sẵn sàng")
+        step = self.undo_stack[-1] if self.undo_stack else None
+        self.paste_info = None
+        if step is not None and step is not last and not moving and styled:
+            kwargs = {k: v for k, v in (("mode", mode), ("transpose", transpose), ("skip_blanks", skip_blanks),
+                                        ("widths", widths)) if v not in ("all", False)}
+            self.paste_info = {"sheet": self.sheet, "rect": self.sel_rect(), "start": start, "step": step,
+                               "kwargs": kwargs}
         self.ensure_visible(*self.cur)
         self.refresh()
+
+    def _paste_block(self, text):
+        """What a paste puts in: PyExcel's own copied cells, cells copied in another program with their
+        formats, or the clipboard's text as tab-separated values."""
+        clip = self.clip
+        if clip and text == clip["text"].rstrip("\n"):
+            return _CopiedBlock(clip)
+        block = self._clipboard_cells()
+        if block is not None:
+            return block
+        if not text:
+            return None
+        rows = list(csv.reader(io.StringIO(text), delimiter="\t")) or [[""]]
+        block = clipcells.Block(len(rows), max(len(row) for row in rows))
+        block.source = "text"
+        block.values = {(i, j): value for i, row in enumerate(rows) for j, value in enumerate(row) if value != ""}
+        return block
+
+    def _clipboard_cells(self):
+        """The cells another program copied with their formats - Excel's XML Spreadsheet, else an HTML table
+        (Windows; an HTML table elsewhere) - or None when the clipboard has only text."""
+        try:
+            data = richclip.read_cells(self.root.winfo_id())
+        except Exception:  # noqa: BLE001 - the formats are a bonus: text always pastes
+            data = {}
+        if not data and sys.platform != "win32":
+            page = self._selection_html()
+            data = {"html": page} if page else {}
+        block = None
+        try:
+            if data.get("xml"):
+                block = clipcells.from_spreadsheet_xml(data["xml"])
+            if block is None and data.get("html"):
+                block = clipcells.from_html(data["html"])
+        except Exception:  # noqa: BLE001 - a clipboard we can't read pastes as text
+            block = None
+        if block is not None and block.h * block.w > 4 * BIG_AREA * 50:
+            block.fit_content()  # (a copied whole column: only its used part)
+        return block
+
+    def _selection_html(self):
+        """The clipboard's text/html (X11), decoded as its owner wrote it."""
+        try:
+            page = self.root.clipboard_get(type="text/html")
+        except tk.TclError:
+            return None
+        try:
+            data = page.encode("latin-1")  # Tk hands over the bytes as Latin-1
+        except UnicodeEncodeError:
+            return page
+        if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            return data.decode("utf-16", "replace")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return page
 
     def paste_special(self):
         result = dialogs.PasteSpecialDialog(self.root).show()
         if result:
             self.paste(**result)
+
+    # Paste Options: the button by what was just pasted (or Ctrl alone) to paste it again another way
+
+    def _paste_options_shown(self):
+        info = self.paste_info
+        return bool(info and info["sheet"] == self.sheet and self.undo_stack and info["step"] is self.undo_stack[-1]
+                    and not self.is_editing())
+
+    def paste_options(self, x=None, y=None):
+        """The Paste Options menu at (x, y) on the screen (by its button when None)."""
+        if not self._paste_options_shown():
+            return
+        if x is None:
+            if not self._paste_button:
+                return
+            x = self.canvas.winfo_rootx() + self._paste_button[0]
+            y = self.canvas.winfo_rooty() + self._paste_button[3]
+        current = self.paste_info["kwargs"]
+        menu = tk.Menu(self.root, tearoff=0)
+        choice = tk.IntVar(menu, value=-1)
+        menu.choice = choice
+        for k, (heading, label, kwargs) in enumerate(PASTE_OPTIONS):
+            if heading:
+                if k:
+                    menu.add_separator()
+                menu.add_command(label=heading, state="disabled")
+            if kwargs == current:
+                choice.set(k)
+            menu.add_radiobutton(label="   " + label, variable=choice, value=k,
+                                 command=lambda kw=kwargs: self._repaste(kw))
+        menu.tk_popup(x, y)
+        menu.grab_release()
+
+    def _repaste(self, kwargs):
+        """Paste again, another way (a choice of the Paste Options)."""
+        if not self._paste_options_shown() or kwargs == self.paste_info["kwargs"]:
+            return
+        start = self.paste_info["start"]
+        self.undo()
+        self.cur, self.ext = start
+        self.paste(**kwargs)
+
+    def _draw_paste_button(self, cv, W, H):
+        self._paste_button = None
+        if not self._paste_options_shown():
+            return
+        box = self._rect_bbox(*self.paste_info["rect"])
+        w, h = round(52 * self.px), round(20 * self.px)
+        x, y = box[2] + 2, box[3] + 2
+        if not (self.header_w <= x and x + w <= W and self.header_h <= y and y + h <= H):
+            return
+        self._paste_button = (x, y, x + w, y + h)
+        cv.create_rectangle(x, y, x + w, y + h, fill="#ffffff", outline="#a6a6a6")
+        k = self.px
+        cx, cy = x + 9 * k, y + h / 2  # a clipboard
+        cv.create_rectangle(cx - 5 * k, cy - 6 * k, cx + 5 * k, cy + 7 * k, fill="#f3d27a", outline="#8a6d1d")
+        cv.create_rectangle(cx - 2.5 * k, cy - 7.5 * k, cx + 2.5 * k, cy - 4.5 * k, fill="#6e6e6e", outline="")
+        cv.create_rectangle(cx - 2 * k, cy - 2 * k, cx + 6 * k, cy + 7.5 * k, fill="#ffffff", outline="#6e6e6e")
+        cv.create_text(x + 17 * k, cy, text="(Ctrl)", anchor="w", font=("Segoe UI", -max(7, round(10 * k))),
+                       fill="#444444")
+        ax = x + w - 5 * k
+        cv.create_polygon(ax - 2.5 * k, cy - 1 * k, ax + 2.5 * k, cy - 1 * k, ax, cy + 2 * k, fill="#444444",
+                          outline="")
 
     # ------------------------------------------------------------------ format painter
 

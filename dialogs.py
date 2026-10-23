@@ -768,9 +768,12 @@ class PasteSpecialDialog(Dialog):
         box = ttk.LabelFrame(self.body, text="Dán", padding=6)
         box.pack(fill="x")
         self.mode = tk.StringVar(value="all")
-        for text, value in (("Tất cả", "all"), ("Công thức", "formulas"), ("Giá trị", "values"),
-                            ("Định dạng", "formats")):
-            ttk.Radiobutton(box, text=text, value=value, variable=self.mode).pack(anchor="w")
+        options = (("Tất cả (giữ định dạng nguồn)", "all"), ("Công thức", "formulas"), ("Giá trị", "values"),
+                   ("Định dạng", "formats"), ("Tất cả trừ viền", "no_borders"), ("Độ rộng cột", "widths"),
+                   ("Giá trị và định dạng số", "values_num"), ("Tất cả và giữ độ rộng cột nguồn", "all_widths"))
+        for k, (text, value) in enumerate(options):
+            ttk.Radiobutton(box, text=text, value=value, variable=self.mode).grid(row=k % 4, column=k // 4, sticky="w",
+                                                                                 padx=(0, 16))
         self.skip = tk.BooleanVar()
         self.transpose = tk.BooleanVar()
         ttk.Checkbutton(self.body, text="Bỏ qua ô trống", variable=self.skip).pack(anchor="w", pady=(8, 0))
@@ -778,7 +781,10 @@ class PasteSpecialDialog(Dialog):
         self.add_buttons()
 
     def collect(self):
-        return {"mode": self.mode.get(), "skip_blanks": self.skip.get(), "transpose": self.transpose.get()}
+        mode = self.mode.get()
+        widths = mode == "all_widths"
+        return {"mode": "all" if widths else mode, "widths": widths, "skip_blanks": self.skip.get(),
+                "transpose": self.transpose.get()}
 
 
 class FunctionDialog(Dialog):
