@@ -31,7 +31,8 @@ class Block:
         self.merges = []          # (i1, j1, i2, j2) in the block
         self.col_widths = {}      # j -> pixels
         self.default_width = None  # pixels of the columns col_widths leaves out
-        self.row_heights = {}     # i -> pixels
+        self.row_heights = {}     # i -> pixels, of rows sized by hand
+        self.origin = None        # (row, col) the block's first cell had in its sheet, when known
         self.notes, self.links = {}, {}
         self.source = ""
 
@@ -47,6 +48,7 @@ class Block:
                 setattr(out, name, {(j, i): v for (i, j), v in value.items()})
         out.merges = [(j1, i1, j2, i2) for i1, j1, i2, j2 in self.merges]
         out.col_widths, out.row_heights = {}, {}
+        out.formulas = {}  # (their references would need turning too: the values are pasted)
         return out
 
     def fit_content(self):
@@ -60,7 +62,7 @@ class Block:
         with references for that place, or its value (see a1_formula; names: the workbook's names)."""
         f = self.formulas.get((i, j))
         if f:
-            a1 = a1_formula(f, row, col, names)
+            a1 = a1_formula(f, row, col, names, (i, j, self.h, self.w, self.origin))
             if a1:
                 return a1
         return self.values.get((i, j))
@@ -77,20 +79,33 @@ _R1C1_RE = re.compile(r"""
 """, re.VERBOSE)
 
 
-def _part(text, here):
-    """(index from 0, absolute) of R1C1's row or column part: '' (this one), '[n]' (n away) or 'n'."""
-    if not text:
-        return here, False
-    if text.startswith("["):
-        return here + int(text[1:-1]), False
-    return int(text) - 1, True
+def _part(text, here, inside=None):
+    """(index from 0, absolute) of R1C1's row or column part - '' (this one), '[n]' (n away) or 'n' - for a
+    cell at `here`. inside: (the cell's index in the copied block, the block's size, the index its first
+    row/column had in its sheet, or None when not known): the part must point into the block, and then
+    points at the same cell of the pasted block (index None when it doesn't)."""
+    absolute = bool(text) and not text.startswith("[")
+    offset = int(text[1:-1]) if text and not absolute else 0
+    if inside is None:
+        return (int(text) - 1 if absolute else here + offset), absolute
+    k, size, first = inside
+    if absolute:
+        if first is None:
+            return None, True
+        b = int(text) - 1 - first
+    else:
+        b = k + offset
+    return (here - k + b if 0 <= b < size else None), absolute
 
 
-def a1_formula(formula, row, col, names=()):
+def a1_formula(formula, row, col, names=(), block=None):
     """An R1C1 formula (as Excel's XML Spreadsheet has it) in A1 form for the cell (row, col) - or None when
     it can't be pasted as a formula here (the value is pasted instead): references to other sheets or
     workbooks (their names differ in PyExcel), whole rows or columns, references off the sheet, functions
-    PyExcel lacks and names not among `names` (the workbook's, upper case)."""
+    PyExcel lacks and names not among `names` (the workbook's, upper case). block: (i, j, h, w, origin) -
+    the cell's place in the copied h x w block, whose first cell was at origin (row, col) of its sheet (None
+    when not known) - also keeps out references to cells outside the block (they aren't here: a formula
+    reading them would show nothing, or 0)."""
     text = formula if formula.startswith("=") else "=" + formula
     out, pos, ok = [], 0, True
     for m in _R1C1_RE.finditer(text):
@@ -102,9 +117,14 @@ def a1_formula(formula, row, col, names=()):
             ok = False
             break
         else:
-            r, rabs = _part(m.group("r"), row)
-            c, cabs = _part(m.group("c"), col)
-            if not (0 <= r < fe.MAX_ROWS and 0 <= c < fe.MAX_COLS):
+            if block:
+                i, j, h, w, origin = block
+                r, rabs = _part(m.group("r"), row, (i, h, origin[0] if origin else None))
+                c, cabs = _part(m.group("c"), col, (j, w, origin[1] if origin else None))
+            else:
+                r, rabs = _part(m.group("r"), row)
+                c, cabs = _part(m.group("c"), col)
+            if r is None or c is None or not (0 <= r < fe.MAX_ROWS and 0 <= c < fe.MAX_COLS):
                 ok = False
                 break
             out.append(f"{'$' if cabs else ''}{fe.col_name(c)}{'$' if rabs else ''}{r + 1}")
@@ -132,6 +152,14 @@ def _known_functions():
     if _FUNCTIONS is None:
         _FUNCTIONS = set(fe.function_names())
     return _FUNCTIONS
+
+
+def link_origin(data):
+    """(row, col) from 0 of a copied block's first cell in its sheet, from Excel's "Link" clipboard format
+    (b"Excel\\0[Book1]Sheet1\\0R1C2:R21C10\\0\\0"; Excel in other languages may write Z1S2), or None."""
+    parts = (data.decode("latin-1") if isinstance(data, bytes) else data or "").split("\0")
+    m = re.match(r"[^\W\d_]+(\d+)[^\W\d_]+(\d+)", parts[2].strip()) if len(parts) > 2 else None
+    return (int(m.group(1)) - 1, int(m.group(2)) - 1) if m else None
 
 
 # ------------------------------------------------------------------ values
@@ -209,7 +237,7 @@ def _style_xml(style, base):
     if al is not None:
         h = _a(al, "Horizontal")
         if h:
-            fmt["align"] = {"Left": "left", "Right": "right", "Center": "center", "CenterAcrossSelection": "center",
+            fmt["align"] = {"Left": "left", "Right": "right", "Center": "center", "CenterAcrossSelection": "centerContinuous",
                             "Distributed": "center", "Justify": "left", "Fill": "left"}.get(h)
         v = _a(al, "Vertical")
         if v:
@@ -229,8 +257,8 @@ def _style_xml(style, base):
             line = BORDER_LINES.get(_a(b, "LineStyle"))
             if key and line:
                 weight = int(float(_a(b, "Weight") or 1))
-                if line == "thin":
-                    line = "thick" if weight >= 3 else "medium" if weight == 2 else "thin"
+                if line == "thin":  # (weight 0: Excel's hair line)
+                    line = "thick" if weight >= 3 else "medium" if weight == 2 else "thin" if weight else "hair"
                 fmt[key] = [line, _color(_a(b, "Color")) or "#000000"]
     number = style.find(SS + "NumberFormat")
     if number is not None and _a(number, "Format") is not None:
@@ -308,7 +336,7 @@ def from_spreadsheet_xml(data):
     i = -1
     for row in table.findall(SS + "Row"):
         i = int(_a(row, "Index")) - 1 if _a(row, "Index") else i + 1
-        if _a(row, "Height"):
+        if _a(row, "Height") and _a(row, "AutoFitHeight") == "0":  # (heights Excel fits to the text, PyExcel does too)
             block.row_heights[i] = round(float(_a(row, "Height")) * PT)
         j = -1
         for cell in row.findall(SS + "Cell"):
@@ -429,13 +457,15 @@ def _length_pt(value):
 def _border(value):
     """[style, colour] of a CSS border shorthand ("0.5pt solid windowtext", "1px solid #000"), or None."""
     style, width, color = "solid", 0.75, "#000000"
+    if "hairline" in value.lower():
+        style = "hair"
     for token in re.findall(r"rgba?\([^)]*\)|\S+", value.lower()):
         if token in ("none", "hidden"):
             return None
         if token in ("solid", "double", "dashed", "dotted", "groove", "ridge", "inset", "outset"):
             style = token
-        elif token in ("thin", "medium", "thick", "hairline"):
-            width = {"thin": 0.75, "medium": 1.5, "thick": 2.25, "hairline": 0.5}[token]
+        elif token in ("thin", "medium", "thick"):
+            width = {"thin": 0.75, "medium": 1.5, "thick": 2.25}[token]
         elif re.match(r"[\d.]+(pt|px|em)?$", token):
             width = _length_pt(token) or 0
             if width == 0:
@@ -444,7 +474,7 @@ def _border(value):
             color = _css_color(token)
     if style == "double":
         return ["double", color]
-    if style in ("dashed", "dotted"):
+    if style in ("dashed", "dotted", "hair"):
         return [style, color]
     return ["thin" if width <= 0.8 else "medium" if width <= 1.6 else "thick", color]
 
@@ -478,7 +508,7 @@ def _format_css(css, fmt):
             if color or low in ("none", "transparent"):
                 fmt["bg"] = color
         elif name == "text-align":
-            fmt["align"] = {"left": "left", "right": "right", "center": "center", "centeracross": "center",
+            fmt["align"] = {"left": "left", "right": "right", "center": "center", "centeracross": "centerContinuous",
                             "justify": "left"}.get(low)
         elif name == "vertical-align":
             fmt["valign"] = {"top": "top", "middle": "center", "center": "center"}.get(low)
@@ -510,7 +540,7 @@ class _TableReader(html.parser.HTMLParser):
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.styles, self.cols, self.rows = [], [], []
+        self.styles, self.cols, self.rows, self.heights = [], [], [], {}
         self.table_style = None
         self.depth = 0           # nesting of tables (cells of tables inside cells are text of the outer cell)
         self.done = False
@@ -542,6 +572,9 @@ class _TableReader(html.parser.HTMLParser):
                 self.cols.append(px)
         elif tag == "tr":
             self.rows.append([])
+            css = parse_css(a.get("style"))
+            if "userset" in css.get("mso-height-source", "") and _length_px(a.get("height") or css.get("height") or ""):
+                self.heights[len(self.rows) - 1] = _length_px(a.get("height") or css.get("height"))
         elif tag in ("td", "th"):
             if not self.rows:
                 self.rows.append([])
@@ -710,6 +743,7 @@ def from_html(data):
     for j, px in enumerate(reader.cols):
         if px:
             block.col_widths[j] = max(fe.MIN_COL_WIDTH, px)
+    block.row_heights = dict(reader.heights)
     return block
 
 

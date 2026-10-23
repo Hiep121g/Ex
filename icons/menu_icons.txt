@@ -103,6 +103,7 @@ line_color
 line_dashed
 line_dotted
 line_double
+line_hair
 line_medium
 line_thick
 line_thin

@@ -477,6 +477,8 @@ def _icon_line_style(cv, P, k, c, style):
             cv.create_line(*P(1, y, 15, y), fill=color, width=max(1, round(k)))
     elif style == "dotted":
         _dots(cv, P, k, 1.5, 8, 14.5, 8, color)
+    elif style == "hair":
+        _dots(cv, P, k, 1.5, 8, 14.5, 8, "#8c8c8c")
     elif style == "dashed":
         for x in (1, 6, 11):
             cv.create_line(*P(x, 8, x + 3.5, 8), fill=color, width=max(1, round(1.2 * k)))
@@ -1068,7 +1070,7 @@ ICONS = {
 }
 ICONS.update({f"border_{kind}": (lambda kind: lambda *a: _icon_border(*a, kind))(kind) for kind in _BORDER_EDGES})
 ICONS.update({f"line_{style}": (lambda style: lambda *a: _icon_line_style(*a, style))(style)
-              for style in ("thin", "medium", "thick", "double", "dashed", "dotted")})
+              for style in ("thin", "medium", "thick", "double", "dashed", "dotted", "hair")})
 ICONS.update({f"paste_{kind}": (lambda kind: lambda *a: _icon_paste_as(*a, kind))(kind)
               for kind in ("formulas", "values", "formats", "transpose", "special")})
 ICONS.update({f"merge_{kind}": (lambda kind: lambda *a: _icon_merge_kind(*a, kind))(kind)

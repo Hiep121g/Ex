@@ -1234,6 +1234,13 @@ class PrintingTests(unittest.TestCase):
         self.assertEqual(boxes["căn phải rất dài"][::2], (col(1), col(3)))   # C2 runs left over B2
         self.assertEqual(boxes["căn giữa rất dài"][::2], (col(3), col(6)))   # E3 over D3 and F3
         self.assertEqual(boxes["căn phải bị chặn"][::2], (col(2), col(3)))   # B4 is not empty
+        wb.set_raw("Sheet1", 4, 1, "giữa vùng chọn")  # Center Across Selection over B5:D5
+        for c in (1, 2, 3):
+            wb.set_format("Sheet1", 4, c, {"align": "centerContinuous"})
+        surface = Recorder()
+        printing.render_page(surface, printing.Layout(wb, "Sheet1", printing.setup_of(wb.sheets["Sheet1"])), 0)
+        box = next(box for text, box in surface.texts if text == "giữa vùng chọn")
+        self.assertEqual(tuple(round(v, 6) for v in box[::2]), (col(1), col(4)))
 
 
     def test_pdf_export(self):
@@ -2635,9 +2642,9 @@ _EXCEL_XML = """<?xml version="1.0"?>
   <Style ss:ID="s66"><NumberFormat ss:Format="@"/></Style>
  </Styles>
  <Worksheet ss:Name="Sheet1">
-  <Table ss:ExpandedColumnCount="3" ss:ExpandedRowCount="5" ss:DefaultColumnWidth="54">
+  <Table ss:ExpandedColumnCount="3" ss:ExpandedRowCount="6" ss:DefaultColumnWidth="54">
    <Column ss:Width="120"/><Column ss:Index="3" ss:Width="60"/>
-   <Row ss:Height="30">
+   <Row ss:AutoFitHeight="0" ss:Height="30">
     <Cell ss:MergeAcross="1" ss:StyleID="s62"><Data ss:Type="String">Tên hàng</Data></Cell>
     <Cell ss:StyleID="s62"><Data ss:Type="String">Giá</Data></Cell>
    </Row>
@@ -2656,8 +2663,10 @@ _EXCEL_XML = """<?xml version="1.0"?>
     <Cell ss:Formula="=Sheet2!R1C1"><Data ss:Type="Number">5</Data></Cell>
     <Cell ss:HRef="https://example.com/"><Data ss:Type="String">Trang</Data></Cell>
    </Row>
-   <Row><Cell><Data ss:Type="Boolean">1</Data></Cell><Cell><Data ss:Type="DateTime">1899-12-31T12:00:00.000</Data></Cell>
+   <Row ss:Height="24"><Cell><Data ss:Type="Boolean">1</Data></Cell><Cell><Data ss:Type="DateTime">1899-12-31T12:00:00.000</Data></Cell>
     <Cell ss:Formula="=Price*2"><Data ss:Type="Number">10</Data></Cell></Row>
+   <Row><Cell ss:Formula="=R[-6]C"><Data ss:Type="String">Bảng</Data></Cell>
+    <Cell ss:Formula="=R2C2*2"><Data ss:Type="Number">90</Data></Cell><Cell ss:Formula="=RC[-1]+1"><Data ss:Type="Number">91</Data></Cell></Row>
   </Table>
  </Worksheet>
 </Workbook>
@@ -2673,7 +2682,7 @@ EndFragment:0000000000\r\n<html xmlns:x="urn:schemas-microsoft-com:office:excel"
 .xl67 {mso-number-format:"\\@";}
 --></style></head><body><table border=0 cellpadding=0 cellspacing=0><!--StartFragment-->
  <col width=160 style='width:120pt'><col width=80 span=2 style='width:60pt'>
- <tr height=40><td colspan=2 class=xl65>Tên<br>
+ <tr height=40 style='mso-height-source:userset;height:30pt'><td colspan=2 class=xl65>Tên<br>
    hàng</td><td class=xl65>Giá</td></tr>
  <tr><td class=xl67>00123</td><td class=xl66 align=right x:num="1234.5">1,235</td><td>=x</td></tr>
  <tr><td><a href="https://example.com/">Trang</a></td><td>1,250</td><td><b>Đậm</b></td></tr>
@@ -2696,18 +2705,26 @@ class ClipboardCellsTests(unittest.TestCase):
                         "=R[-5]C", "=Price*2", "=NOSUCHFUNCTION(1)", "=Table1[Col]"):
             self.assertIsNone(clipcells.a1_formula(formula, 2, 2), formula)
         self.assertEqual(clipcells.a1_formula("=Price*2", 2, 2, {"PRICE"}), "=PRICE*2")
+        self.assertEqual(clipcells.link_origin(b"Excel\0C:\\a\\[B.xlsx]Sheet1\0R1C2:R21C10\0\0"), (0, 1))
+        self.assertEqual(clipcells.link_origin(b"Excel\0[B]S\0Z3S4\0"), (2, 3))  # (German Excel)
+        self.assertIsNone(clipcells.link_origin(b"nothing"))
 
     def test_excel_xml(self):
         import clipcells
         b = clipcells.from_spreadsheet_xml(_EXCEL_XML.encode("utf-8") + b"\0")
-        self.assertEqual((b.h, b.w, b.merges), (5, 3, [(0, 0, 0, 1)]))
+        self.assertEqual((b.h, b.w, b.merges), (6, 3, [(0, 0, 0, 1)]))
         self.assertEqual((b.col_widths, b.default_width, b.row_heights), ({0: 160, 2: 80}, 72, {0: 40}))
-        self.assertEqual([[b.raw(i, j, 9 + i, 1 + j) for j in range(3)] for i in range(5)], [
+        self.assertEqual([[b.raw(i, j, 9 + i, 1 + j) for j in range(3)] for i in range(6)], [
             ["Tên hàng", None, "Giá"],
             ["Xi măng", "45", "=C11*2000.5"],
             [None, "=SUM(C11:D11)", "46317"],
             ["00123", "5", "Trang"],
-            ["TRUE", "0.5", "10"]])
+            ["TRUE", "0.5", "10"],
+            ["Bảng", "90", "=C15+1"]])  # (references out of the block: their values; R2C2: where unknown)
+        b.origin = (4, 6)  # Excel's Link format: the block was at G5 - R5C7 is its first cell
+        self.assertEqual(b.raw(5, 1, 14, 2), "90")  # R2C2 is outside it
+        b.formulas[(5, 1)] = "=R6C8*2"
+        self.assertEqual(b.raw(5, 1, 14, 2), "=$C$11*2")  # H6 was the block's (1, 1): here C11
         f = b.formats
         self.assertEqual(f[(0, 0)], {"font": "Arial", "size": 12, "fg": "#ffffff", "valign": "center", "bold": True,
                                      "bg": "#1f4e78", "align": "center", "wrap": True, "bb": ["thin", "#000000"],
@@ -2721,13 +2738,14 @@ class ClipboardCellsTests(unittest.TestCase):
         self.assertEqual(f[(1, 1)], {"font": "游ゴシック", "valign": "center"})  # the Normal style
         self.assertEqual((b.notes, b.links), ({(1, 0): "Ghi chú"}, {(3, 2): {"target": "https://example.com/"}}))
         t = b.transposed()
-        self.assertEqual((t.h, t.w, t.merges, t.values[(1, 1)]), (3, 5, [(0, 0, 1, 0)], "45"))
+        self.assertEqual((t.h, t.w, t.merges, t.values[(1, 1)], t.raw(2, 1, 2, 1)), (3, 6, [(0, 0, 1, 0)], "45", "90022.5"))
         self.assertIsNone(clipcells.from_spreadsheet_xml(b"<not xml"))
 
     def test_html_tables(self):
         import clipcells
         b = clipcells.from_html(_EXCEL_HTML.encode("utf-8"))
         self.assertEqual((b.h, b.w, b.merges, b.col_widths), (3, 3, [(0, 0, 0, 1)], {0: 160, 1: 80, 2: 80}))
+        self.assertEqual(b.row_heights, {0: 40})
         self.assertEqual([[b.raw(i, j, i, j) for j in range(3)] for i in range(3)], [
             ["Tên\nhàng", None, "Giá"], ["00123", "1234.5", "'=x"], ["Trang", "1,250", "Đậm"]])
         f = b.formats
@@ -2756,6 +2774,25 @@ class ClipboardCellsTests(unittest.TestCase):
         self.assertNotIn("bt", g.formats[(1, 0)])
         self.assertEqual(g.formats[(0, 1)]["num"], "#,##0.00")
         self.assertIsNone(clipcells.from_html("<p>no table here</p>"))
+
+    @unittest.skipUnless(fe.HAS_XLSX, "openpyxl not installed")
+    def test_hair_borders_and_center_across_in_files(self):
+        wb = make({"A1": "Tiêu đề"})
+        fmt = {"align": "centerContinuous", "bb": ["hair", "#000000"], "bt": ["dotted", "#ff0000"]}
+        wb.set_format("Sheet1", 0, 0, fmt)
+        wb.set_format("Sheet1", 0, 1, {"align": "centerContinuous"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.xlsx")
+            fe.save_workbook(wb, path)
+            again = fe.load_workbook(path).sheets["Sheet1"].formats
+        self.assertEqual(again[(0, 0)], fmt)
+        self.assertEqual(again[(0, 1)], {"align": "centerContinuous"})
+        import clipcells
+        b = clipcells.from_spreadsheet_xml(_EXCEL_XML.replace('ss:Horizontal="Center" ss:Vertical="Center" ss:WrapText="1"',
+                                                              'ss:Horizontal="CenterAcrossSelection"').replace(
+            '<Border ss:Position="Bottom" ss:LineStyle="Continuous" ss:Weight="1"/>',
+            '<Border ss:Position="Bottom" ss:LineStyle="Continuous" ss:Weight="0"/>'))
+        self.assertEqual((b.formats[(0, 0)]["align"], b.formats[(0, 0)]["bb"]), ("centerContinuous", ["hair", "#000000"]))
 
     def test_number_formats_from_excel(self):
         self.assertEqual(fe.excel_number_format("m/d/yyyy"), "dd/mm/yyyy")

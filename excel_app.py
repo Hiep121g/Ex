@@ -397,8 +397,9 @@ SAO CHÉP VÀ DÁN VỚI PHẦN MỀM KHÁC
   • Chép ô trong Excel rồi Ctrl+V trong PyExcel: giữ định dạng như khi dán trong Excel — phông, cỡ chữ, đậm,
     nghiêng, gạch chân, màu chữ, màu tô, viền, căn lề, xuống dòng, xoay chữ, định dạng số, ô gộp, công thức
     (tham chiếu tự đổi theo chỗ dán), ghi chú và liên kết. Bảng chép từ Google Sheets, LibreOffice hay trang
-    web cũng giữ định dạng. Công thức trỏ sang trang tính khác, tệp khác hoặc tên vùng mà PyExcel không có
-    thì được dán thành giá trị.
+    web cũng giữ định dạng. Công thức trỏ ra ngoài vùng đã chép (sang ô khác, trang tính khác, tệp khác) hoặc
+    dùng tên vùng PyExcel không có thì được dán thành giá trị Excel đang hiện. Dán vào chỗ trống (cột, hàng
+    còn cỡ mặc định) thì cột và hàng lấy luôn độ rộng, chiều cao như bên Excel.
   • Sau khi dán, nút (Ctrl) cạnh góc vùng vừa dán (hoặc nhấn rồi thả riêng phím Ctrl) mở Tùy chọn dán như
     Excel: giữ định dạng nguồn, chỉ công thức, không có viền, giữ độ rộng cột nguồn, chuyển vị, chỉ giá trị,
     giá trị và định dạng số, chỉ định dạng. Các lựa chọn này cũng có ở nút Dán ▾ và Dán đặc biệt.
@@ -2437,6 +2438,11 @@ class SpreadsheetApp(drawing.DrawingTools):
                                 tinted.add((r, left))
 
                         needed, start, end, lc, nc = self.text_width(font, text), x0, x1, c - 1, c + 1
+                        if align == "centerContinuous":  # Center Across Selection: over the empty cells after
+                            while free(nc) and (formats.get((r, nc)) or {}).get("align") == "centerContinuous":
+                                join(nc - 1)                # it that have it too
+                                end, nc = col_pos[nc][1], nc + 1
+                            x1, align = end, "center"
                         mid = (x0 + x1) / 2
                         while True:
                             room = (2 * min(mid - start, end - mid) if align == "center" else end - start) - 2 * pad
@@ -2456,7 +2462,7 @@ class SpreadsheetApp(drawing.DrawingTools):
                 lines = [text]
             block = len(lines) * ls
             ty = {"top": y0 + 1 + block / 2, "center": (y0 + y1) / 2, "bottom": y1 - 2 - block / 2}[valign]
-            if align == "center":
+            if align in ("center", "centerContinuous"):
                 tx, anchor = (x0 + x1) / 2, "center"
             elif align == "right":
                 tx, anchor = x1 - pad - 1 - indent, "e"
@@ -2826,7 +2832,9 @@ class SpreadsheetApp(drawing.DrawingTools):
         """The canvas lines of one border of a cell box: [((x0, y0, x1, y1), (option, value, ...))]."""
         style, color = spec[0], spec[1] if len(spec) > 1 else "#000000"
         width = max(1, round({"medium": 2, "thick": 3}.get(style, 1) * min(self.px, 2)))
-        dash = {"dashed": "-", "dotted": "."}.get(style, "")
+        dash = {"dashed": "-", "dotted": ".", "hair": "."}.get(style, "")
+        if style == "hair":  # Excel's finest line: dots of every other pixel, which look lighter
+            color = fe.blend(color, "#ffffff", 0.35)
         points = {"bt": ((x0 - 1, y0 - 1, x1, y0 - 1), (0, 1)), "bb": ((x0 - 1, y1 - 1, x1, y1 - 1), (0, -1)),
                   "bl": ((x0 - 1, y0 - 1, x0 - 1, y1), (1, 0)), "br": ((x1 - 1, y0 - 1, x1 - 1, y1), (-1, 0))}
         (a, b, c, d), (dx, dy) = points[key]
@@ -4348,7 +4356,8 @@ class SpreadsheetApp(drawing.DrawingTools):
                 fmt.update({k: style[k] for k in ("bg", "fg", "bold", "italic") if k in style})
                 default = ("right" if fe.is_number(value) else
                            "center" if isinstance(value, (bool, fe.CellError)) else "left")
-                row.append({"text": self.wb.display_text(self.sheet, r, c), "align": fmt.get("align") or default,
+                align = {"centerContinuous": "center"}.get(fmt.get("align"), fmt.get("align"))
+                row.append({"text": self.wb.display_text(self.sheet, r, c), "align": align or default,
                             "fmt": fmt, "value": value if fe.is_number(value) and not isinstance(value, bool) else None})
             cells.append(row)
         row_at, col_at = {r: i for i, r in enumerate(rows)}, {c: j for j, c in enumerate(cols)}
@@ -4448,13 +4457,13 @@ class SpreadsheetApp(drawing.DrawingTools):
             merges = [m for m in sh.merges if not (m[0] <= a2 and m[2] >= a1 and m[1] <= b2 and m[3] >= b1)]
             merges += [(r0 + i1, c0 + j1, r0 + i2, c0 + j2) for r0, c0 in tiles for i1, j1, i2, j2 in block.merges
                        if r0 + i2 < MAX_ROWS and c0 + j2 < MAX_COLS]
-        col_widths = {}
+        col_widths, row_heights = self._pasted_sizes(block, tiles, mode) if styled and not transpose else ({}, {})
         if (widths or mode == "widths") and not transpose:
             for r0, c0 in tiles:
                 for j in range(min(block.w, MAX_COLS - c0)):
                     col_widths[c0 + j] = block.col_widths.get(j) or block.default_width or fe.DEFAULT_COL_WIDTH
         extras = mode == "all" and (block.notes or block.links)
-        if merges is None and not col_widths and not extras:
+        if merges is None and not col_widths and not row_heights and not extras:
             self.commit(cs)
         else:
             def apply():
@@ -4463,6 +4472,9 @@ class SpreadsheetApp(drawing.DrawingTools):
                     sh.set_merges(merges)
                 for c, width in col_widths.items():
                     sh.col_widths[c] = max(fe.MIN_COL_WIDTH, round(width))
+                for r, height in row_heights.items():
+                    sh.row_heights[r] = max(4, round(height))
+                    sh.custom_rows.add(r)
                 if extras:
                     for r0, c0 in tiles:
                         sh.notes.update(((r0 + i, c0 + j), note) for (i, j), note in block.notes.items())
@@ -4480,6 +4492,33 @@ class SpreadsheetApp(drawing.DrawingTools):
                                "kwargs": kwargs}
         self.ensure_visible(*self.cur)
         self.refresh()
+
+    def _pasted_sizes(self, block, tiles, mode):
+        """({col: width}, {row: height}) cells from another program bring along to the sheet: the copied
+        sizes, for columns and rows still at the default size here with nothing else in them (pasting into
+        an empty sheet then looks as it did there; Excel itself leaves sizes alone)."""
+        if block.source in ("PyExcel", "text") or mode not in ("all", "formats") or not tiles:
+            return {}, {}
+        sh = self.sh
+        a1, b1, a2, b2 = self.sel_rect()
+        if len(sh.cells) > 200000:  # (looking through every cell for the busy rows and columns would take long)
+            return {}, {}
+        busy_cols, busy_rows = set(), set()
+        for r, c in sh.cells:
+            if b1 <= c <= b2 and not a1 <= r <= a2:
+                busy_cols.add(c)
+            if a1 <= r <= a2 and not b1 <= c <= b2:
+                busy_rows.add(r)
+        widths, heights = {}, {}
+        for r0, c0 in tiles:
+            for j in range(min(block.w, MAX_COLS - c0)):
+                width = block.col_widths.get(j) or block.default_width
+                if width and c0 + j not in sh.col_widths and c0 + j not in busy_cols:
+                    widths[c0 + j] = width
+            for i, height in block.row_heights.items():
+                if r0 + i < MAX_ROWS and r0 + i not in sh.custom_rows and r0 + i not in busy_rows:
+                    heights[r0 + i] = height
+        return widths, heights
 
     def _paste_block(self, text):
         """What a paste puts in: PyExcel's own copied cells, cells copied in another program with their
@@ -4516,6 +4555,8 @@ class SpreadsheetApp(drawing.DrawingTools):
                 block = clipcells.from_html(data["html"])
         except Exception:  # noqa: BLE001 - a clipboard we can't read pastes as text
             block = None
+        if block is not None and data.get("link"):
+            block.origin = clipcells.link_origin(data["link"])
         if block is not None and block.h * block.w > 4 * BIG_AREA * 50:
             block.fit_content()  # (a copied whole column: only its used part)
         return block

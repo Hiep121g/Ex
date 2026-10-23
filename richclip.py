@@ -16,7 +16,7 @@ import sys
 
 DEFAULT_FONT = "Calibri"
 DEFAULT_SIZE = 11
-BORDER_PT = {"thin": 0.5, "medium": 1.0, "thick": 1.5, "double": 2.25, "dashed": 0.5, "dotted": 0.5}
+BORDER_PT = {"thin": 0.5, "medium": 1.0, "thick": 1.5, "double": 2.25, "dashed": 0.5, "dotted": 0.5, "hair": 0.5}
 BORDER_PX = {"medium": 2, "thick": 3}
 EDGES = (("bt", "top"), ("bb", "bottom"), ("bl", "left"), ("br", "right"))
 
@@ -52,7 +52,7 @@ def _css(cell):
     for key, side in EDGES:
         spec = fmt.get(key)
         if spec:
-            kind = {"double": "double", "dashed": "dashed", "dotted": "dotted"}.get(spec[0], "solid")
+            kind = {"double": "double", "dashed": "dashed", "dotted": "dotted", "hair": "hairline"}.get(spec[0], "solid")
             style.append(f"border-{side}:{BORDER_PT.get(spec[0], 0.5)}pt {kind} {spec[1] if len(spec) > 1 else '#000000'}")
     if number:  # Excel's own property: the number format (backslash-escaped, as Excel writes it)
         style.append('mso-number-format:"' + re.sub(r"([^\w\s])", r"\\\1", number) + '"')
@@ -154,7 +154,8 @@ def rtf_table(table):
             for key, side in EDGES:
                 spec = fmt.get(key)
                 if spec:
-                    kind = {"double": "\\brdrdb", "dashed": "\\brdrdash", "dotted": "\\brdrdot"}.get(spec[0], "\\brdrs")
+                    kind = {"double": "\\brdrdb", "dashed": "\\brdrdash", "dotted": "\\brdrdot",
+                            "hair": "\\brdrhair"}.get(spec[0], "\\brdrs")
                     width = round(BORDER_PT.get(spec[0], 0.5) * 20)
                     body.append(f"\\clbrdr{side[0]}{kind}\\brdrw{width}\\brdrcf{color(spec[1] if len(spec) > 1 else '#000000')}")
             if fmt.get("bg"):
@@ -306,7 +307,7 @@ def _draw(gdi, dc, table, sx, sy):
                 continue
             style, color = spec[0], _colorref(spec[1] if len(spec) > 1 else "#000000")
             width = max(1, round(BORDER_PX.get(style, 1) * sx))
-            pen = gdi.CreatePen({"dashed": 1, "dotted": 2}.get(style, 0), width, color)
+            pen = gdi.CreatePen({"dashed": 1, "dotted": 2, "hair": 2}.get(style, 0), width, color)
             old = gdi.SelectObject(dc, pen)
             line = {"bt": (x0, y0, x1, y0), "bb": (x0, y1, x1, y1), "bl": (x0, y0, x0, y1), "br": (x1, y0, x1, y1)}[key]
             offsets = (0, 2 * sx) if style == "double" else (0,)
@@ -398,16 +399,17 @@ def copy_to_clipboard(hwnd, text, table):
 
 def read_cells(hwnd):
     """The cell formats another program put on the Windows clipboard: {"xml": Excel's XML Spreadsheet,
-    "html": HTML Format} (bytes; those present), or {} (also off Windows)."""
+    "html": HTML Format, "link": Excel's Link (where the cells were)} (bytes; those present), or {} (also
+    off Windows)."""
     if sys.platform != "win32":
         return {}
     import ctypes
 
     gdi = _Gdi(ctypes)
     kinds = {key: gdi.RegisterClipboardFormatW(name) for key, name in (("xml", "XML Spreadsheet"),
-                                                                        ("html", "HTML Format"))}
+                                                                        ("html", "HTML Format"), ("link", "Link"))}
     kinds = {key: kind for key, kind in kinds.items() if kind and gdi.IsClipboardFormatAvailable(kind)}
-    if not kinds:
+    if not kinds.keys() - {"link"}:
         return {}
     for _ in range(10):  # another program may hold the clipboard for a moment
         if gdi.OpenClipboard(hwnd):

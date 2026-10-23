@@ -33,7 +33,7 @@ DEFAULT_SETUP = {"paper": "A4", "orientation": "portrait", "margins": MARGINS["n
                  "header": "", "footer": "",  # codes: &P page, &N pages, &D date, &T time, &F file, &A sheet
                  "breaks": [], "col_breaks": []}  # rows / columns that start a new page
 DEFAULT_FONT, DEFAULT_SIZE = "Calibri", 11
-BORDER_WIDTHS = {"thin": 0.5, "medium": 1.0, "thick": 1.75, "dashed": 0.5, "dotted": 0.5, "double": 0.5}
+BORDER_WIDTHS = {"thin": 0.5, "medium": 1.0, "thick": 1.75, "dashed": 0.5, "dotted": 0.5, "double": 0.5, "hair": 0.25}
 
 
 def setup_of(sheet):
@@ -450,10 +450,15 @@ def render_page(surface, layout, index, file_name=""):
             # run on over empty cells as on screen: rightwards when left-aligned, leftwards when right-aligned,
             # both ways when centred
             k = j = cols.index(c)
-            mid, need = (a + cc) / 2, surface.measure(text, spec, size) + 2 * pad + indent
 
             def free(i):
                 return 0 <= i < len(cols) and (r, cols[i]) not in sh.cells and not sh.merge_at(r, cols[i])
+            if align == "centerContinuous":  # Center Across Selection: over the empty cells after it that have it too
+                while free(k + 1) and (sh.formats.get((r, cols[k + 1])) or {}).get("align") == "centerContinuous":
+                    k += 1
+                cc = clip_right = xs[cols[k]][1]
+                align = "center"
+            mid, need = (a + cc) / 2, surface.measure(text, spec, size) + 2 * pad + indent
             while (2 * min(mid - clip_left, clip_right - mid) if align == "center" else clip_right - clip_left) < need:
                 grow_r, grow_l = align in ("left", "center") and free(k + 1), align in ("right", "center") and free(j - 1)
                 if not (grow_r or grow_l) or (align == "center" and not (grow_r and grow_l)):
@@ -477,7 +482,8 @@ def render_page(surface, layout, index, file_name=""):
         surface.clip(clip_left, b, clip_right, d)
         for i, line in enumerate(lines):
             w = surface.measure(line, spec, size)
-            lx = {"center": (a + cc - w) / 2, "right": cc - pad - indent - w}.get(align, a + pad + indent)
+            lx = {"center": (a + cc - w) / 2, "centerContinuous": (a + cc - w) / 2,
+                  "right": cc - pad - indent - w}.get(align, a + pad + indent)
             base = top + i * ls + asc
             surface.text(lx, base, line, spec, size, color)
             if fmt.get("underline"):
@@ -501,7 +507,7 @@ def render_page(surface, layout, index, file_name=""):
                 continue
             style, color = spec[0], spec[1] if len(spec) > 1 else "#000000"
             w = BORDER_WIDTHS.get(style, 0.5) * max(0.6, s)
-            dash = {"dashed": (3 * s, 2 * s), "dotted": (0.8 * s, 1.2 * s)}.get(style)
+            dash = {"dashed": (3 * s, 2 * s), "dotted": (0.8 * s, 1.2 * s), "hair": (0.6 * s, 0.6 * s)}.get(style)
             if style == "double":
                 off = 1.0 * max(0.6, s)
                 dx, dy = (0, off) if key in ("bt", "bb") else (off, 0)

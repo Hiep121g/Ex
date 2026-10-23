@@ -21,7 +21,7 @@ FRACTION_TYPES = ["# ?/?", "# ??/??", "# ???/???"]
 NUM_CATEGORIES = ["Chung", "Số", "Tiền tệ", "Kế toán", "Ngày", "Thời gian", "Phần trăm", "Phân số",
                   "Khoa học", "Văn bản", "Tùy chỉnh"]
 BORDER_NAMES = [("thin", "Mảnh"), ("medium", "Vừa"), ("thick", "Dày"), ("double", "Kép"),
-                ("dashed", "Gạch"), ("dotted", "Chấm")]
+                ("dashed", "Gạch"), ("dotted", "Chấm"), ("hair", "Chấm rất mảnh")]
 CF_PRESETS = [("Tô đỏ nhạt, chữ đỏ sẫm", {"bg": "#ffc7ce", "fg": "#9c0006"}),
               ("Tô vàng, chữ vàng sẫm", {"bg": "#ffeb9c", "fg": "#9c5700"}),
               ("Tô xanh lá, chữ xanh sẫm", {"bg": "#c6efce", "fg": "#006100"}),
@@ -304,7 +304,8 @@ class FormatCellsDialog(Dialog):
         self.nb.add(page, text="Căn chỉnh")
         box = ttk.LabelFrame(page, text="Căn chỉnh văn bản", padding=8)
         box.grid(row=0, column=0, sticky="nsew")
-        self.h_names = {"Chung": None, "Trái (thụt lề)": "left", "Giữa": "center", "Phải (thụt lề)": "right"}
+        self.h_names = {"Chung": None, "Trái (thụt lề)": "left", "Giữa": "center", "Phải (thụt lề)": "right",
+                        "Căn giữa trong vùng chọn": "centerContinuous"}
         self.v_names = {"Trên": "top", "Giữa": "center", "Dưới": None}
         ttk.Label(box, text="Ngang:").grid(row=0, column=0, sticky="w")
         self.h_var = tk.StringVar(value=next(k for k, v in self.h_names.items() if v == self.fmt.get("align")))
@@ -519,7 +520,7 @@ class FormatCellsDialog(Dialog):
         cv.create_text(150, 75, text="Văn bản", fill="#999")
         style, color = self._line()
         width = {"medium": 2, "thick": 3}.get(style, 1)
-        dash = {"dashed": "-", "dotted": "."}.get(style, "")
+        dash = {"dashed": "-", "dotted": ".", "hair": "."}.get(style, "")
         lines = {"top": (x0, y0, x1, y0), "bottom": (x0, y1, x1, y1), "left": (x0, y0, x0, y1),
                  "right": (x1, y0, x1, y1), "inside_h": (x0, 60, x1, 60), "inside_v": (110, y0, 110, y1)}
         for key, pts in lines.items():

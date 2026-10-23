@@ -44,7 +44,7 @@ MAX_COLS = 16384   # column XFD, as Excel
 DEFAULT_COL_WIDTH = 80   # pixels at 96 DPI
 DEFAULT_ROW_HEIGHT = 20  # pixels at 96 DPI
 MIN_COL_WIDTH = 12
-BORDER_STYLES = ("thin", "medium", "thick", "double", "dashed", "dotted")
+BORDER_STYLES = ("thin", "medium", "thick", "double", "dashed", "dotted", "hair")
 BORDER_KEYS = ("bt", "bb", "bl", "br")  # top, bottom, left, right: [style, "#rrggbb"]
 HAS_XLSX = importlib.util.find_spec("openpyxl") is not None
 FILE_TAG = "PyExcel"
@@ -5327,7 +5327,7 @@ def _save_csv(wb, sheet, path):
 
 _XL_OPS = {">": "greaterThan", "<": "lessThan", ">=": "greaterThanOrEqual", "<=": "lessThanOrEqual",
            "=": "equal", "<>": "notEqual", "between": "between", "notbetween": "notBetween"}
-_XL_BORDER = {"hair": "thin", "mediumDashed": "dashed", "dashDot": "dashed", "mediumDashDot": "dashed",
+_XL_BORDER = {"mediumDashed": "dashed", "dashDot": "dashed", "mediumDashDot": "dashed",
               "dashDotDot": "dotted", "mediumDashDotDot": "dashed", "slantDashDot": "dashed"}
 
 
@@ -5415,7 +5415,7 @@ def _format_from_xlsx(cell):
             fmt["bg"] = bg
     al = cell.alignment
     if al is not None:
-        if al.horizontal in ("left", "center", "right"):
+        if al.horizontal in ("left", "center", "right", "centerContinuous"):
             fmt["align"] = al.horizontal
         if al.vertical in ("top", "center"):
             fmt["valign"] = al.vertical
