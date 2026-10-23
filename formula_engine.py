@@ -10,31 +10,41 @@ rows/columns/cells are inserted or deleted, and reads/writes .pyxl (JSON),
 
 from __future__ import annotations
 
+import base64
+import calendar
+import contextlib
 import copy
+import functools
 import csv
 import datetime as dt
+import gc
 import importlib.util
 import io
+import itertools
 import json
 import math
 import operator
+from operator import itemgetter
 import os
 import random
 import re
 import statistics
 import sys
+import unicodedata
 from collections import Counter, namedtuple
+
+import drawingml
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal, InvalidOperation
 from fractions import Fraction
 
 sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
 
-MAX_ROWS = 10000
-MAX_COLS = 200
+MAX_ROWS = 1048576  # as Excel
+MAX_COLS = 16384   # column XFD, as Excel
 DEFAULT_COL_WIDTH = 80   # pixels at 96 DPI
 DEFAULT_ROW_HEIGHT = 20  # pixels at 96 DPI
 MIN_COL_WIDTH = 12
-BORDER_STYLES = ("thin", "medium", "thick", "double", "dashed", "dotted")
+BORDER_STYLES = ("thin", "medium", "thick", "double", "dashed", "dotted", "hair")
 BORDER_KEYS = ("bt", "bb", "bl", "br")  # top, bottom, left, right: [style, "#rrggbb"]
 HAS_XLSX = importlib.util.find_spec("openpyxl") is not None
 FILE_TAG = "PyExcel"
@@ -47,6 +57,8 @@ NA = "#N/A"
 NUM = "#NUM!"
 CIRC = "#CIRC!"
 SYNTAX = "#ERROR!"
+SPILL = "#SPILL!"  # a dynamic-array result can't spill: a cell it needs is taken
+CALC = "#CALC!"    # a calculation Excel can't do, e.g. an empty array or a LAMBDA left uncalled
 
 
 class CellError(Exception):
@@ -104,6 +116,25 @@ def parse_range(text):
 _ADDR_RE = re.compile(r"\$?([A-Za-z]{1,3})\$?(\d+)")
 
 
+def rect_minus(rect, cut):
+    """Parts of rectangle `rect` (r1, c1, r2, c2) outside rectangle `cut`, as up to four rectangles."""
+    r1, c1, r2, c2 = rect
+    a1, b1, a2, b2 = cut
+    if a1 > r2 or a2 < r1 or b1 > c2 or b2 < c1:
+        return [tuple(rect)]
+    parts = []
+    if r1 < a1:
+        parts.append((r1, c1, a1 - 1, c2))
+    if a2 < r2:
+        parts.append((a2 + 1, c1, r2, c2))
+    top, bottom = max(r1, a1), min(r2, a2)
+    if c1 < b1:
+        parts.append((top, c1, bottom, b1 - 1))
+    if b2 < c2:
+        parts.append((top, b2 + 1, bottom, c2))
+    return parts
+
+
 def parse_address(text):
     """'B3' -> (2, 1); 'A1:C4' -> (0, 0, 3, 2); None when invalid."""
     parts = text.strip().split(":")
@@ -136,6 +167,127 @@ def quote_sheet(name):
     return "'" + name.replace("'", "''") + "'"
 
 
+# what a protected sheet may still allow (Review > Protect Sheet)
+PROTECT_OPTIONS = (("format_cells", "Định dạng ô"), ("format_rows_cols", "Định dạng, ẩn hàng và cột"),
+                   ("outline", "Thu gọn / mở rộng nhóm (dàn bài)"), ("filter", "Dùng Bộ lọc"),
+                   ("objects", "Sửa biểu đồ, ảnh và hình vẽ"))
+
+
+def password_hash(password):
+    """Excel's legacy sheet-protection password hash (hex), as .xlsx files store it."""
+    if not password:
+        return ""
+    value = 0
+    for i, ch in enumerate(password, 1):
+        v = ord(ch) << i
+        value ^= (v & 0x7FFF) | (v >> 15)
+    value ^= len(password) ^ 0xCE4B
+    return f"{value:04X}"
+
+
+def cell_locked(fmt):
+    return not (fmt or {}).get("unlocked")
+
+
+def protection_problem(before, after, allow=()):
+    """Why a change to a protected sheet is not allowed, or None. before/after: Sheet.copy_state()."""
+    changed = () if before["cells"] == after["cells"] else set(before["cells"].items()) ^ set(after["cells"].items())
+    for key in {k for k, _ in changed}:
+        if before["cells"].get(key) != after["cells"].get(key) and (
+                cell_locked(before["formats"].get(key)) or cell_locked(after["formats"].get(key))):
+            return "cells"
+    if before["formats"] != after["formats"] and "format_cells" not in allow:
+        return "format"
+    for key in ("merges", "cond_formats", "validations", "notes", "links", "pivots", "row_levels", "col_levels"):
+        if before[key] != after[key]:
+            return "cells"
+    if ((before["row_heights"], before["col_widths"]) != (after["row_heights"], after["col_widths"])
+            and "format_rows_cols" not in allow):
+        return "rows"
+    for hidden, levels, marks in (("hidden_rows", "row_levels", "collapsed_rows"),
+                                  ("hidden_cols", "col_levels", "collapsed_cols")):
+        changed = before[hidden] ^ after[hidden]
+        if changed and "format_rows_cols" not in allow and not (
+                "outline" in allow and changed <= set(after[levels])):
+            return "rows"
+        if before[marks] != after[marks] and "outline" not in allow and "format_rows_cols" not in allow:
+            return "rows"
+    if before["charts"] != after["charts"] and "objects" not in allow:
+        return "objects"
+    if before["filter"] != after["filter"] and "filter" not in allow:
+        return "filter"
+    return None
+
+
+def split_text(text, delimiters="", merge=False, breaks=None, quote='"'):
+    """Data > Text to Columns: the parts of a cell's text, split at any of the delimiter characters
+    (text in quotes kept whole; runs of delimiters as one with `merge`) or at the character positions
+    `breaks` (fixed width)."""
+    if breaks is not None:
+        cuts = [0] + sorted(b for b in set(breaks) if 0 < b < len(text)) + [len(text)]
+        return [text[a:b].strip() for a, b in zip(cuts, cuts[1:])]
+    parts, cur, quoted, i = [], [], False, 0
+    while i < len(text):
+        ch = text[i]
+        if quote and ch == quote:
+            if quoted and text[i + 1:i + 2] == quote:
+                cur.append(quote)
+                i += 1
+            else:
+                quoted = not quoted
+        elif ch in delimiters and not quoted:
+            parts.append("".join(cur))
+            cur = []
+            while merge and i + 1 < len(text) and text[i + 1] in delimiters:
+                i += 1
+        else:
+            cur.append(ch)
+        i += 1
+    parts.append("".join(cur))
+    return parts
+
+
+def cells_to_rects(cells):
+    """Cover a set of (row, col) cells with few rectangles: runs along each row, stacked where they match."""
+    runs = {}
+    for r, c in sorted(set(cells)):
+        row = runs.setdefault(r, [])
+        if row and row[-1][1] == c - 1:
+            row[-1][1] = c
+        else:
+            row.append([c, c])
+    rects, open_ = [], {}
+    for r in sorted(runs):
+        spans = {tuple(s) for s in runs[r]}
+        for span in list(open_):
+            if span not in spans or open_[span][2] != r - 1:
+                rects.append(tuple(open_.pop(span)))
+        for span in sorted(spans):
+            if span in open_:
+                open_[span][2] = r
+            else:
+                open_[span] = [r, span[0], r, span[1]]
+    rects += [tuple(v) for v in open_.values()]
+    return sorted(rects)
+
+
+def absolute_ref(sheet, rect):
+    """'Sheet1!$A$1:$B$4' (or 'Sheet1!$A$1' for one cell), as names refer to cells."""
+    r1, c1, r2, c2 = rect
+    first = f"${col_name(c1)}${r1 + 1}"
+    return f"{quote_sheet(sheet)}!{first}" + ("" if (r1, c1) == (r2, c2) else f":${col_name(c2)}${r2 + 1}")
+
+
+def name_from_label(text):
+    """A defined name made from a heading, as Formulas > Create from Selection does ('Đơn giá' -> 'Đơn_giá')."""
+    name = re.sub(r"[^\w.]", "", re.sub(r"\s+", "_", str(text).strip()))
+    if name and not (name[0].isalpha() or name[0] == "_"):
+        name = "_" + name
+    if _REF_LIKE_RE.match(name) or name.upper() in ("TRUE", "FALSE"):
+        name += "_"
+    return name
+
+
 # ------------------------------------------------------------------ values
 
 def is_number(v):
@@ -166,8 +318,21 @@ _DATE_DMY_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
 _DATE_ISO_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
 
 
+_NOT_CACHED = object()
+_LITERALS = {}  # raw text -> parse_literal(raw): sheets repeat texts and numbers, and every change recalculates
+
+
 def parse_literal(raw):
     """Interpret typed (non-formula) text. Returns (value, implied number format)."""
+    hit = _LITERALS.get(raw)
+    if hit is None:
+        if len(_LITERALS) > 200000:
+            _LITERALS.clear()
+        hit = _LITERALS[raw] = _parse_literal(raw)
+    return hit
+
+
+def _parse_literal(raw):
     if raw.startswith("'"):
         return raw[1:], None
     s = raw.strip()
@@ -254,6 +419,55 @@ def sort_key(v):
     if isinstance(v, CellError):
         return (3, v.code)
     return (1, str(v).lower())
+
+
+# Vietnamese alphabetical order (with the Latin letters Vietnamese lacks), and the tones in dictionary order:
+# none, huyền, hỏi, ngã, sắc, nặng
+_VN_LETTERS = {ch: i for i, ch in enumerate("aăâbcdđeêfghijklmnoôơpqrstuưvwxyz")}
+_VN_TONES = {"\u0300": 1, "\u0309": 2, "\u0303": 3, "\u0301": 4, "\u0323": 5}
+_DIGITS_RE = re.compile(r"(\d+)")
+
+
+def _text_order(text):
+    """(letters, tones) ordering a piece of text alphabetically the Vietnamese way: "d" < "đ" < "e",
+    "a" < "ă" < "â" < "b", and tones only break ties ("anh" < "ánh" < "bình")."""
+    letters, tones = [], []
+    for ch in unicodedata.normalize("NFD", text.lower()):
+        if ch in _VN_TONES and tones:
+            tones[-1] = _VN_TONES[ch]
+        elif unicodedata.combining(ch) and letters:  # breve, circumflex, horn: part of the letter (ă, â, ơ...)
+            letters[-1] += ch
+        else:
+            letters.append(ch)
+            tones.append(0)
+    ranks = []
+    for letter in letters:
+        letter = unicodedata.normalize("NFC", letter)
+        if letter in _VN_LETTERS:
+            ranks.append(200 + _VN_LETTERS[letter])
+        else:  # spaces and ASCII punctuation sort before letters, other scripts after them
+            ranks.append(ord(letter[0]) if ord(letter[0]) < 200 else 1000 + ord(letter[0]))
+    return tuple(ranks), tuple(tones)
+
+
+def natural_key(v):
+    """Order for sorting in the UI - sorted rows, filter lists, PivotTable items - unlike Excel's:
+    numbers by value, also when typed as text ("2" before "10"), dates typed as text by date, and text
+    "naturally", runs of digits by value ("SP2" before "SP10", "BCR-300x30" before "BCR-1000x50") in
+    Vietnamese alphabetical order. Formulas keep Excel's rules (see compare / sort_key)."""
+    if isinstance(v, bool):
+        return (2, v)
+    if isinstance(v, CellError):
+        return (3, v.code)
+    if is_number(v):
+        return (0, float(v))
+    text = str(v).strip()
+    literal = parse_literal(text)[0] if text else ""
+    if is_number(literal):
+        return (0, float(literal))
+    parts = tuple((0, int(chunk)) if chunk.isdigit() else (1, _text_order(chunk))
+                  for chunk in _DIGITS_RE.split(text) if chunk)
+    return (1, parts, text.lower())
 
 
 def _blank_like(v):
@@ -513,19 +727,20 @@ def blend(c1, c2, t):
 
 # ------------------------------------------------------------------ tokenizer
 
-_SHEET_PAT = r"(?:'(?:[^']|'')+'|[^\W\d][\w.]*)"
+_SHEET_PAT = r"(?:'(?:[^']|'')+'|[^\W\d][\w.]*(?::[^\W\d][\w.]*)?)"  # also Sheet1:Sheet3 (a 3-D reference)
 _TOKEN_RE = re.compile(rf"""
     (?P<ws>\s+)
   | (?P<string>"(?:[^"]|"")*")
-  | (?P<error>\#(?:DIV/0!|REF!|NAME\?|VALUE!|N/A|NUM!|CIRC!|ERROR!))
-  | (?P<ref>(?:(?P<sheet>{_SHEET_PAT})!)?(?P<cabs>\$?)(?P<col>[A-Za-z]{{1,3}})(?P<rabs>\$?)(?P<row>\d+)(?![\w(]))
+  | (?P<error>\#(?:DIV/0!|REF!|NAME\?|VALUE!|N/A|NUM!|CIRC!|ERROR!|SPILL!|CALC!))
+  | (?P<ref>(?:(?P<sheet>{_SHEET_PAT})!)?(?P<cabs>\$?)(?P<col>[A-Za-z]{{1,3}})(?P<rabs>\$?)(?P<row>\d+)(?![\w(])
+      (?P<spill>\#)?)
   | (?P<number>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)
-  | (?P<ident>[A-Za-z_][\w.]*)
-  | (?P<op><>|<=|>=|[-+*/^&=<>%:(),;])
+  | (?P<ident>[^\W\d][\w.]*)
+  | (?P<op><>|<=|>=|[-+*/^&=<>%:(),;{{}}])
 """, re.VERBOSE)
 _TOKEN_KINDS = ("ws", "string", "error", "ref", "number", "ident", "op")
 
-RefParts = namedtuple("RefParts", "sheet_text sheet cabs col rabs row")
+RefParts = namedtuple("RefParts", "sheet_text sheet cabs col rabs row spill", defaults=(False,))  # spill: A1#
 
 
 class Token:
@@ -547,7 +762,7 @@ def tokenize(text):
             st = m.group("sheet")
             sheet = (st[1:-1].replace("''", "'") if st.startswith("'") else st) if st else None
             ref = RefParts(st, sheet, bool(m.group("cabs")), col_index(m.group("col")),
-                           bool(m.group("rabs")), int(m.group("row")) - 1)
+                           bool(m.group("rabs")), int(m.group("row")) - 1, bool(m.group("spill")))
         tokens.append(Token(kind, m.group(0), ref))
         pos = m.end()
     return tokens
@@ -555,7 +770,7 @@ def tokenize(text):
 
 def _format_ref(p):
     prefix = f"{p.sheet_text}!" if p.sheet_text else ""
-    return f"{prefix}{'$' if p.cabs else ''}{col_name(p.col)}{'$' if p.rabs else ''}{p.row + 1}"
+    return f"{prefix}{'$' if p.cabs else ''}{col_name(p.col)}{'$' if p.rabs else ''}{p.row + 1}{'#' if p.spill else ''}"
 
 
 def _ref_items(tokens):
@@ -635,10 +850,54 @@ class _Parser:
         return node
 
     def primary(self):
+        node = self._operand()
+        while self._at("("):  # LAMBDA(x, x + 1)(5): call what the expression gives
+            self.pos += 1
+            node = ("call", node, self._args())
+        return node
+
+    def _array_constant(self):
+        """{1,2,3;4,5,6}: rows separated by ';', items by ','."""
+        rows, row = [], []
+        while True:
+            sign = 1
+            if self._at("-", "+"):
+                sign = -1 if self.toks[self.pos].text == "-" else 1
+                self.pos += 1
+            if self.pos >= len(self.toks):
+                raise CellError(SYNTAX)
+            t = self.toks[self.pos]
+            self.pos += 1
+            if t.kind == "number":
+                row.append(sign * float(t.text))
+            elif sign == 1 and t.kind == "string":
+                row.append(t.text[1:-1].replace('""', '"'))
+            elif sign == 1 and t.kind == "ident" and t.text.upper() in ("TRUE", "FALSE"):
+                row.append(t.text.upper() == "TRUE")
+            elif sign == 1 and t.kind == "error":
+                row.append(CellError(t.text.upper()))
+            else:
+                raise CellError(SYNTAX)
+            if self._at(","):
+                self.pos += 1
+            elif self._at(";"):
+                self.pos += 1
+                rows.append(row)
+                row = []
+            else:
+                self._expect("}")
+                rows.append(row)
+                if len({len(r) for r in rows}) != 1:
+                    raise CellError(VALUE)
+                return ("array", tuple(tuple(r) for r in rows))
+
+    def _operand(self):
         if self.pos >= len(self.toks):
             raise CellError(SYNTAX)
         t = self.toks[self.pos]
         self.pos += 1
+        if t.kind == "op" and t.text == "{":
+            return self._array_constant()
         if t.kind == "number":
             return ("num", float(t.text))
         if t.kind == "string":
@@ -647,6 +906,8 @@ class _Parser:
             return ("err", t.text.upper())
         if t.kind == "ref":
             p = t.ref
+            if p.spill:  # A1#: the whole array A1's formula spills
+                return ("spill", p.sheet, p.row, p.col)
             if self._at(":"):
                 self.pos += 1
                 if self.pos >= len(self.toks) or self.toks[self.pos].kind != "ref":
@@ -663,7 +924,7 @@ class _Parser:
                 return ("func", name, self._args())
             if name in ("TRUE", "FALSE"):
                 return ("bool", name == "TRUE")
-            return ("err", NAME)
+            return ("name", name)  # a defined name, looked up when evaluated
         if t.kind == "op" and t.text == "(":
             node = self.comparison()
             self._expect(")")
@@ -694,27 +955,100 @@ def parse_formula(raw):
 
 # ------------------------------------------------------------------ formula text rewriting
 
-def normalize_formula(raw):
-    """Upper-case names and references, use ',' separators and close open parentheses."""
+def normalize_formula(raw, names=None):
+    """Upper-case functions and references, write defined names as they were defined (`names`: the
+    workbook's names), use ',' separators and close open parentheses."""
     if not is_formula(raw):
         return raw
     try:
         tokens = tokenize(raw[1:])
     except CellError:
         return raw
-    out, depth = [], 0
-    for t in tokens:
+    out, depth, braces = [], 0, 0
+    for i, t in enumerate(tokens):
         if t.kind == "ident":
-            out.append(t.text.upper())
+            after = next((n for n in tokens[i + 1:] if n.kind != "ws"), None)
+            called = after is not None and after.kind == "op" and after.text == "("
+            upper = t.text.upper()
+            if not called and names and upper in names:
+                out.append(names[upper]["name"])
+            else:
+                out.append(upper if called or upper in ("TRUE", "FALSE") or not names else t.text)
         elif t.kind == "ref":
             out.append(_format_ref(t.ref))
-        elif t.kind == "op" and t.text == ";":
+        elif t.kind == "op" and t.text == ";" and not braces:
             out.append(",")
         else:
             out.append(t.text)
             if t.kind == "op":
                 depth += {"(": 1, ")": -1}.get(t.text, 0)
+                braces += {"{": 1, "}": -1}.get(t.text, 0)
     return "=" + "".join(out) + ")" * max(depth, 0)
+
+
+# functions newer than Excel 2007 carry a prefix in .xlsx files (without it Excel shows #NAME?)
+_XLFN = {"AGGREGATE", "ARRAYTOTEXT", "BYCOL", "BYROW", "CEILING.MATH", "CHOOSECOLS", "CHOOSEROWS", "CONCAT", "DAYS",
+         "DROP", "EXPAND", "FLOOR.MATH", "HSTACK", "IFNA", "IFS", "ISFORMULA", "ISOMITTED", "ISOWEEKNUM", "LAMBDA",
+         "LET", "MAKEARRAY", "MAP", "MAXIFS", "MINIFS", "MODE.MULT", "MODE.SNGL", "NUMBERVALUE", "PERCENTILE.EXC",
+         "PERCENTILE.INC", "QUARTILE.EXC", "QUARTILE.INC", "RANDARRAY", "RANK.AVG", "RANK.EQ", "REDUCE", "SCAN",
+         "SEQUENCE", "SINGLE", "SORTBY", "STDEV.P", "STDEV.S", "SWITCH", "TAKE", "TEXTAFTER", "TEXTBEFORE",
+         "TEXTJOIN", "TEXTSPLIT", "TOCOL", "TOROW", "UNICHAR", "UNICODE", "UNIQUE", "VALUETOTEXT", "VAR.P", "VAR.S",
+         "VSTACK", "WRAPCOLS", "WRAPROWS", "XLOOKUP", "XMATCH", "XOR"}
+_XLWS = {"FILTER", "SORT"}  # _xlfn._xlws.
+
+
+def _lambda_names(node, found):
+    """Names LAMBDA parameters and LET give anywhere in a formula's AST."""
+    if isinstance(node, tuple) and node:
+        if node[0] == "func" and node[1] in ("LAMBDA", "LET"):
+            args = node[2]
+            named = args[:-1] if node[1] == "LAMBDA" else args[:-1:2]
+            found.update(n[1] for n in named if n[0] == "name")
+        for part in node[1:]:
+            if isinstance(part, (list, tuple)):
+                for item in (part if isinstance(part, list) else [part]):
+                    _lambda_names(item, found)
+    return found
+
+
+def file_formula(raw):
+    """A formula as Excel writes it in .xlsx files: newer functions prefixed _xlfn. (FILTER and SORT
+    _xlfn._xlws.), LAMBDA and LET names _xlpm., and A1# as _xlfn.ANCHORARRAY(A1)."""
+    try:
+        tokens = tokenize(raw[1:])
+    except CellError:
+        return raw
+    names = _lambda_names(parse_formula(raw), set())
+    out = []
+    for i, t in enumerate(tokens):
+        if t.kind == "ident":
+            after = next((n for n in tokens[i + 1:] if n.kind != "ws"), None)
+            called = after is not None and after.kind == "op" and after.text == "("
+            upper = t.text.upper()
+            if upper in names:
+                out.append("_xlpm." + t.text)
+            elif called and upper in _XLWS:
+                out.append("_xlfn._xlws." + t.text)
+            elif called and upper in _XLFN:
+                out.append("_xlfn." + t.text)
+            else:
+                out.append(t.text)
+        elif t.kind == "ref" and t.ref.spill:
+            out.append(f"_xlfn.ANCHORARRAY({_format_ref(t.ref._replace(spill=False))})")
+        else:
+            out.append(t.text)
+    return "=" + "".join(out)
+
+
+_ANCHORARRAY_RE = re.compile(r"_xlfn\.ANCHORARRAY\(([^()]*)\)", re.I)
+
+
+def formula_from_file(text):
+    """A formula read from an .xlsx file (with or without '=') in PyExcel's form: the prefixes of newer
+    functions and LAMBDA names dropped, _xlfn.ANCHORARRAY(A1) written A1#."""
+    text = _ANCHORARRAY_RE.sub(r"\1#", text)
+    text = text.replace("_xlfn.", "").replace("_xlws.", "").replace("_xlpm.", "")
+    return normalize_formula(text if text.startswith("=") else "=" + text)
 
 
 def shift_formula(raw, dr, dc):
@@ -855,9 +1189,109 @@ def fill_series(raws):
     return None
 
 
+# ------------------------------------------------------------------ dynamic arrays
+
+_NO_SPILLS = {}
+# functions that give arrays (or may: IF, CHOOSE, INDEX... pass on what they are given)
+_ARRAY_FUNCS = {"FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "TOCOL", "TOROW", "WRAPCOLS",
+                "WRAPROWS", "CHOOSECOLS", "CHOOSEROWS", "TAKE", "DROP", "EXPAND", "TEXTSPLIT", "MAP", "SCAN",
+                "BYROW", "BYCOL", "MAKEARRAY", "HSTACK", "VSTACK", "TRANSPOSE", "MMULT", "XLOOKUP", "OFFSET",
+                "INDEX", "INDIRECT", "IF", "IFS", "SWITCH", "CHOOSE", "LET", "IFERROR", "IFNA", "LAMBDA"}
+# functions of single values that Excel applies to each item of an array argument
+_LIFTED = {"ABS", "ACOS", "ASIN", "ATAN", "CEILING", "CHAR", "CLEAN", "CODE", "COS", "DATE", "DATEVALUE", "DAY",
+           "DEGREES", "EDATE", "EOMONTH", "EVEN", "EXACT", "EXP", "FACT", "FIND", "FLOOR", "HOUR", "INT", "ISBLANK",
+           "ISERR", "ISERROR", "ISEVEN", "ISLOGICAL", "ISNA", "ISNONTEXT", "ISNUMBER", "ISODD", "ISTEXT", "LEFT",
+           "LEN", "LN", "LOG", "LOG10", "LOWER", "MID", "MINUTE", "MOD", "MONTH", "MROUND", "N", "NOT", "ODD",
+           "POWER", "PROPER", "QUOTIENT", "RADIANS", "REPLACE", "REPT", "RIGHT", "ROUND", "ROUNDDOWN", "ROUNDUP",
+           "SEARCH", "SECOND", "SIGN", "SIN", "SQRT", "SUBSTITUTE", "T", "TAN", "TEXT", "TEXTAFTER", "TEXTBEFORE",
+           "TIME", "TRIM", "TRUNC", "UPPER", "VALUE", "WEEKDAY", "WEEKNUM", "YEAR"}
+_MAY_ARRAY = {}  # formula text -> whether it can give an array
+
+
+def _may_array(raw):
+    """Whether a formula can give several values (and so may spill)."""
+    hit = _MAY_ARRAY.get(raw)
+    if hit is None:
+        if len(_MAY_ARRAY) > 50000:
+            _MAY_ARRAY.clear()
+        hit = _MAY_ARRAY[raw] = _node_may_array(parse_formula(raw))
+    return hit
+
+
+def _node_may_array(node):
+    kind = node[0]
+    if kind in ("range", "spill", "array", "name", "call"):
+        return True
+    if kind == "bin":
+        return _node_may_array(node[2]) or _node_may_array(node[3])
+    if kind in ("neg", "pct"):
+        return _node_may_array(node[1])
+    if kind == "func":
+        return node[1] in _ARRAY_FUNCS or node[1] not in _FUNCS and node[1] not in _LAZY_FUNCS or \
+            (node[1] in _LIFTED and any(map(_node_may_array, node[2])))
+    return False
+
+
+# functions of Excel 365 (or ones Excel before it only ran as Ctrl+Shift+Enter formulas): a formula using
+# them is saved as a dynamic-array formula
+_DYNAMIC_FUNCS = _ARRAY_FUNCS - {"INDEX", "INDIRECT", "IF", "IFS", "SWITCH", "CHOOSE", "IFERROR", "IFNA", "OFFSET",
+                                 "XLOOKUP"}
+_DYNAMIC = {}
+
+
+def _dynamic_formula(raw):
+    """Whether a formula works on arrays where Excel before 365 would take one value (=SUM(A1:A3*B1:B3),
+    =LEN(A1:A3), FILTER...): Excel only calculates it the same way when the file marks it as a dynamic array."""
+    hit = _DYNAMIC.get(raw)
+    if hit is None:
+        if len(_DYNAMIC) > 50000:
+            _DYNAMIC.clear()
+        hit = _DYNAMIC[raw] = _node_dynamic(parse_formula(raw))
+    return hit
+
+
+def _node_dynamic(node, native=False):
+    """(native: inside SUMPRODUCT, which always took its arguments as arrays)"""
+    kind = node[0]
+    if kind in ("spill", "call"):
+        return True
+    if kind == "bin":
+        return not native and (_node_may_array(node[2]) or _node_may_array(node[3])) or \
+            _node_dynamic(node[2], native) or _node_dynamic(node[3], native)
+    if kind in ("neg", "pct"):
+        return not native and _node_may_array(node[1]) or _node_dynamic(node[1], native)
+    if kind == "func":
+        if node[1] in _DYNAMIC_FUNCS or (not native and node[1] in _LIFTED and any(map(_node_may_array, node[2]))):
+            return True
+        native = native or node[1] == "SUMPRODUCT"
+        return any(_node_dynamic(n, native) for n in node[2])
+    return False
+
+
 # ------------------------------------------------------------------ ranges
 
-class RangeRef:
+class Block:
+    """A rectangle of values handed to functions: worksheet cells (RangeRef) or values a formula worked
+    out (Array). Subclasses give nrows, ncols and value(i, j)."""
+
+    __slots__ = ()
+
+    def rows(self):
+        return [[self.value(i, j) for j in range(self.ncols)] for i in range(self.nrows)]
+
+    def flat(self):
+        return [v for row in self.rows() for v in row]
+
+    def line(self):
+        """Values of a one-row or one-column block, in order; None for a 2-D block."""
+        if self.ncols == 1:
+            return [self.value(i, 0) for i in range(self.nrows)]
+        if self.nrows == 1:
+            return [self.value(0, j) for j in range(self.ncols)]
+        return None
+
+
+class RangeRef(Block):
     """A rectangular block of cells, handed to functions without being evaluated."""
 
     __slots__ = ("wb", "sheet", "r1", "c1", "r2", "c2")
@@ -880,32 +1314,170 @@ class RangeRef:
             return None
         return self.wb.get_value(self.sheet, r, c)
 
-    def rows(self):
-        return [[self.value(i, j) for j in range(self.ncols)] for i in range(self.nrows)]
-
-    def flat(self):
-        return [v for row in self.rows() for v in row]
+    def stored(self):
+        """(row, col) of the cells holding something, row by row; only the part of the range within the
+        sheet's data is looked at (=SUM(A:A) or A1:A50000 on a sheet of 2000 rows), and on large sparse
+        ranges only stored cells are visited. Cells a dynamic array spills into count too."""
+        spilled = [k for k in self.wb.spill_map(self.sheet, self.r2, self.c2)
+                   if self.r1 <= k[0] <= self.r2 and self.c1 <= k[1] <= self.c2]
+        cells = self.wb.sheets[self.sheet].cells
+        rows, cols = cells.extent()
+        r2, c2 = min(self.r2, rows - 1), min(self.c2, cols - 1)
+        if r2 < self.r1 or c2 < self.c1:
+            found = []
+        elif (r2 - self.r1 + 1) * (c2 - self.c1 + 1) <= len(cells):
+            found = [(r, c) for r in range(self.r1, r2 + 1) for c in range(self.c1, c2 + 1) if (r, c) in cells]
+        else:
+            found = sorted(k for k in cells if self.r1 <= k[0] <= r2 and self.c1 <= k[1] <= c2)
+        return sorted(found + spilled) if spilled else found
 
     def values(self):
-        """Non-empty values row by row; on large sparse ranges only stored cells are visited."""
-        cells = self.wb.sheets[self.sheet].cells
-        if self.nrows * self.ncols <= len(cells):
-            for i in range(self.nrows):
-                for j in range(self.ncols):
-                    v = self.value(i, j)
-                    if v is not None:
-                        yield v
-        else:
-            keys = sorted(k for k in cells if self.r1 <= k[0] <= self.r2 and self.c1 <= k[1] <= self.c2)
-            for r, c in keys:
-                v = self.wb.get_value(self.sheet, r, c)
-                if v is not None:
-                    yield v
+        """Non-empty values row by row."""
+        for r, c in self.stored():
+            v = self.wb.get_value(self.sheet, r, c)
+            if v is not None:
+                yield v
+
+    def part(self, i, by_row):
+        """Row i (by_row) or column i of the range, as a range."""
+        if by_row:
+            return RangeRef(self.wb, self.sheet, self.r1 + i, self.c1, self.r1 + i, self.c2)
+        return RangeRef(self.wb, self.sheet, self.r1, self.c1 + i, self.r2, self.c1 + i)
+
+
+class Array(Block):
+    """Values a formula worked out, in rows of equal length - what a dynamic-array formula spills."""
+
+    __slots__ = ("data",)
+
+    def __init__(self, rows):
+        data = [list(row) for row in rows]
+        if not data or not data[0]:
+            raise CellError(CALC)  # Excel's "empty array"
+        width = max(map(len, data))
+        for row in data:
+            row.extend([CellError(NA)] * (width - len(row)))
+        self.data = data
+
+    @property
+    def nrows(self):
+        return len(self.data)
+
+    @property
+    def ncols(self):
+        return len(self.data[0])
+
+    def value(self, i, j):
+        return self.data[i][j]
+
+    def rows(self):
+        return self.data
+
+    def values(self):
+        return (v for row in self.data for v in row if v is not None)
+
+    def part(self, i, by_row):
+        return Array([self.data[i]]) if by_row else Array([[row[i]] for row in self.data])
+
+
+class Lambda:
+    """A LAMBDA: parameter names, the body to calculate and the names it was made among (LET, outer
+    LAMBDAs). Calling it calculates the body with the parameters set to the arguments."""
+
+    __slots__ = ("wb", "params", "body", "scope", "sheet")
+
+    def __init__(self, wb, params, body, scope, sheet):
+        self.wb, self.params, self.body, self.scope, self.sheet = wb, params, body, scope, sheet
+
+    def __call__(self, *args):
+        if len(args) != len(self.params):
+            raise CellError(VALUE)
+        wb = self.wb
+        wb._scopes.append({**self.scope, **dict(zip(self.params, args))})
+        try:
+            return wb._eval(self.body, self.sheet)
+        finally:
+            wb._scopes.pop()
+
+
+def is_array(x):
+    """True for a value holding several values: a worked-out array or a range of two or more cells."""
+    return isinstance(x, Array) or (isinstance(x, RangeRef) and (x.nrows > 1 or x.ncols > 1))
+
+
+def as_block(x):
+    """x as a Block: ranges and arrays as they are, a single value as a 1x1 array."""
+    if isinstance(x, Block):
+        return x
+    if isinstance(x, (RangeAreas, Lambda)):
+        raise CellError(VALUE)
+    return Array([[x]])
+
+
+def _safely(func, args):
+    """func(*args) with Python's errors turned into Excel's."""
+    try:
+        result = func(*args)
+    except CellError:
+        raise
+    except TypeError:  # wrong number of arguments
+        raise CellError(VALUE) from None
+    except ZeroDivisionError:
+        raise CellError(DIV0) from None
+    except (ValueError, OverflowError, InvalidOperation, statistics.StatisticsError):
+        raise CellError(NUM) from None
+    return _finite(result)
+
+
+def _elementwise(func, *args, errors=False):
+    """func applied item by item across array arguments, as Excel calculates =A1:A5*2 or =LEN(B2:B9): a
+    single value, row or column is repeated to the size of the others, and positions beyond a smaller
+    array get #N/A. An error item gives that error in its place (with errors=True func gets it itself)."""
+    blocks = [as_block(a) if is_array(a) else None for a in args]
+    rows = max(b.nrows for b in blocks if b)
+    cols = max(b.ncols for b in blocks if b)
+    grids = [b.rows() if b else None for b in blocks]
+    singles = []
+    for a, b in zip(args, blocks):
+        try:
+            singles.append(None if b else scalar(a))
+        except CellError as err:
+            singles.append(CellError(err.code))
+    out = []
+    for i in range(rows):
+        row = []
+        for j in range(cols):
+            items = []
+            for g, single in zip(grids, singles):
+                if g is None:
+                    items.append(single)
+                else:
+                    ii, jj = (0 if len(g) == 1 else i), (0 if len(g[0]) == 1 else j)
+                    items.append(g[ii][jj] if ii < len(g) and jj < len(g[0]) else CellError(NA))
+            bad = None if errors else next((v for v in items if isinstance(v, CellError)), None)
+            if bad is not None:
+                row.append(CellError(bad.code))
+                continue
+            try:
+                row.append(_safely(func, items))
+            except CellError as err:
+                row.append(CellError(err.code))
+        out.append(row)
+    return Array(out)
+
+
+class RangeAreas(tuple):
+    """The same block on several sheets - a 3-D reference such as Sheet1:Sheet3!A1:B5 - as one RangeRef
+    per sheet; functions such as SUM get them as separate arguments, as in Excel."""
 
 
 def scalar(x):
-    """Single value of an argument: a one-cell range is dereferenced, larger ones are an error."""
-    if isinstance(x, RangeRef):
+    """Single value of an argument: a one-cell range or array is dereferenced, larger ones are an error."""
+    if isinstance(x, RangeAreas):
+        raise CellError(VALUE)
+    if isinstance(x, Lambda):
+        raise CellError(CALC)
+    if isinstance(x, Block):
         if x.nrows == 1 and x.ncols == 1:
             v = x.value(0, 0)
             if isinstance(v, CellError):
@@ -920,7 +1492,8 @@ def scalar(x):
 _FUNCS = {}
 _LAZY_FUNCS = {}  # take (workbook, argument nodes, sheet) and evaluate only what they need
 
-_FUNC_FORMATS = {"TODAY": "dd/mm/yyyy", "DATE": "dd/mm/yyyy", "NOW": "dd/mm/yyyy hh:mm"}
+_FUNC_FORMATS = {"TODAY": "dd/mm/yyyy", "DATE": "dd/mm/yyyy", "NOW": "dd/mm/yyyy hh:mm", "EDATE": "dd/mm/yyyy",
+                 "EOMONTH": "dd/mm/yyyy", "WORKDAY": "dd/mm/yyyy", "DATEVALUE": "dd/mm/yyyy", "TIME": "hh:mm"}
 
 
 def _register(*names, lazy=False):
@@ -963,9 +1536,14 @@ def _raise_if_error(v):
     return v
 
 
+def _block_arg(x):
+    """A table or list argument: a range, an array or (as a 1x1 array) a single value."""
+    return as_block(x)
+
+
 def _peek(x):
     """Value of a one-cell argument without raising the error it may hold."""
-    if isinstance(x, RangeRef) and x.nrows == 1 and x.ncols == 1:
+    if isinstance(x, Block) and x.nrows == 1 and x.ncols == 1:
         return x.value(0, 0)
     return x
 
@@ -973,7 +1551,7 @@ def _peek(x):
 def _numbers(args):
     """Numbers for SUM/AVERAGE/...: ranges contribute numeric cells only, literals are coerced."""
     for a in args:
-        if isinstance(a, RangeRef):
+        if isinstance(a, Block):
             for v in a.values():
                 if is_number(_raise_if_error(v)):
                     yield float(v)
@@ -983,7 +1561,7 @@ def _numbers(args):
 
 def _flat(args):
     for a in args:
-        if isinstance(a, RangeRef):
+        if isinstance(a, Block):
             for v in a.flat():
                 yield _raise_if_error(v)
         else:
@@ -1037,7 +1615,7 @@ def _f_median(*args):
     return float(statistics.median(nums))
 
 
-@_register("STDEV")
+@_register("STDEV", "STDEV.S")
 def _f_stdev(*args):
     nums = list(_numbers(args))
     if len(nums) < 2:
@@ -1045,7 +1623,7 @@ def _f_stdev(*args):
     return statistics.stdev(nums)
 
 
-@_register("VAR")
+@_register("VAR", "VAR.S")
 def _f_var(*args):
     nums = list(_numbers(args))
     if len(nums) < 2:
@@ -1053,11 +1631,98 @@ def _f_var(*args):
     return statistics.variance(nums)
 
 
+@_register("STDEVP", "STDEV.P")
+def _f_stdevp(*args):
+    nums = list(_numbers(args))
+    if not nums:
+        raise CellError(DIV0)
+    return statistics.pstdev(nums)
+
+
+@_register("VARP", "VAR.P")
+def _f_varp(*args):
+    nums = list(_numbers(args))
+    if not nums:
+        raise CellError(DIV0)
+    return statistics.pvariance(nums)
+
+
+def _kth(args, k, largest):
+    nums = sorted(_numbers([args]), reverse=largest)
+    k = math.ceil(_num(k))
+    if not 1 <= k <= len(nums):
+        raise CellError(NUM)
+    return nums[k - 1]
+
+
+@_register("LARGE")
+def _f_large(array, k):
+    return _kth(array, k, True)
+
+
+@_register("SMALL")
+def _f_small(array, k):
+    return _kth(array, k, False)
+
+
+def _rank(x, ref, order, average):
+    v = _num(x)
+    nums = list(_numbers([_range_arg(ref)]))
+    if v not in nums:
+        raise CellError(NA)
+    ascending = order is not None and _num(order) != 0
+    better = sum(1 for n in nums if (n < v if ascending else n > v))
+    if not average:
+        return float(better + 1)
+    ties = nums.count(v)
+    return better + (ties + 1) / 2
+
+
+@_register("RANK", "RANK.EQ")
+def _f_rank(x, ref, order=None):
+    return _rank(x, ref, order, False)
+
+
+@_register("RANK.AVG")
+def _f_rank_avg(x, ref, order=None):
+    return _rank(x, ref, order, True)
+
+
+@_register("MODE", "MODE.SNGL")
+def _f_mode(*args):
+    nums = list(_numbers(args))
+    counts = Counter(nums)
+    best = max(counts.values(), default=0)
+    if best < 2:
+        raise CellError(NA)
+    return next(n for n in nums if counts[n] == best)  # the first one met wins ties, as in Excel
+
+
+@_register("PERCENTILE", "PERCENTILE.INC")
+def _f_percentile(array, k):
+    nums = sorted(_numbers([array]))
+    k = _num(k)
+    if not nums or not 0 <= k <= 1:
+        raise CellError(NUM)
+    pos = k * (len(nums) - 1)
+    lo = math.floor(pos)
+    hi = min(lo + 1, len(nums) - 1)
+    return nums[lo] + (nums[hi] - nums[lo]) * (pos - lo)
+
+
+@_register("QUARTILE", "QUARTILE.INC")
+def _f_quartile(array, quart):
+    q = math.trunc(_num(quart))
+    if not 0 <= q <= 4:
+        raise CellError(NUM)
+    return _f_percentile(array, q / 4)
+
+
 @_register("COUNT")
 def _f_count(*args):
     n = 0
     for a in args:
-        if isinstance(a, RangeRef):
+        if isinstance(a, Block):
             n += sum(1 for v in a.values() if is_number(v))
         elif is_number(a) or isinstance(a, bool):
             n += 1
@@ -1066,7 +1731,7 @@ def _f_count(*args):
 
 @_register("COUNTA")
 def _f_counta(*args):
-    return sum(sum(1 for _ in a.values()) if isinstance(a, RangeRef) else int(a is not None) for a in args)
+    return sum(sum(1 for _ in a.values()) if isinstance(a, Block) else int(a is not None) for a in args)
 
 
 @_register("COUNTBLANK")
@@ -1189,7 +1854,7 @@ def _f_randbetween(a, b):
 def _f_sumproduct(*ranges):
     if not ranges:
         raise CellError(VALUE)
-    ranges = [_range_arg(r) for r in ranges]
+    ranges = [_block_arg(r) for r in ranges]
     shape = (ranges[0].nrows, ranges[0].ncols)
     if any((r.nrows, r.ncols) != shape for r in ranges):
         raise CellError(VALUE)
@@ -1205,10 +1870,132 @@ def _f_sumproduct(*ranges):
     return total
 
 
+@_register("SUMSQ")
+def _f_sumsq(*args):
+    return math.fsum(x * x for x in _numbers(args))
+
+
+@_register("MROUND")
+def _f_mround(x, multiple):
+    v, m = _num(x), _num(multiple)
+    if m == 0:
+        return 0.0
+    if v * m < 0:
+        raise CellError(NUM)
+    return _quantize(v / m, 0, ROUND_HALF_UP) * m
+
+
+@_register("QUOTIENT")
+def _f_quotient(a, b):
+    a, b = _num(a), _num(b)
+    if b == 0:
+        raise CellError(DIV0)
+    return float(math.trunc(a / b))
+
+
+def _whole_numbers(args):
+    nums = [math.trunc(x) for x in _numbers(args)]
+    if any(x < 0 for x in nums):
+        raise CellError(NUM)
+    return nums
+
+
+@_register("GCD")
+def _f_gcd(*args):
+    return float(math.gcd(*_whole_numbers(args)))
+
+
+@_register("LCM")
+def _f_lcm(*args):
+    return float(math.lcm(*_whole_numbers(args)))
+
+
+@_register("FACT")
+def _f_fact(x):
+    n = math.trunc(_num(x))
+    if n < 0 or n > 170:
+        raise CellError(NUM)
+    return float(math.factorial(n))
+
+
+@_register("COMBIN")
+def _f_combin(n, k):
+    n, k = math.trunc(_num(n)), math.trunc(_num(k))
+    if n < 0 or k < 0 or k > n:
+        raise CellError(NUM)
+    return float(math.comb(n, k))
+
+
+def _away_from_zero(v, parity):
+    """Round away from zero to the nearest even (parity 0) or odd (parity 1) integer."""
+    n = math.ceil(abs(v))
+    if n % 2 != parity:
+        n += 1
+    return float(math.copysign(n, v)) if v else float(parity)
+
+
+@_register("EVEN")
+def _f_even(x):
+    return _away_from_zero(_num(x), 0)
+
+
+@_register("ODD")
+def _f_odd(x):
+    return _away_from_zero(_num(x), 1)
+
+
+def _unary_math(name, func):
+    _register(name)(lambda x: func(_num(x)))
+
+
+for _name, _func in (("SIN", math.sin), ("COS", math.cos), ("TAN", math.tan), ("ASIN", math.asin),
+                     ("ACOS", math.acos), ("ATAN", math.atan), ("DEGREES", math.degrees),
+                     ("RADIANS", math.radians)):
+    _unary_math(_name, _func)
+
+
+@_register("ATAN2")
+def _f_atan2(x, y):
+    x, y = _num(x), _num(y)
+    if x == 0 and y == 0:
+        raise CellError(DIV0)
+    return math.atan2(y, x)  # Excel takes x first
+
+
+_SUBTOTALS = {1: "AVERAGE", 2: "COUNT", 3: "COUNTA", 4: "MAX", 5: "MIN", 6: "PRODUCT", 7: "STDEV",
+              8: "STDEVP", 9: "SUM", 10: "VAR", 11: "VARP"}
+_SUBTOTAL_RE = re.compile(r"=\s*SUBTOTAL\s*\(", re.I)
+
+
+@_register("SUBTOTAL")
+def _f_subtotal(kind, *refs):
+    """Aggregate that skips rows hidden by a filter (and, for codes 101-111, by hand) and
+    cells that are themselves SUBTOTALs."""
+    k = _int(kind)
+    name = _SUBTOTALS.get(k - 100 if k > 100 else k)
+    if name is None or not refs:
+        raise CellError(VALUE)
+    values = []
+    for ref in refs:
+        rng = _range_arg(ref)
+        sh = rng.wb.sheets[rng.sheet]
+        filtered = sh.filter["hidden"] if sh.filter else ()
+        for r, c in rng.stored():
+            if r in filtered or (k > 100 and r in sh.hidden_rows) or _SUBTOTAL_RE.match(sh.cells[(r, c)]):
+                continue
+            values.append(_raise_if_error(rng.wb.get_value(rng.sheet, r, c)))
+    if name == "COUNTA":
+        return len(values)
+    nums = [float(v) for v in values if is_number(v)]
+    if name == "COUNT":
+        return len(nums)
+    return _FUNCS[name](*nums)
+
+
 # logic
 def _logicals(args):
     for a in args:
-        if isinstance(a, RangeRef):
+        if isinstance(a, Block):
             for v in a.values():
                 v = _raise_if_error(v)
                 if isinstance(v, bool):
@@ -1262,7 +2049,13 @@ def _f_false():
 def _f_if(wb, nodes, sheet):
     if len(nodes) not in (2, 3):
         raise CellError(VALUE)
-    if to_bool(scalar(wb._eval(nodes[0], sheet))):
+    test = wb._eval(nodes[0], sheet)
+    if is_array(test):  # =IF(B2:B9>5, "yes", "no"): one answer per item
+        yes = wb._eval(nodes[1], sheet)
+        no = wb._eval(nodes[2], sheet) if len(nodes) == 3 else False
+        return _elementwise(lambda t, a, b: t if isinstance(t, CellError) else a if to_bool(t) else b,
+                            test, yes, no, errors=True)
+    if to_bool(scalar(test)):
         return wb._eval(nodes[1], sheet)
     return wb._eval(nodes[2], sheet) if len(nodes) == 3 else False
 
@@ -1277,26 +2070,47 @@ def _f_ifs(wb, nodes, sheet):
     raise CellError(NA)
 
 
+@_register("SWITCH", lazy=True)
+def _f_switch(wb, nodes, sheet):
+    if len(nodes) < 3:
+        raise CellError(VALUE)
+    value = scalar(wb._eval(nodes[0], sheet))
+    pairs = nodes[1:]
+    for i in range(0, len(pairs) - 1, 2):
+        if compare("=", value, scalar(wb._eval(pairs[i], sheet))):
+            return wb._eval(pairs[i + 1], sheet)
+    if len(pairs) % 2:
+        return wb._eval(pairs[-1], sheet)
+    raise CellError(NA)
+
+
 @_register("IFERROR", lazy=True)
 def _f_iferror(wb, nodes, sheet):
     if len(nodes) != 2:
         raise CellError(VALUE)
+    return _if_error(wb, nodes, sheet, lambda code: True)
+
+
+def _if_error(wb, nodes, sheet, caught):
+    """IFERROR / IFNA: the value, or the fallback for errors `caught(code)` accepts - item by item for an array."""
     try:
-        return scalar(wb._eval(nodes[0], sheet))
-    except CellError:
+        value = wb._eval(nodes[0], sheet)
+        if not is_array(value):
+            return scalar(value)
+    except CellError as err:
+        if not caught(err.code):
+            raise
         return wb._eval(nodes[1], sheet)
+    fallback = wb._eval(nodes[1], sheet)
+    return _elementwise(lambda v, f: f if isinstance(v, CellError) and caught(v.code) else v, value, fallback,
+                        errors=True)
 
 
 @_register("IFNA", lazy=True)
 def _f_ifna(wb, nodes, sheet):
     if len(nodes) != 2:
         raise CellError(VALUE)
-    try:
-        return scalar(wb._eval(nodes[0], sheet))
-    except CellError as err:
-        if err.code != NA:
-            raise
-        return wb._eval(nodes[1], sheet)
+    return _if_error(wb, nodes, sheet, lambda code: code == NA)
 
 
 def _error_code(wb, nodes, sheet):
@@ -1344,6 +2158,38 @@ def _f_islogical(x):
     return isinstance(_peek(x), bool)
 
 
+@_register("ISNONTEXT")
+def _f_isnontext(x):
+    return not isinstance(_peek(x), str)
+
+
+@_register("ISEVEN")
+def _f_iseven(x):
+    return math.trunc(_num(x)) % 2 == 0
+
+
+@_register("ISODD")
+def _f_isodd(x):
+    return math.trunc(_num(x)) % 2 == 1
+
+
+@_register("HYPERLINK")
+def _f_hyperlink(link, name=None):
+    """Shows `name` (or the link); clicking the cell opens the link (see hyperlink_at)."""
+    return scalar(link) if name is None else scalar(name)
+
+
+@_register("ISFORMULA")
+def _f_isformula(ref):
+    rng = _range_arg(ref)
+    return is_formula(rng.wb.get_raw(rng.sheet, rng.r1, rng.c1))
+
+
+@_register("NA")
+def _f_na():
+    raise CellError(NA)
+
+
 @_register("ROW", lazy=True)
 def _f_row(wb, nodes, sheet):
     if not nodes:
@@ -1360,14 +2206,37 @@ def _f_column(wb, nodes, sheet):
     return float(_range_arg(ref).c1 + 1)
 
 
+@_register("SINGLE", lazy=True)
+def _f_single(wb, nodes, sheet):
+    """Excel's implicit intersection (shown as @ in Excel): the cell of a range in the formula's own row
+    or column, or the first value of an array."""
+    if len(nodes) != 1:
+        raise CellError(VALUE)
+    x = wb._eval(nodes[0], sheet)
+    if isinstance(x, RangeRef):
+        _, row, col = wb._stack[-1]
+        if x.nrows == 1 and x.ncols == 1:
+            v = x.value(0, 0)
+        elif x.ncols == 1 and x.r1 <= row <= x.r2:
+            v = x.value(row - x.r1, 0)
+        elif x.nrows == 1 and x.c1 <= col <= x.c2:
+            v = x.value(0, col - x.c1)
+        else:
+            raise CellError(VALUE)
+        return 0.0 if v is None else _raise_if_error(v)
+    if isinstance(x, Block):
+        return _raise_if_error(x.value(0, 0))
+    return x
+
+
 @_register("ROWS")
 def _f_rows(rng):
-    return _range_arg(rng).nrows
+    return _block_arg(rng).nrows
 
 
 @_register("COLUMNS")
 def _f_columns(rng):
-    return _range_arg(rng).ncols
+    return _block_arg(rng).ncols
 
 
 @_register("CHOOSE")
@@ -1527,6 +2396,42 @@ def _f_code(x):
     return ord(s[0])
 
 
+def _split_at(x, delimiter, instance, match_mode, match_end):
+    """Text before and after the n-th delimiter (counting from the end when n < 0). `delimiter` may be
+    several (an array); match_mode 1 ignores case; with match_end the text's end counts as a delimiter."""
+    s = _text(x)
+    n = 1 if instance is None else _int(instance)
+    if n == 0 or abs(n) > len(s) + 1:
+        raise CellError(VALUE)
+    found = [(m.start(), m.end()) for m in _delimiters(delimiter, re.I if match_mode and _int(match_mode) == 1 else 0)
+             .finditer(s)]
+    if match_end is not None and _bool(match_end):
+        found = [(0, 0)] + found + [(len(s), len(s))] if n < 0 else found + [(len(s), len(s))]
+    if abs(n) > len(found):
+        raise CellError(NA)
+    start, end = found[n - 1] if n > 0 else found[n]
+    return s[:start], s[end:]
+
+
+def _text_part(x, delimiter, instance, match_mode, match_end, if_not_found, which):
+    try:
+        return _split_at(x, delimiter, instance, match_mode, match_end)[which]
+    except CellError as err:
+        if err.code != NA or if_not_found is None:
+            raise
+        return scalar(if_not_found)
+
+
+@_register("TEXTBEFORE")
+def _f_textbefore(x, delimiter, instance=None, match_mode=None, match_end=None, if_not_found=None):
+    return _text_part(x, delimiter, instance, match_mode, match_end, if_not_found, 0)
+
+
+@_register("TEXTAFTER")
+def _f_textafter(x, delimiter, instance=None, match_mode=None, match_end=None, if_not_found=None):
+    return _text_part(x, delimiter, instance, match_mode, match_end, if_not_found, 1)
+
+
 # dates
 @_register("TODAY")
 def _f_today():
@@ -1584,6 +2489,125 @@ def _f_days(end, start):
     return math.floor(_num(end)) - math.floor(_num(start))
 
 
+@_register("SECOND")
+def _f_second(x):
+    return serial_to_datetime(_num(x) + 1 / 172800).second
+
+
+@_register("TIME")
+def _f_time(h, m, s):
+    total = _int(h) * 3600 + _int(m) * 60 + _int(s)
+    if total < 0:
+        raise CellError(NUM)
+    return (total % 86400) / 86400
+
+
+@_register("DATEVALUE")
+def _f_datevalue(x):
+    value, fmt = parse_literal(_text(x))
+    if not (fmt and is_date_format(fmt)):
+        raise CellError(VALUE)
+    return float(math.floor(value))
+
+
+def _date_of(x):
+    return serial_to_datetime(math.floor(_num(x))).date()
+
+
+def _plus_months(d, months):
+    """(year, month) `months` after the month of date d."""
+    y, m = divmod(d.month - 1 + months, 12)
+    if not 1 <= d.year + y <= 9999:
+        raise CellError(NUM)
+    return d.year + y, m + 1
+
+
+@_register("EDATE")
+def _f_edate(start, months):
+    d = _date_of(start)
+    y, m = _plus_months(d, math.trunc(_num(months)))
+    return date_to_serial(dt.date(y, m, min(d.day, calendar.monthrange(y, m)[1])))
+
+
+@_register("EOMONTH")
+def _f_eomonth(start, months):
+    y, m = _plus_months(_date_of(start), math.trunc(_num(months)))
+    return date_to_serial(dt.date(y, m, calendar.monthrange(y, m)[1]))
+
+
+def _is_weekend(serial):
+    return (serial + 5) % 7 >= 5  # serial 0 (30/12/1899) was a Saturday
+
+
+def _holidays(arg):
+    return set() if arg is None else {math.floor(v) for v in _numbers([arg])}
+
+
+@_register("NETWORKDAYS")
+def _f_networkdays(start, end, holidays=None):
+    a, b = math.floor(_num(start)), math.floor(_num(end))
+    sign = 1 if a <= b else -1
+    a, b = min(a, b), max(a, b)
+    weeks, rest = divmod(b - a + 1, 7)
+    count = weeks * 5 + sum(1 for d in range(b - rest + 1, b + 1) if not _is_weekend(d))
+    count -= sum(1 for d in _holidays(holidays) if a <= d <= b and not _is_weekend(d))
+    return float(sign * count)
+
+
+@_register("WORKDAY")
+def _f_workday(start, days, holidays=None):
+    d, n = math.floor(_num(start)), math.trunc(_num(days))
+    if abs(n) > 1_000_000:
+        raise CellError(NUM)
+    skip, step = _holidays(holidays), 1 if n >= 0 else -1
+    while n:
+        d += step
+        if not _is_weekend(d) and d not in skip:
+            n -= step
+    return float(d)
+
+
+@_register("DATEDIF")
+def _f_datedif(start, end, unit):
+    a, b, unit = _date_of(start), _date_of(end), _text(unit).upper()
+    if a > b:
+        raise CellError(NUM)
+    months = (b.year - a.year) * 12 + b.month - a.month - (b.day < a.day)
+
+    def shifted(d, n):  # d moved n months on, the day clamped to the month's length
+        y, m = _plus_months(d, n)
+        return dt.date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+    if unit == "D":
+        return float((b - a).days)
+    if unit == "M":
+        return float(months)
+    if unit == "Y":
+        return float(months // 12)
+    if unit == "YM":
+        return float(months % 12)
+    if unit == "MD":
+        return float((b - shifted(a, months)).days)
+    if unit == "YD":
+        return float((b - shifted(a, months // 12 * 12)).days)
+    raise CellError(NUM)
+
+
+@_register("WEEKNUM")
+def _f_weeknum(x, kind=1):
+    d, kind = _date_of(x), _int(kind)
+    if kind not in (1, 2):
+        raise CellError(NUM)
+    jan1 = dt.date(d.year, 1, 1)
+    offset = (jan1.weekday() + 1) % 7 if kind == 1 else jan1.weekday()  # days of week 1 before Jan 1
+    return float((d.timetuple().tm_yday - 1 + offset) // 7 + 1)
+
+
+@_register("ISOWEEKNUM")
+def _f_isoweeknum(x):
+    return float(_date_of(x).isocalendar()[1])
+
+
 # lookup
 def _match_index(items, key, mode):
     """Position of `key` in items: mode 0 exact, 1 largest <= key, -1 smallest >= key."""
@@ -1609,7 +2633,7 @@ def _match_index(items, key, mode):
 
 @_register("VLOOKUP")
 def _f_vlookup(key, table, col, approx=True):
-    table, ci = _range_arg(table), _int(col)
+    table, ci = _block_arg(table), _int(col)
     if ci < 1:
         raise CellError(VALUE)
     if ci > table.ncols:
@@ -1620,7 +2644,7 @@ def _f_vlookup(key, table, col, approx=True):
 
 @_register("HLOOKUP")
 def _f_hlookup(key, table, row, approx=True):
-    table, ri = _range_arg(table), _int(row)
+    table, ri = _block_arg(table), _int(row)
     if ri < 1:
         raise CellError(VALUE)
     if ri > table.nrows:
@@ -1631,11 +2655,15 @@ def _f_hlookup(key, table, row, approx=True):
 
 @_register("INDEX")
 def _f_index(table, row, col=None):
-    table, r = _range_arg(table), _int(row)
+    table, r = _block_arg(table), _int(row)
     if col is None:
         r, c = (1, r) if table.nrows == 1 else (r, 1)
     else:
         c = _int(col)
+    if r == 0 and 1 <= c <= table.ncols:  # a whole column (or row, below) of the table
+        return table.part(c - 1, False)
+    if c == 0 and 1 <= r <= table.nrows:
+        return table.part(r - 1, True)
     if not (1 <= r <= table.nrows and 1 <= c <= table.ncols):
         raise CellError(REF)
     return _raise_if_error(table.value(r - 1, c - 1))
@@ -1643,11 +2671,567 @@ def _f_index(table, row, col=None):
 
 @_register("MATCH")
 def _f_match(key, rng, mode=1):
-    rng = _range_arg(rng)
+    rng = _block_arg(rng)
     if rng.nrows != 1 and rng.ncols != 1:
         raise CellError(NA)
     m = _int(mode)
     return _match_index(rng.flat(), scalar(key), (m > 0) - (m < 0)) + 1
+
+
+def _wildcard_re(text):
+    """Regex for an Excel pattern where * is any run of characters and ? any one character."""
+    return re.compile("".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in text), re.S)
+
+
+def _xmatch_index(items, key, match_mode, search_mode):
+    """Position of `key` for XLOOKUP/XMATCH: match_mode 0 exact, -1 exact or next smaller,
+    1 exact or next larger, 2 wildcard; a negative search_mode searches from the end."""
+    if match_mode not in (-1, 0, 1, 2) or search_mode not in (-2, -1, 1, 2):
+        raise CellError(VALUE)
+    if key is None:
+        raise CellError(NA)
+    order = range(len(items)) if search_mode > 0 else range(len(items) - 1, -1, -1)
+    if match_mode == 2:
+        pattern = _wildcard_re(to_text(key).lower())
+        for i in order:
+            if isinstance(items[i], str) and pattern.fullmatch(items[i].lower()):
+                return i
+        raise CellError(NA)
+    rank, best = sort_key(key)[0], None
+    for i in order:
+        v = items[i]
+        if v is None or isinstance(v, CellError):
+            continue
+        if compare("=", v, key):
+            return i
+        if (match_mode and sort_key(v)[0] == rank and compare("<" if match_mode < 0 else ">", v, key)
+                and (best is None or compare(">" if match_mode < 0 else "<", v, items[best]))):
+            best = i
+    if best is None:
+        raise CellError(NA)
+    return best
+
+
+def _optional_int(wb, nodes, i, sheet, default):
+    if len(nodes) <= i or nodes[i][0] == "empty":
+        return default
+    return int(to_number(scalar(wb._eval(nodes[i], sheet))))
+
+
+@_register("XLOOKUP", lazy=True)
+def _f_xlookup(wb, nodes, sheet):
+    if not 3 <= len(nodes) <= 6:
+        raise CellError(VALUE)
+    key = wb._eval(nodes[0], sheet)
+    if is_array(key):  # several values looked up at once: an array of what each finds
+        def one(k):
+            if isinstance(k, CellError):
+                return k
+            found = _f_xlookup(wb, [("num", k)] + list(nodes[1:]), sheet)
+            return _blank_zero(_peek(found) if isinstance(found, Block) else found)
+        return _elementwise(one, as_block(key), errors=True)
+    key = scalar(key)
+    look = _block_arg(wb._eval(nodes[1], sheet))
+    result = _block_arg(wb._eval(nodes[2], sheet))
+    items = look.line()
+    by_row = look.ncols == 1
+    if items is None or (result.nrows if by_row else result.ncols) != len(items):
+        raise CellError(VALUE)
+    match_mode = _optional_int(wb, nodes, 4, sheet, 0)
+    search_mode = _optional_int(wb, nodes, 5, sheet, 1)
+    try:
+        i = _xmatch_index(items, key, match_mode, search_mode)
+    except CellError as err:
+        if err.code != NA or len(nodes) < 4 or nodes[3][0] == "empty":
+            raise
+        return wb._eval(nodes[3], sheet)
+    return result.part(i, by_row)
+
+
+@_register("XMATCH")
+def _f_xmatch(key, rng, match_mode=None, search_mode=None):
+    items = _block_arg(rng).line()
+    if items is None:
+        raise CellError(VALUE)
+    match_mode = 0 if match_mode is None else _int(match_mode)
+    search_mode = 1 if search_mode is None else _int(search_mode)
+    return _xmatch_index(items, scalar(key), match_mode, search_mode) + 1
+
+
+# dynamic arrays (Excel 365): functions that give arrays, which spill into the cells around
+def _grid(x):
+    """Rows (lists) of an array argument; a single value is one row of one."""
+    return [list(row) for row in as_block(x).rows()]
+
+
+def _transposed(rows):
+    return [list(col) for col in zip(*rows)]
+
+
+def _blank_zero(v):
+    """An empty cell as dynamic arrays show it: 0."""
+    return 0.0 if v is None else v
+
+
+def _count_arg(x, default, low=1):
+    if x is None:
+        return default
+    n = _int(x)
+    if n < low:
+        raise CellError(VALUE)
+    return n
+
+
+def _flag(x, default=False):
+    return default if x is None else _bool(x)
+
+
+@_register("FILTER", lazy=True)
+def _f_filter(wb, nodes, sheet):
+    if len(nodes) not in (2, 3):
+        raise CellError(VALUE)
+    data = _grid(wb._eval(nodes[0], sheet))
+    include = as_block(wb._eval(nodes[1], sheet))
+    flags = []
+    for v in include.flat():
+        v = _raise_if_error(v)
+        if isinstance(v, str):
+            raise CellError(VALUE)
+        flags.append(bool(v))
+    if include.ncols == 1 and include.nrows == len(data):
+        out = [row for row, keep in zip(data, flags) if keep]
+    elif include.nrows == 1 and include.ncols == len(data[0]):
+        keep = [j for j, f in enumerate(flags) if f]
+        out = [[row[j] for j in keep] for row in data] if keep else []
+    else:
+        raise CellError(VALUE)
+    if not out or not out[0]:
+        if len(nodes) == 3 and nodes[2][0] != "empty":
+            return wb._eval(nodes[2], sheet)
+        raise CellError(CALC)
+    return Array(out)
+
+
+def _sorted_rows(rows, keys):
+    """rows sorted by [(index, descending)] keys, the first key first (blanks sort as 0, as in Excel)."""
+    for index, descending in reversed(keys):
+        rows = sorted(rows, key=lambda row: sort_key(_blank_zero(row[index])), reverse=descending)
+    return rows
+
+
+def _sort_orders(order, count):
+    orders = [1] if order is None else [_int(v) for v in as_block(order).flat()]
+    if any(o not in (1, -1) for o in orders) or len(orders) not in (1, count):
+        raise CellError(VALUE)
+    return orders * count if len(orders) == 1 else orders
+
+
+@_register("SORT")
+def _f_sort(array, sort_index=None, sort_order=None, by_col=None):
+    data = _grid(array)
+    by_col = _flag(by_col)
+    if by_col:
+        data = _transposed(data)
+    indexes = [1] if sort_index is None else [_int(v) for v in as_block(sort_index).flat()]
+    if any(not 1 <= i <= len(data[0]) for i in indexes):
+        raise CellError(VALUE)
+    orders = _sort_orders(sort_order, len(indexes))
+    out = _sorted_rows(data, [(i - 1, o < 0) for i, o in zip(indexes, orders)])
+    return Array(_transposed(out) if by_col else out)
+
+
+@_register("SORTBY")
+def _f_sortby(array, *by):
+    data = _grid(array)
+    if not by:
+        raise CellError(VALUE)
+    keys, columns = [], None
+    for k in range(0, len(by), 2):
+        values = as_block(by[k])
+        order = _sort_orders(by[k + 1] if k + 1 < len(by) else None, 1)[0]
+        line = values.line()
+        if line is None:
+            raise CellError(VALUE)
+        by_rows = values.ncols == 1 and len(line) == len(data)
+        if not by_rows and not (values.nrows == 1 and len(line) == len(data[0])):
+            raise CellError(VALUE)
+        if columns is None:
+            columns = not by_rows
+        elif columns != (not by_rows):
+            raise CellError(VALUE)
+        keys.append((line, order < 0))
+    items = _transposed(data) if columns else data
+    order = list(range(len(items)))
+    for line, descending in reversed(keys):
+        order.sort(key=lambda i: sort_key(_blank_zero(line[i])), reverse=descending)
+    out = [items[i] for i in order]
+    return Array(_transposed(out) if columns else out)
+
+
+def _unique_key(v):
+    if isinstance(v, str):
+        return (1, v.lower())
+    if isinstance(v, CellError):
+        return (3, v.code)
+    return sort_key(_blank_zero(v))
+
+
+@_register("UNIQUE")
+def _f_unique(array, by_col=None, exactly_once=None):
+    data = _grid(array)
+    by_col = _flag(by_col)
+    if by_col:
+        data = _transposed(data)
+    counts, first = {}, {}
+    for row in data:
+        key = tuple(map(_unique_key, row))
+        counts[key] = counts.get(key, 0) + 1
+        first.setdefault(key, row)
+    out = [row for key, row in first.items() if not _flag(exactly_once) or counts[key] == 1]
+    if not out:
+        raise CellError(CALC)
+    return Array(_transposed(out) if by_col else out)
+
+
+def _array_size(rows, cols):
+    rows, cols = _count_arg(rows, 1, 0), _count_arg(cols, 1, 0)
+    if not rows or not cols:
+        raise CellError(CALC)  # an empty array
+    if rows > MAX_ROWS or cols > MAX_COLS or rows * cols > 5_000_000:
+        raise CellError(NUM)
+    return rows, cols
+
+
+@_register("SEQUENCE")
+def _f_sequence(rows, cols=None, start=None, step=None):
+    rows, cols = _array_size(rows, cols)
+    first = 1.0 if start is None else _num(start)
+    inc = 1.0 if step is None else _num(step)
+    return Array([[first + (i * cols + j) * inc for j in range(cols)] for i in range(rows)])
+
+
+@_register("RANDARRAY")
+def _f_randarray(rows=None, cols=None, low=None, high=None, whole=None):
+    rows, cols = _array_size(rows, cols)
+    low = 0.0 if low is None else _num(low)
+    high = 1.0 if high is None else _num(high)
+    if low > high:
+        raise CellError(VALUE)
+    if _flag(whole):
+        if int(low) != low or int(high) != high:
+            raise CellError(VALUE)
+        return Array([[float(random.randint(int(low), int(high))) for _ in range(cols)] for _ in range(rows)])
+    return Array([[random.uniform(low, high) for _ in range(cols)] for _ in range(rows)])
+
+
+@_register("MMULT")
+def _f_mmult(a, b):
+    a, b = _grid(a), _grid(b)
+    if len(a[0]) != len(b):
+        raise CellError(VALUE)
+    for v in itertools.chain.from_iterable(a + b):
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise CellError(VALUE)
+    cols = _transposed(b)
+    return Array([[math.fsum(x * y for x, y in zip(row, col)) for col in cols] for row in a])
+
+
+@_register("TRANSPOSE")
+def _f_transpose(array):
+    return Array(_transposed(_grid(array)))
+
+
+def _items(array, ignore, scan_by_column):
+    """The values of an array one by one, row by row (column by column), skipping blanks (ignore 1),
+    errors (2) or both (3)."""
+    data = _grid(array)
+    if _flag(scan_by_column):
+        data = _transposed(data)
+    ignore = 0 if ignore is None else _int(ignore)
+    if ignore not in (0, 1, 2, 3):
+        raise CellError(VALUE)
+    out = [v for row in data for v in row
+           if not (ignore & 1 and v is None) and not (ignore & 2 and isinstance(v, CellError))]
+    if not out:
+        raise CellError(CALC)
+    return out
+
+
+@_register("TOCOL")
+def _f_tocol(array, ignore=None, scan_by_column=None):
+    return Array([[v] for v in _items(array, ignore, scan_by_column)])
+
+
+@_register("TOROW")
+def _f_torow(array, ignore=None, scan_by_column=None):
+    return Array([_items(array, ignore, scan_by_column)])
+
+
+def _wrapped(vector, count, pad):
+    items = as_block(vector).line()
+    if items is None:
+        raise CellError(VALUE)
+    count = _count_arg(count, 1)
+    pad = CellError(NA) if pad is None else scalar(pad)
+    chunks = [items[i:i + count] for i in range(0, len(items), count)]
+    chunks[-1] += [pad] * (count - len(chunks[-1]))
+    return chunks
+
+
+@_register("WRAPROWS")
+def _f_wraprows(vector, wrap_count, pad_with=None):
+    return Array(_wrapped(vector, wrap_count, pad_with))
+
+
+@_register("WRAPCOLS")
+def _f_wrapcols(vector, wrap_count, pad_with=None):
+    return Array(_transposed(_wrapped(vector, wrap_count, pad_with)))
+
+
+def _picked(count, numbers):
+    """0-based positions for CHOOSEROWS / CHOOSECOLS numbers (negative ones count from the end)."""
+    out = []
+    for x in numbers:
+        for v in as_block(x).flat():
+            n = int(to_number(_raise_if_error(v)))
+            if n == 0 or abs(n) > count:
+                raise CellError(VALUE)
+            out.append(n - 1 if n > 0 else count + n)
+    if not out:
+        raise CellError(VALUE)
+    return out
+
+
+@_register("CHOOSEROWS")
+def _f_chooserows(array, *numbers):
+    data = _grid(array)
+    return Array([data[i] for i in _picked(len(data), numbers)])
+
+
+@_register("CHOOSECOLS")
+def _f_choosecols(array, *numbers):
+    data = _grid(array)
+    picked = _picked(len(data[0]), numbers)
+    return Array([[row[j] for j in picked] for row in data])
+
+
+def _span(count, n, take):
+    """Slice of `count` items that TAKE (take=True) or DROP keeps for n (None: all for TAKE, none for DROP)."""
+    if n is None:
+        return slice(0, count)
+    n = _int(n)
+    if take:
+        return slice(0, n) if n >= 0 else slice(max(0, count + n), count)
+    return slice(n, count) if n >= 0 else slice(0, max(0, count + n))
+
+
+@_register("TAKE")
+def _f_take(array, rows=None, cols=None):
+    data = _grid(array)
+    out = [row[_span(len(data[0]), cols, True)] for row in data[_span(len(data), rows, True)]]
+    return Array(out)
+
+
+@_register("DROP")
+def _f_drop(array, rows=None, cols=None):
+    data = _grid(array)
+    out = [row[_span(len(data[0]), cols, False)] for row in data[_span(len(data), rows, False)]]
+    return Array(out)
+
+
+@_register("EXPAND")
+def _f_expand(array, rows=None, cols=None, pad_with=None):
+    data = _grid(array)
+    rows = len(data) if rows is None else _int(rows)
+    cols = len(data[0]) if cols is None else _int(cols)
+    if rows < len(data) or cols < len(data[0]):
+        raise CellError(VALUE)
+    pad = CellError(NA) if pad_with is None else scalar(pad_with)
+    out = [row + [pad] * (cols - len(row)) for row in data] + [[pad] * cols for _ in range(rows - len(data))]
+    return Array(out)
+
+
+@_register("HSTACK")
+def _f_hstack(*arrays):
+    grids = [_grid(a) for a in arrays]
+    height = max(map(len, grids))
+    return Array([sum((g[i] if i < len(g) else [CellError(NA)] * len(g[0]) for g in grids), [])
+                  for i in range(height)])
+
+
+@_register("VSTACK")
+def _f_vstack(*arrays):
+    rows = [row for a in arrays for row in _grid(a)]
+    width = max(map(len, rows))
+    return Array([row + [CellError(NA)] * (width - len(row)) for row in rows])
+
+
+def _delimiters(x, flags):
+    """Regex for the delimiters of TEXTSPLIT (one text or an array of them), longest first."""
+    parts = sorted({to_text(_raise_if_error(v)) for v in as_block(x).flat() if v is not None}, key=len, reverse=True)
+    if not parts or not all(parts):
+        raise CellError(VALUE)
+    return re.compile("|".join(map(re.escape, parts)), flags)
+
+
+@_register("TEXTSPLIT")
+def _f_textsplit(text, col_delimiter=None, row_delimiter=None, ignore_empty=None, match_mode=None, pad_with=None):
+    text = _text(text)
+    flags = re.I if match_mode is not None and _int(match_mode) == 1 else 0
+    if col_delimiter is None and row_delimiter is None:
+        raise CellError(VALUE)
+    lines = _delimiters(row_delimiter, flags).split(text) if row_delimiter is not None else [text]
+    if _flag(ignore_empty):
+        lines = [line for line in lines if line]
+    rows = [_delimiters(col_delimiter, flags).split(line) if col_delimiter is not None else [line] for line in lines]
+    if _flag(ignore_empty):
+        rows = [[v for v in row if v] for row in rows]
+        rows = [row for row in rows if row]
+    if not rows:
+        raise CellError(CALC)
+    pad = CellError(NA) if pad_with is None else scalar(pad_with)
+    width = max(map(len, rows))
+    return Array([row + [pad] * (width - len(row)) for row in rows])
+
+
+# LAMBDA and the functions that take one
+@_register("LAMBDA", lazy=True)
+def _f_lambda(wb, nodes, sheet):
+    if not nodes or any(n[0] != "name" for n in nodes[:-1]):
+        raise CellError(VALUE)
+    scope = {}
+    for outer in wb._scopes:
+        scope.update(outer)
+    return Lambda(wb, [n[1] for n in nodes[:-1]], nodes[-1], scope, sheet)
+
+
+@_register("LET", lazy=True)
+def _f_let(wb, nodes, sheet):
+    if len(nodes) < 3 or len(nodes) % 2 == 0 or any(nodes[i][0] != "name" for i in range(0, len(nodes) - 1, 2)):
+        raise CellError(VALUE)
+    scope = {}
+    wb._scopes.append(scope)
+    try:
+        for i in range(0, len(nodes) - 1, 2):
+            scope[nodes[i][1]] = wb._eval(nodes[i + 1], sheet)
+        return wb._eval(nodes[-1], sheet)
+    finally:
+        wb._scopes.pop()
+
+
+def _lambda_arg(x, params):
+    if not isinstance(x, Lambda) or len(x.params) != params:
+        raise CellError(VALUE)
+    return x
+
+
+def _single(v):
+    """What a LAMBDA gave for one item of MAP / BYROW / SCAN...: a single value (an array is #CALC!)."""
+    if is_array(v) and (v.nrows > 1 or v.ncols > 1):
+        return CellError(CALC)
+    try:
+        return _blank_zero(scalar(v))
+    except CellError as err:
+        return CellError(err.code)
+
+
+@_register("MAP")
+def _f_map(*args):
+    if len(args) < 2:
+        raise CellError(VALUE)
+    func = _lambda_arg(args[-1], len(args) - 1)
+    arrays = [as_block(a) for a in args[:-1]]
+    return _elementwise(lambda *items: _single(func(*items)), *arrays, errors=True) if any(map(is_array, arrays)) \
+        else _single(func(*(a.value(0, 0) for a in arrays)))
+
+
+@_register("REDUCE")
+def _f_reduce(initial, array, func):
+    func = _lambda_arg(func, 2)
+    acc = None if initial is None else _peek(initial)
+    for row in _grid(array):
+        for v in row:
+            acc = func(acc, v)
+    return acc
+
+
+@_register("SCAN")
+def _f_scan(initial, array, func):
+    func = _lambda_arg(func, 2)
+    acc = None if initial is None else _peek(initial)
+    out = []
+    for row in _grid(array):
+        line = []
+        for v in row:
+            acc = _single(func(acc, v))
+            line.append(acc)
+        out.append(line)
+    return Array(out)
+
+
+@_register("BYROW")
+def _f_byrow(array, func):
+    func = _lambda_arg(func, 1)
+    return Array([[_single(func(Array([row])))] for row in _grid(array)])
+
+
+@_register("BYCOL")
+def _f_bycol(array, func):
+    func = _lambda_arg(func, 1)
+    return Array([[_single(func(Array([[v] for v in col]))) for col in _transposed(_grid(array))]])
+
+
+@_register("MAKEARRAY")
+def _f_makearray(rows, cols, func):
+    rows, cols = _array_size(rows, cols)
+    func = _lambda_arg(func, 2)
+    return Array([[_single(func(float(i + 1), float(j + 1))) for j in range(cols)] for i in range(rows)])
+
+
+@_register("OFFSET")
+def _f_offset(ref, rows, cols, height=None, width=None):
+    ref = _range_arg(ref)
+    r1, c1 = ref.r1 + _int(rows), ref.c1 + _int(cols)
+    h = ref.nrows if height is None else _int(height)
+    w = ref.ncols if width is None else _int(width)
+    if h == 0 or w == 0:
+        raise CellError(REF)
+    if h < 0:  # a negative height or width reaches up / left
+        r1, h = r1 + h + 1, -h
+    if w < 0:
+        c1, w = c1 + w + 1, -w
+    if r1 < 0 or c1 < 0 or r1 + h > MAX_ROWS or c1 + w > MAX_COLS:
+        raise CellError(REF)
+    return RangeRef(ref.wb, ref.sheet, r1, c1, r1 + h - 1, c1 + w - 1)
+
+
+_R1C1_RE = re.compile(r"R(\d+)C(\d+)(?::R(\d+)C(\d+))?", re.I)
+
+
+@_register("INDIRECT", lazy=True)
+def _f_indirect(wb, nodes, sheet):
+    if len(nodes) not in (1, 2):
+        raise CellError(VALUE)
+    text = to_text(scalar(wb._eval(nodes[0], sheet))).strip()
+    a1 = len(nodes) < 2 or nodes[1][0] == "empty" or to_bool(scalar(wb._eval(nodes[1], sheet)))
+    sheet_ref = None
+    if "!" in text:
+        sheet_ref, text = text.rsplit("!", 1)
+        if len(sheet_ref) >= 2 and sheet_ref[0] == sheet_ref[-1] == "'":
+            sheet_ref = sheet_ref[1:-1].replace("''", "'")
+    if a1:
+        rect = parse_range(text)
+    else:
+        m = _R1C1_RE.fullmatch(text)
+        if m:
+            ra, ca = int(m.group(1)) - 1, int(m.group(2)) - 1
+            rb, cb = (int(m.group(3)) - 1, int(m.group(4)) - 1) if m.group(3) else (ra, ca)
+            rect = (min(ra, rb), min(ca, cb), max(ra, rb), max(ca, cb))
+        else:
+            rect = None
+    if rect is None:
+        raise CellError(REF)
+    return wb._range(sheet_ref, sheet, *rect)
 
 
 # conditional aggregation
@@ -1673,7 +3257,7 @@ def _criteria(crit):
     t = target.lower()
     pattern = None
     if op in ("=", "<>") and ("*" in t or "?" in t):
-        pattern = re.compile("".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in t), re.S)
+        pattern = _wildcard_re(t)
 
     def pred(v):
         if op in ("=", "<>"):
@@ -1748,14 +3332,329 @@ def _f_averageif(rng, crit, avg_rng=None):
     return math.fsum(nums) / len(nums)
 
 
+@_register("AVERAGEIFS")
+def _f_averageifs(avg_rng, *pairs):
+    base, hits = _matching_cells(pairs)
+    nums = list(_numbers_at(_aligned(base, _range_arg(avg_rng)), hits))
+    if not nums:
+        raise CellError(DIV0)
+    return math.fsum(nums) / len(nums)
+
+
+@_register("MAXIFS")
+def _f_maxifs(max_rng, *pairs):
+    base, hits = _matching_cells(pairs)
+    return max(_numbers_at(_aligned(base, _range_arg(max_rng)), hits), default=0.0)
+
+
+@_register("MINIFS")
+def _f_minifs(min_rng, *pairs):
+    base, hits = _matching_cells(pairs)
+    return min(_numbers_at(_aligned(base, _range_arg(min_rng)), hits), default=0.0)
+
+
+# ------------------------------------------------------------------ AutoFilter criteria
+
+# A filter column's criterion is either a set of displayed texts to keep (the checklist) or a dict:
+#   {"type": "custom", "join": "and" | "or", "conds": [[op, text], ...]}   op in FILTER_OPS
+#   {"type": "top", "n": 10, "bottom": bool, "percent": bool}
+#   {"type": "average", "above": bool}
+#   {"type": "dynamic", "kind": one of DYNAMIC_FILTERS}                      dates relative to today
+#   {"type": "color", "what": "bg" | "fg", "color": "#rrggbb" | None}         None: no fill / automatic
+FILTER_OPS = ("=", "<>", ">", ">=", "<", "<=", "begins", "nbegins", "ends", "nends", "contains", "ncontains")
+DYNAMIC_FILTERS = ("tomorrow", "today", "yesterday", "nextweek", "thisweek", "lastweek", "nextmonth", "thismonth",
+                   "lastmonth", "nextyear", "thisyear", "lastyear")
+_TEXT_OPS = {"begins": "{}*", "ends": "*{}", "contains": "*{}*"}
+
+
+def filter_condition(op, target, value, text):
+    """Whether a cell (its value and displayed text) meets one custom AutoFilter condition. Text
+    comparisons ignore case and take Excel's wildcards; a number or date target compares numbers."""
+    target = str(target)
+    negate = op.startswith("n") and op[1:] in _TEXT_OPS
+    base = op[1:] if negate else op
+    if base in _TEXT_OPS:
+        return (_wildcard_re(_TEXT_OPS[base].format(target.lower())).fullmatch(text.lower()) is not None) != negate
+    goal = parse_literal(target)[0] if target.strip() else ""
+    if op in ("=", "<>"):
+        if is_number(goal):
+            hit = is_number(value) and abs(value - goal) < 1e-9
+        elif isinstance(goal, str) and ("*" in goal or "?" in goal):
+            hit = _wildcard_re(goal.lower()).fullmatch(text.lower()) is not None
+        else:
+            hit = text.lower() == target.strip().lower()
+        return hit == (op == "=")
+    if is_number(goal):
+        return is_number(value) and _CMP_OPS[op](value, goal)
+    return isinstance(value, str) and value != "" and _CMP_OPS[op](value.lower(), str(goal).lower())
+
+
+def dynamic_date_span(kind, today):
+    """(first, last) date that a relative date filter such as "thismonth" keeps."""
+    step = {"last": -1, "this": 0, "next": 1}
+    if kind in ("today", "yesterday", "tomorrow"):
+        day = today + dt.timedelta(days={"yesterday": -1, "today": 0, "tomorrow": 1}[kind])
+        return day, day
+    when, unit = kind[:4], kind[4:]
+    n = step[when]
+    if unit == "week":  # Sunday to Saturday, as in Excel
+        start = today - dt.timedelta(days=(today.weekday() + 1) % 7) + dt.timedelta(weeks=n)
+        return start, start + dt.timedelta(days=6)
+    if unit == "month":
+        y, m = divmod(today.month - 1 + n, 12)
+        year, month = today.year + y, m + 1
+        return dt.date(year, month, 1), dt.date(year, month, calendar.monthrange(year, month)[1])
+    return dt.date(today.year + n, 1, 1), dt.date(today.year + n, 12, 31)
+
+
 # ------------------------------------------------------------------ workbook
+
+CHART_TYPES = ("column", "bar", "line", "pie")
+PICTURE = "picture"  # a picture floating over the cells, kept with the charts
+SHAPE = "shape"      # a shape or connector drawn over the cells (see shapes.py), kept with the charts too
+
+
+def new_picture_id():
+    return os.urandom(6).hex()
+
+
+def _shape_from_dict(d):
+    """A shape as read from a .pyxl file (lists back to tuples, an id when it had none)."""
+    shape = dict(d, anchor=tuple(d.get("anchor", (0, 0, 0, 0))), size=tuple(d.get("size", (96, 96))),
+                 id=d.get("id") or new_picture_id())
+    if shape.get("tip"):
+        shape["tip"] = tuple(shape["tip"])
+    for end in ("start", "end"):
+        if end in shape and not isinstance(shape[end], dict):
+            shape[end] = None
+    return shape
+CHART_SIZE = (480, 288)  # Excel's default 5 x 3 inches
+VALIDATION_TYPES = ("any", "whole", "decimal", "list", "date", "length", "custom")
+VALIDATION_OPS = ("between", "notbetween", "=", "<>", ">", "<", ">=", "<=")
+
+
+def _shift_freeze(freeze, axis, at, move_span):
+    """Frozen panes after rows (axis 0) or columns (axis 1) were inserted or deleted at `at`."""
+    a0, a1 = freeze[0:2] if axis == 0 else freeze[2:4]
+    if a1 > a0:
+        span = move_span(a0, a1 - 1)
+        if span is None:
+            a0 = a1 = 0
+        else:  # lines inserted right at the top of the frozen block join it, as in Excel
+            a0, a1 = (a0 if at == a0 < span[0] else span[0]), span[1] + 1
+    elif a0:
+        span = move_span(a0, a0)
+        a0 = a1 = span[0] if span else 0
+    freeze = (a0, a1) + tuple(freeze[2:4]) if axis == 0 else tuple(freeze[0:2]) + (a0, a1)
+    return freeze if freeze[1] > freeze[0] or freeze[3] > freeze[2] else None
+
+
+MAX_OUTLINE = 7  # outline levels Excel allows
+_DEFINED_NAME_RE = re.compile(r"[^\W\d][\w.]*\Z")
+_REF_LIKE_RE = re.compile(r"(?:[A-Za-z]{1,3}\d+|[RrCc]\d*|[Rr]\d+[Cc]\d+)\Z")
+# SUBTOTAL function numbers -> (label after each group's value, label of the grand total row)
+SUBTOTAL_NAMES = {9: ("Tổng", "Tổng Cuối"), 3: ("Đếm", "Đếm chung"), 1: ("Trung bình", "Trung bình chung"),
+                  4: ("Lớn nhất", "Lớn nhất chung"), 5: ("Nhỏ nhất", "Nhỏ nhất chung"), 6: ("Tích", "Tích chung"),
+                  2: ("Đếm số", "Đếm số chung"), 7: ("Độ lệch chuẩn", "Độ lệch chuẩn chung"),
+                  8: ("Độ lệch chuẩn TT", "Độ lệch chuẩn TT chung"), 10: ("Phương sai", "Phương sai chung"),
+                  11: ("Phương sai TT", "Phương sai TT chung")}
+
+
+def outline_groups(levels):
+    """[(level, first, last)] of the groups an outline {index: level} makes, outer levels first."""
+    groups = []
+    for level in range(1, max(levels.values(), default=0) + 1):
+        run = None
+        for i in sorted(levels):
+            if levels[i] < level:
+                continue
+            if run and i == run[1] + 1:
+                run[1] = i
+            else:
+                if run:
+                    groups.append((level, *run))
+                run = [i, i]
+        if run:
+            groups.append((level, *run))
+    return groups
+
+
+@contextlib.contextmanager
+def bulk():
+    """Pause Python's cyclic garbage collector while millions of cell keys are built or moved: it would
+    rescan them all again and again (cells hold no reference cycles; reference counting frees them)."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def _bulky(func):
+    """Run func with bulk() in effect."""
+    @functools.wraps(func)
+    def wrapper(*args, **kw):
+        with bulk():
+            return func(*args, **kw)
+    return wrapper
+
+
+class TrackedDict(dict):
+    """A dict that counts its changes, so an undo copy can be reused while nothing changed (copying or
+    comparing millions of cells on every command is what made big sheets slow)."""
+
+    __slots__ = ("version", "_copy", "_copy_version", "_memo")
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.version, self._copy, self._copy_version, self._memo = 0, None, -1, None
+
+    def memo(self, name, compute):
+        """compute(self), remembered until the dict changes (things worked out from every entry, such as
+        the area of a big sheet's formats that prints)."""
+        hit = self._memo.get(name) if self._memo else None
+        if hit is not None and hit[0] == self.version:
+            return hit[1]
+        value = compute(self)
+        if self._memo is None:
+            self._memo = {}
+        self._memo[name] = (self.version, value)
+        return value
+
+    def frozen(self):
+        """A plain-dict copy of the contents, the same object until the dict changes."""
+        if self._copy is None or self._copy_version != self.version:
+            self._copy, self._copy_version = dict(self), self.version
+        return self._copy
+
+    def _changed(self):
+        self.version += 1
+
+    def __setitem__(self, key, value):
+        self.version += 1
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self.version += 1
+        super().__delitem__(key)
+
+    def pop(self, key, *default):
+        if key in self:  # popping what isn't there (very common: "no format here") changes nothing
+            self._changed()
+        return super().pop(key, *default)
+
+    def popitem(self):
+        self._changed()
+        return super().popitem()
+
+    def clear(self):
+        self._changed()
+        super().clear()
+
+    def update(self, *args, **kw):
+        self._changed()
+        super().update(*args, **kw)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def __reduce__(self):  # copies are plain dicts (snapshots); Sheet wraps them again
+        return dict, (dict(self),)
+
+
+class CellStore(TrackedDict):
+    """A sheet's {(row, col): raw text} that also knows where its data starts and how far it reaches
+    without scanning every cell (used_extent runs on every scroll). Adding cells grows the remembered
+    bounds; removing one makes them unknown until next asked."""
+
+    __slots__ = ("_extent", "_first", "_formulas")
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self._extent = self._first = self._formulas = None
+
+    def formulas(self):
+        """Keys of the cells holding formulas, kept up to date as cells change."""
+        if self._formulas is None:
+            self._formulas = {k for k, v in self.items() if v[:1] == "="}
+        return self._formulas
+
+    def extent(self):
+        """(rows, cols) spanned by the cells."""
+        if self._extent is None:
+            if not self:
+                self._extent = (0, 0)
+            else:
+                self._extent = (max(self)[0] + 1, max(map(itemgetter(1), self)) + 1)
+        return self._extent
+
+    def first(self):
+        """(first row, first column) holding a cell; None when there are none."""
+        if self._first is None and self:
+            self._first = (min(self)[0], min(map(itemgetter(1), self)))
+        return self._first
+
+    def _changed(self):
+        self.version += 1
+        self._extent = self._first = None
+
+    def __setitem__(self, key, value):
+        ext, first = self._extent, self._first
+        if ext is not None and (key[0] >= ext[0] or key[1] >= ext[1]):
+            self._extent = (max(ext[0], key[0] + 1), max(ext[1], key[1] + 1))
+        if first is not None and (key[0] < first[0] or key[1] < first[1]):
+            self._first = (min(first[0], key[0]), min(first[1], key[1]))
+        if self._formulas is not None:
+            if value[:1] == "=":
+                self._formulas.add(key)
+            else:
+                self._formulas.discard(key)
+        self.version += 1
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        self._changed()
+        if self._formulas is not None:
+            self._formulas.discard(key)
+        dict.__delitem__(self, key)
+
+    def pop(self, key, *default):
+        if self._formulas is not None:
+            self._formulas.discard(key)
+        return super().pop(key, *default)
+
+    def popitem(self):
+        self._formulas = None
+        return super().popitem()
+
+    def clear(self):
+        self._formulas = None
+        super().clear()
+
+    def update(self, *args, **kw):
+        self._formulas = None
+        super().update(*args, **kw)
+
 
 class Sheet:
     """One worksheet. Format dicts are never mutated in place, only replaced."""
 
     _STATE = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows",
-              "hidden_cols", "merges", "cond_formats", "filter", "tab_color")
-    __slots__ = ("name", "_merge_map") + _STATE
+              "hidden_cols", "merges", "cond_formats", "filter", "tab_color", "freeze", "validations", "notes",
+              "charts", "pivots", "page_setup", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols",
+              "links", "hidden", "protection")
+    __slots__ = ("name", "_merge_map", "_cells", "_formats") + tuple(k for k in _STATE if k not in ("cells", "formats"))
+    # dicts whose values are never changed in place (only replaced): copied shallowly for undo snapshots
+    _FLAT = ("cells", "formats", "col_widths", "row_heights", "custom_rows", "hidden_rows", "hidden_cols", "notes",
+             "links", "row_levels", "col_levels", "collapsed_rows", "collapsed_cols")
 
     def __init__(self, name):
         self.name = name
@@ -1772,6 +3671,23 @@ class Sheet:
         self.cond_formats = []  # [{"range": (r1, c1, r2, c2), "type": ..., ...}] - later rules win
         self.filter = None      # {"range": (r1, c1, r2, c2), "criteria": {col: set(texts)}, "hidden": set(rows)}
         self.tab_color = None
+        self.freeze = None      # (r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 stay put when scrolling
+        self.validations = []   # [{"range": (r1, c1, r2, c2), "type": ..., ...}] - later rules win, see VALIDATION_TYPES
+        self.notes = {}         # (row, col) -> note text
+        self.links = {}         # (row, col) -> {"target": URL, file, mailto: or "#Sheet!A1", "tip": ScreenTip}
+        self.charts = []        # [{"type": CHART_TYPES[i], "range": (r1, c1, r2, c2), "title": str,
+                                #   "anchor": (row, col, dx, dy), "size": (w, h)}] - offsets and size in pixels at 96 DPI;
+                                #   pictures float the same way: {"type": PICTURE, "image": base64, "format": "png",
+                                #   "id": str, "name": str, "anchor", "size"} (no range)
+        self.pivots = []        # PivotTables whose reports sit on this sheet (see pivot.new_pivot)
+        self.page_setup = None  # printing options that differ from printing.DEFAULT_SETUP
+        self.row_levels = {}    # row -> outline (group) level 1..MAX_OUTLINE; summary rows sit below groups
+        self.col_levels = {}    # col -> outline level; summary columns sit right of groups
+        self.collapsed_rows = set()  # summary rows of collapsed groups (Excel's "collapsed" flag)
+        self.collapsed_cols = set()
+        self.hidden = False     # sheet hidden (Format > Hide & Unhide > Hide Sheet)
+        self.protection = None  # Review > Protect Sheet: {"hash": Excel password hash or "", "allow": [option]};
+                                # cells are locked unless their format has "unlocked"
         self._merge_map = None
 
     def merge_at(self, r, c):
@@ -1793,14 +3709,44 @@ class Sheet:
     def row_hidden(self, r):
         return r in self.hidden_rows or (self.filter is not None and r in self.filter["hidden"])
 
+    cells = property(operator.attrgetter("_cells"))  # a C-level getter: cells are read very often
+
+    @cells.setter
+    def cells(self, value):
+        self._cells = value if isinstance(value, CellStore) else CellStore(value)
+
+    formats = property(operator.attrgetter("_formats"))
+
+    @formats.setter
+    def formats(self, value):
+        self._formats = value if isinstance(value, TrackedDict) else TrackedDict(value)
+
     def copy_state(self):
-        return {key: copy.deepcopy(getattr(self, key)) for key in self._STATE}
+        """The sheet's data for undo; big dicts of immutable values are copied shallowly - cells and
+        formats only when they changed since the last copy."""
+        state = {}
+        for key in self._STATE:
+            v = getattr(self, key)
+            if isinstance(v, TrackedDict):
+                state[key] = v.frozen()
+            elif key in self._FLAT:
+                state[key] = dict(v) if isinstance(v, dict) else set(v)
+            else:
+                state[key] = copy.deepcopy(v)
+        return state
 
     @classmethod
     def from_state(cls, name, state):
         sheet = cls(name)
         for key, value in state.items():
-            setattr(sheet, key, copy.deepcopy(value))
+            if key in cls._FLAT:
+                value = value if key in ("cells", "formats") else type(value)(value)  # cells/formats: wrapped
+            else:                                                                    # (a copy) by the setters
+                value = copy.deepcopy(value)
+            setattr(sheet, key, value)
+            if key in ("cells", "formats"):  # the snapshot is this content: reuse it as the next undo copy
+                store = getattr(sheet, key)
+                store._copy, store._copy_version = value, store.version
         sheet.set_merges(sheet.merges)
         return sheet
 
@@ -1815,6 +3761,17 @@ class Workbook:
         self._cf_stats = {}    # (sheet, rule index, name) -> statistics of a rule's range
         self._evaluating = set()
         self._stack = []
+        self._scopes = []      # names LET and LAMBDA set, innermost last
+        self._spills = {}      # sheet -> {anchor (r, c): (rows, cols)} of the dynamic arrays that spilled
+        self._spilled = {}     # sheet -> {(r, c): (value, anchor)} of the cells they spilled into
+        self._spill_ready = set()  # sheets whose dynamic arrays are all worked out
+        self._candidates = {}  # sheet -> (cells version, [formula cells that can give an array])
+        self._journal = None   # keys cached during a tentative calculation (see _tentative)
+        self._outer = ()       # cells being calculated when a tentative calculation started
+        self._blocked = False  # a tentative calculation needed one of those
+        self.names = {}        # NAME (upper case) -> {"name": as typed, "ref": "=Sheet1!$A$1:$B$4", "comment": ""}
+        self.import_info = None  # how a text file was read: {"encoding", "delimiter", "decimal_comma", "truncated"}
+        self._names_ast = {}
         for name in sheet_names:
             self.add_sheet(name)
 
@@ -1861,14 +3818,31 @@ class Workbook:
             for key, raw in list(sh.cells.items()):
                 if is_formula(raw):
                     sh.cells[key] = _rename_in_formula(raw, old, new)
+        for d in self.names.values():
+            d["ref"] = _rename_in_formula(d["ref"], old, new)
+        self._names_ast.clear()
         self.sheets = {(new if n == old else n): s for n, s in self.sheets.items()}
         self.sheets[new].name = new
+        for sh in self.sheets.values():
+            for p in sh.pivots:
+                if p["source"]["sheet"].lower() == old.lower():
+                    p["source"]["sheet"] = new
         self._ast.clear()
         self.invalidate()
+
+    def visible_sheets(self):
+        return [name for name, sh in self.sheets.items() if not sh.hidden]
+
+    def hide_sheet(self, name, hidden=True):
+        if hidden and self.visible_sheets() == [name]:
+            raise ValueError("Sổ làm việc phải có ít nhất một trang tính hiển thị.")
+        self.sheets[name].hidden = hidden
 
     def delete_sheet(self, name):
         if len(self.sheets) <= 1:
             raise ValueError("Sổ làm việc phải có ít nhất một trang tính.")
+        if self.visible_sheets() == [name]:
+            raise ValueError("Sổ làm việc phải có ít nhất một trang tính hiển thị.")
         del self.sheets[name]
         self._ast.clear()
         self.invalidate()
@@ -1904,6 +3878,24 @@ class Workbook:
     def get_format(self, sheet, r, c):
         return self.sheets[sheet].formats.get((r, c))
 
+    @_bulky
+    def write_cells(self, items):
+        """Set many cells at once - [(sheet, row, col, raw, fmt)], None clearing - with the caches cleared
+        once instead of after every cell."""
+        for sheet, r, c, raw, fmt in items:
+            sh = self.sheets[sheet]
+            if raw:
+                sh.cells[(r, c)] = raw
+            else:
+                sh.cells.pop((r, c), None)
+            if fmt:
+                if sh.formats.get((r, c)) is not fmt:
+                    sh.formats[(r, c)] = fmt  # format dicts are shared, never edited in place
+            else:
+                sh.formats.pop((r, c), None)
+            self._ast.pop((sheet, r, c), None)
+        self.invalidate()
+
     def set_format(self, sheet, r, c, fmt):
         formats = self.sheets[sheet].formats
         old = formats.get((r, c)) or {}
@@ -1918,13 +3910,13 @@ class Workbook:
         self._cache.clear()
         self._cf_cache.clear()
         self._cf_stats.clear()
+        self._spills.clear()
+        self._spilled.clear()
+        self._spill_ready.clear()
 
     def used_extent(self, sheet):
         """(rows, cols) spanned by non-empty cells."""
-        cells = self.sheets[sheet].cells
-        if not cells:
-            return 0, 0
-        return max(r for r, _ in cells) + 1, max(c for _, c in cells) + 1
+        return self.sheets[sheet].cells.extent()
 
     # evaluation
     def _parsed(self, key, raw):
@@ -1935,14 +3927,14 @@ class Workbook:
 
     def get_value(self, sheet, r, c):
         key = (sheet, r, c)
-        try:
-            return self._cache[key]
-        except KeyError:
-            pass
+        value = self._cache.get(key, _NOT_CACHED)  # not try/except: after a change nearly every lookup misses
+        if value is not _NOT_CACHED:
+            return value
         sh = self.sheets[sheet]
         raw = sh.cells.get((r, c))
         if raw is None:
-            return None
+            hit = self.spill_map(sheet, r, c).get((r, c))
+            return None if hit is None else 0.0 if hit[0] is None else hit[0]
         fmt = sh.formats.get((r, c))
         if fmt and fmt.get("num") == "@":  # Text format: keep exactly what was typed
             value = raw[1:] if raw.startswith("'") else raw
@@ -1950,11 +3942,14 @@ class Workbook:
             value = parse_literal(raw)[0]
         else:
             if key in self._evaluating:
+                if key in self._outer:  # (a tentative calculation, see _tentative)
+                    self._blocked = True
                 raise CellError(CIRC)
             self._evaluating.add(key)
             self._stack.append(key)
             try:
-                value = scalar(self._eval(self._parsed(key, raw), sheet))
+                result = self._eval(self._parsed(key, raw), sheet)
+                value = self._spill(sheet, r, c, result) if is_array(result) else scalar(result)
                 if value is None:
                     value = 0.0
             except CellError as err:
@@ -1965,7 +3960,121 @@ class Workbook:
                 self._evaluating.discard(key)
                 self._stack.pop()
         self._cache[key] = value
+        if self._journal is not None:
+            self._journal.append(key)
         return value
+
+    # dynamic arrays: a formula giving several values shows the first and spills the rest into the cells
+    # right of and below it, like Excel 365
+
+    def _spill(self, sheet, r, c, block):
+        """Value of a formula cell whose result is `block`: its top-left value, the rest going into the
+        cells beside and below - or #SPILL! when one of those holds something (or is merged)."""
+        rows, cols = block.nrows, block.ncols
+        r2, c2 = r + rows - 1, c + cols - 1
+        if r2 >= MAX_ROWS or c2 >= MAX_COLS:
+            return CellError(SPILL)
+        sh = self.sheets[sheet]
+        spilled = self._spilled.setdefault(sheet, {})
+        if rows * cols <= len(sh.cells) + len(spilled):
+            taken = any(k in sh.cells or k in spilled for k in itertools.product(range(r, r2 + 1), range(c, c2 + 1))
+                        if k != (r, c))
+        else:
+            taken = any(r <= k[0] <= r2 and c <= k[1] <= c2 and k != (r, c)
+                        for k in itertools.chain(sh.cells, spilled))
+        if taken or any(m[0] <= r2 and m[2] >= r and m[1] <= c2 and m[3] >= c for m in sh.merges):
+            return CellError(SPILL)
+        data = block.rows()
+        for i, row in enumerate(data):
+            for j, v in enumerate(row):
+                if i or j:
+                    spilled[(r + i, c + j)] = (v, (r, c))
+        self._spills.setdefault(sheet, {})[(r, c)] = (rows, cols)
+        return data[0][0]
+
+    def spill_map(self, sheet, r=MAX_ROWS - 1, c=MAX_COLS - 1):
+        """{(r, c): (value, anchor)} of the cells of `sheet` dynamic arrays spill into, with every array
+        that could reach (r, c) worked out first."""
+        if sheet not in self._spill_ready:
+            top = not self._evaluating
+            for ar, ac in self._spill_candidates(sheet):
+                if not top and ar > r:
+                    break
+                if (top or ac <= c) and (sheet, ar, ac) not in self._evaluating:
+                    if top:
+                        self.get_value(sheet, ar, ac)
+                    else:
+                        self._tentative(sheet, ar, ac)
+            if top:
+                self._spill_ready.add(sheet)
+        return self._spilled.get(sheet, _NO_SPILLS)
+
+    def _tentative(self, sheet, r, c):
+        """Work out formula (r, c) in the middle of another calculation, to learn where it spills. When it
+        needs a cell still being calculated, what it worked out is forgotten (Excel's dependency order
+        would have done it later), instead of keeping a circular-reference error."""
+        if (sheet, r, c) in self._cache:
+            return
+        journal, outer, blocked = self._journal, self._outer, self._blocked
+        self._journal, self._blocked = [], False
+        if journal is None:
+            self._outer = frozenset(self._evaluating)
+        try:
+            self.get_value(sheet, r, c)
+        finally:
+            added, failed = self._journal, self._blocked
+            self._journal, self._outer, self._blocked = journal, outer, blocked or failed
+            if failed:
+                for key in added:
+                    self._cache.pop(key, None)
+                    area = self._spills.get(key[0], {}).pop(key[1:], None)
+                    if area:
+                        spilled = self._spilled[key[0]]
+                        for k in itertools.product(range(key[1], key[1] + area[0]), range(key[2], key[2] + area[1])):
+                            spilled.pop(k, None)
+            elif journal is not None:
+                journal.extend(added)
+
+    def _spill_candidates(self, sheet):
+        """Formula cells of `sheet` that can give an array, top to bottom."""
+        cells = self.sheets[sheet].cells
+        hit = self._candidates.get(sheet)
+        if hit is None or hit[0] != (id(cells), cells.version):
+            found = sorted(k for k in cells.formulas() if _may_array(cells[k]))
+            hit = self._candidates[sheet] = ((id(cells), cells.version), found)
+        return hit[1]
+
+    def spill_areas(self, sheet):
+        """{anchor (r, c): (r1, c1, r2, c2)} of the dynamic arrays of `sheet` that spill."""
+        self.spill_map(sheet)
+        return {(r, c): (r, c, r + h - 1, c + w - 1) for (r, c), (h, w) in self._spills.get(sheet, {}).items()}
+
+    def spill_anchor(self, sheet, r, c):
+        """(row, col) of the formula whose array covers cell (r, c) - the cell itself for that formula -
+        or None."""
+        hit = self.spill_map(sheet).get((r, c))
+        if hit:
+            return hit[1]
+        return (r, c) if (r, c) in self._spills.get(sheet, ()) else None
+
+    def spill_range(self, sheet, r, c):
+        """(r1, c1, r2, c2) of the array that cell (r, c) belongs to, or None."""
+        anchor = self.spill_anchor(sheet, r, c)
+        if anchor is None:
+            return None
+        rows, cols = self._spills[sheet][anchor]
+        return anchor[0], anchor[1], anchor[0] + rows - 1, anchor[1] + cols - 1
+
+    def _spill_ref(self, sheet_ref, home, r, c):
+        """A1#: the range A1's dynamic array fills."""
+        name = home if sheet_ref is None else self.resolve_sheet(sheet_ref)
+        if name is None or not (0 <= r < MAX_ROWS and 0 <= c < MAX_COLS):
+            raise CellError(REF)
+        value = self.get_value(name, r, c)
+        area = self._spills.get(name, {}).get((r, c))
+        if area is None:
+            raise CellError(value.code if isinstance(value, CellError) else REF)
+        return RangeRef(self, name, r, c, r + area[0] - 1, c + area[1] - 1)
 
     def cell_display(self, sheet, r, c):
         """(value, number format) used to draw a cell."""
@@ -1988,7 +4097,16 @@ class Workbook:
 
     def _range(self, sheet_ref, home, r1, c1, r2, c2):
         name = home if sheet_ref is None else self.resolve_sheet(sheet_ref)
-        if name is None or r1 < 0 or c1 < 0 or r2 >= MAX_ROWS or c2 >= MAX_COLS:
+        if r1 < 0 or c1 < 0 or r2 >= MAX_ROWS or c2 >= MAX_COLS:
+            raise CellError(REF)
+        if name is None and sheet_ref and ":" in sheet_ref:  # Sheet1:Sheet3!A1: the sheets from one to the other
+            first, last = (self.resolve_sheet(s) for s in sheet_ref.split(":", 1))
+            if first is None or last is None:
+                raise CellError(REF)
+            names = list(self.sheets)
+            i, j = sorted((names.index(first), names.index(last)))
+            return RangeAreas(RangeRef(self, s, r1, c1, r2, c2) for s in names[i:j + 1])
+        if name is None:
             raise CellError(REF)
         return RangeRef(self, name, r1, c1, r2, c2)
 
@@ -2001,38 +4119,69 @@ class Workbook:
         if kind == "range":
             return self._range(node[1], sheet, *node[2:])
         if kind == "bin":
-            return binary_op(node[1], scalar(self._eval(node[2], sheet)), scalar(self._eval(node[3], sheet)))
-        if kind == "neg":
-            return -to_number(scalar(self._eval(node[1], sheet)))
-        if kind == "pct":
-            return to_number(scalar(self._eval(node[1], sheet))) / 100
+            a, b = self._eval(node[2], sheet), self._eval(node[3], sheet)
+            if is_array(a) or is_array(b):  # =A1:A5*2: item by item
+                op = node[1]
+                return _elementwise(lambda x, y: binary_op(op, x, y), a, b)
+            return binary_op(node[1], scalar(a), scalar(b))
+        if kind in ("neg", "pct"):
+            a = self._eval(node[1], sheet)
+            op = (lambda x: -to_number(x)) if kind == "neg" else (lambda x: to_number(x) / 100)
+            return _elementwise(op, a) if is_array(a) else op(scalar(a))
         if kind == "func":
             return self._call(node[1], node[2], sheet)
+        if kind == "name":
+            for scope in reversed(self._scopes):  # LET and LAMBDA names first
+                if node[1] in scope:
+                    return scope[node[1]]
+            return self._eval(self._name_ast(node[1]), sheet)
+        if kind == "array":
+            return Array(node[1])
+        if kind == "spill":
+            return self._spill_ref(node[1], sheet, node[2], node[3])
+        if kind == "call":
+            return self._apply(self._eval(node[1], sheet), [self._eval(n, sheet) for n in node[2]])
         if kind == "err":
             raise CellError(node[1])
         if kind == "empty":
             return None
         raise CellError(SYNTAX)
 
+    def _name_ast(self, name):
+        ast = self._names_ast.get(name)
+        if ast is None:
+            d = self.names.get(name)
+            ast = self._names_ast[name] = parse_formula(d["ref"]) if d else ("err", NAME)
+        return ast
+
     def _call(self, name, nodes, sheet):
         lazy = _LAZY_FUNCS.get(name)
         if lazy is not None:
             return lazy(self, nodes, sheet)
         func = _FUNCS.get(name)
-        if func is None:
-            raise CellError(NAME)
-        args = [self._eval(n, sheet) for n in nodes]
-        try:
-            result = func(*args)
-        except CellError:
-            raise
-        except TypeError:  # wrong number of arguments
-            raise CellError(VALUE) from None
-        except ZeroDivisionError:
-            raise CellError(DIV0) from None
-        except (ValueError, OverflowError, InvalidOperation, statistics.StatisticsError):
-            raise CellError(NUM) from None
-        return _finite(result)
+        if func is None:  # a LAMBDA given a name by LET or the Name Manager
+            target = next((scope[name] for scope in reversed(self._scopes) if name in scope), None)
+            if target is None and name in self.names:
+                target = self._eval(self._name_ast(name), sheet)
+            if not isinstance(target, Lambda):
+                raise CellError(NAME)
+            return self._apply(target, [self._eval(n, sheet) for n in nodes])
+        args = []
+        for node in nodes:
+            value = self._eval(node, sheet)
+            if isinstance(value, RangeAreas):
+                args.extend(value)
+            else:
+                args.append(value)
+        if name in _LIFTED and any(map(is_array, args)):  # =LEN(A2:A9): one result per item
+            return _elementwise(func, *args)
+        return _safely(func, args)
+
+    def _apply(self, target, args):
+        """Call a LAMBDA with argument values."""
+        if not isinstance(target, Lambda):
+            raise CellError(VALUE)
+        return target(*args)
 
     def evaluate(self, text, sheet):
         """Value of a literal or '=formula' outside any cell (conditional-format operands)."""
@@ -2048,6 +4197,24 @@ class Workbook:
 
     def display_text(self, sheet, r, c):
         return format_value(*self.cell_display(sheet, r, c))
+
+    def hyperlink_at(self, sheet, r, c):
+        """{"target", "tip"} a click on the cell opens: its hyperlink, or a =HYPERLINK(link, ...) formula's link."""
+        sh = self.sheets[sheet]
+        link = sh.links.get((r, c))
+        if link:
+            return link
+        raw = sh.cells.get((r, c), "")
+        if is_formula(raw) and "HYPERLINK" in raw.upper():
+            ast = self._parsed((sheet, r, c), raw)
+            if ast[0] == "func" and ast[1] == "HYPERLINK" and ast[2]:
+                try:
+                    target = scalar(self._eval(ast[2][0], sheet))
+                except CellError:
+                    return None
+                if target not in (None, ""):
+                    return {"target": str(target), "tip": ""}
+        return None
 
     # conditional formatting
     def cond_format(self, sheet, r, c):
@@ -2151,6 +4318,137 @@ class Workbook:
         self.sheets[sheet].cond_formats = rules
         self.invalidate()
 
+    # data validation
+    def validation_at(self, sheet, r, c):
+        """The data-validation rule covering (r, c), or None."""
+        for rule in reversed(self.sheets[sheet].validations):
+            r1, c1, r2, c2 = rule["range"]
+            if r1 <= r <= r2 and c1 <= c <= c2:
+                return rule
+        return None
+
+    def _rule_eval(self, sheet, rule, text, r, c):
+        """Value of a rule operand, with relative references moved from the rule's first cell to (r, c)."""
+        text = str(text or "").strip()
+        if is_formula(text):
+            text = shift_formula(text, r - rule["range"][0], c - rule["range"][1])
+        self._stack.append((sheet, r, c))
+        try:
+            if not is_formula(text):
+                return parse_literal(text)[0] if text else None
+            return self._eval(parse_formula(text), sheet)
+        except CellError as err:
+            return CellError(err.code)
+        finally:
+            self._stack.pop()
+
+    def validation_options(self, sheet, r, c, rule=None):
+        """Texts offered by a list rule: its comma-separated items or the cells of its source range."""
+        rule = rule or self.validation_at(sheet, r, c)
+        source = str(rule.get("source", "")).strip()
+        if not is_formula(source):
+            return [item.strip() for item in re.split(r"[,;]", source) if item.strip()]
+        value = self._rule_eval(sheet, rule, source, r, c)
+        if isinstance(value, RangeRef):
+            texts = (self.display_text(value.sheet, rr, cc) for rr in range(value.r1, value.r2 + 1)
+                     for cc in range(value.c1, value.c2 + 1))
+            return [t for t in texts if t != ""]
+        return [] if value is None or isinstance(value, CellError) else [to_text(value)]
+
+    def validate(self, sheet, r, c, raw):
+        """The rule that typing `raw` into (r, c) breaks, or None when the entry is allowed."""
+        rule = self.validation_at(sheet, r, c)
+        if rule is None or rule.get("type", "any") == "any":
+            return None
+        if not raw:
+            return None if rule.get("blank", True) else rule
+        old = self.get_raw(sheet, r, c)
+        self.set_raw(sheet, r, c, raw)  # judge the value the cell would really get
+        try:
+            ok = self._valid_value(sheet, rule, r, c, raw)
+        finally:
+            self.set_raw(sheet, r, c, old)
+        return None if ok else rule
+
+    def _valid_value(self, sheet, rule, r, c, raw):
+        value, kind = self.get_value(sheet, r, c), rule["type"]
+        if isinstance(value, CellError):
+            return False
+        if kind == "custom":  # the formula must come out TRUE (or a non-zero number)
+            try:
+                result = scalar(self._rule_eval(sheet, rule, rule.get("v1"), r, c))
+            except CellError:
+                return False
+            return (isinstance(result, bool) or is_number(result)) and bool(result)
+        if kind == "list":
+            options = self.validation_options(sheet, r, c, rule)
+            text = self.display_text(sheet, r, c).lower()
+            typed = (raw[1:] if raw.startswith("'") else raw).strip().lower()
+            return any(o.lower() in (text, typed) or (is_number(value) and parse_literal(o)[0] == value)
+                       for o in options)
+        if kind == "length":
+            x = float(len(to_text(value)))
+        elif is_number(value):
+            x = float(value)
+            if kind == "whole" and not x.is_integer():
+                return False
+        else:
+            return False
+        a = self._rule_eval(sheet, rule, rule.get("v1"), r, c)
+        b = self._rule_eval(sheet, rule, rule.get("v2"), r, c)
+        try:
+            a = to_number(scalar(a))
+            b = to_number(scalar(b)) if rule.get("op", "between") in ("between", "notbetween") else a
+        except CellError:
+            return False
+        op = rule.get("op", "between")
+        if op in ("between", "notbetween"):
+            return (min(a, b) <= x <= max(a, b)) == (op == "between")
+        return _CMP_OPS[op](x, a)
+
+    # charts
+    def chart_layout(self, sheet, chart):
+        """How a chart reads its range, like Excel: series run down the columns of a block at least as
+        tall as it is wide (else along its rows); a first row/column holding text gives the series names /
+        category labels. Returns (rect clipped to the data, by_cols, has_names, has_categories)."""
+        r1, c1, r2, c2 = chart["range"]
+        rows, cols = self.used_extent(sheet)
+        r2, c2 = min(r2, max(r1, rows - 1)), min(c2, max(c1, cols - 1))
+        by_cols = r2 - r1 >= c2 - c1
+        along, across = (r2 - r1 + 1, c2 - c1 + 1) if by_cols else (c2 - c1 + 1, r2 - r1 + 1)
+
+        def value(i, j):
+            return self.get_value(sheet, *((r1 + i, c1 + j) if by_cols else (r1 + j, c1 + i)))
+
+        def is_text(v):
+            return isinstance(v, str) and v != ""
+
+        names = along > 1 and any(is_text(value(0, j)) for j in range(across))
+        first = 1 if names else 0
+        cats = across > 1 and (any(is_text(value(i, 0)) for i in range(first, along))
+                               or (names and value(0, 0) in (None, "")))
+        return (r1, c1, r2, c2), by_cols, names, cats
+
+    def chart_data(self, sheet, chart):
+        """(category labels, [(series name, [number or None])]) plotted by a chart."""
+        (r1, c1, r2, c2), by_cols, names, cats = self.chart_layout(sheet, chart)
+        along, across = (r2 - r1 + 1, c2 - c1 + 1) if by_cols else (c2 - c1 + 1, r2 - r1 + 1)
+        along, across = min(along, 1000), min(across, 50)
+
+        def pos(i, j):
+            return (r1 + i, c1 + j) if by_cols else (r1 + j, c1 + i)
+
+        first = 1 if names else 0
+        labels = ([self.display_text(sheet, *pos(i, 0)) for i in range(first, along)] if cats
+                  else [str(k + 1) for k in range(along - first)])
+        series = []
+        for j in range(1 if cats else 0, across):
+            name = self.display_text(sheet, *pos(0, j)) if names else f"Chuỗi {len(series) + 1}"
+            values = [self.get_value(sheet, *pos(i, j)) for i in range(first, along)]
+            series.append((name, [float(v) if is_number(v) else None for v in values]))
+        numeric = [item for item in series if any(v is not None for v in item[1])]
+        return labels, numeric or series  # a text column in the middle of the data is not a series
+
     # filtering
     def filter_values(self, sheet, col):
         """Distinct display texts in a filter column (data rows only), sorted like Excel."""
@@ -2159,7 +4457,68 @@ class Workbook:
         texts = {}
         for r in range(r1 + 1, r2 + 1):
             texts.setdefault(self.display_text(sheet, r, col), self.get_value(sheet, r, col))
-        return sorted(texts, key=lambda t: (t == "", sort_key(texts[t]) if texts[t] is not None else (9,)))
+        return sorted(texts, key=lambda t: (t == "", natural_key(texts[t]) if texts[t] is not None else (9,)))
+
+    def cell_color(self, sheet, r, c, what="bg"):
+        """Fill ("bg") or font ("fg") colour a cell shows, conditional formatting included; None when
+        it has none of its own."""
+        style = self.cond_format(sheet, r, c) or {}
+        fmt = self.sheets[sheet].formats.get((r, c)) or {}
+        return style.get(what) or fmt.get(what)
+
+    def filter_colors(self, sheet, col, what="bg"):
+        """Colours of a filter column's data cells, in order of appearance (None: no fill / automatic),
+        when they are not all the same - like Excel, which offers colour filters only then."""
+        r1, _, r2, _ = self.sheets[sheet].filter["range"]
+        colors = list(dict.fromkeys(self.cell_color(sheet, r, col, what) for r in range(r1 + 1, r2 + 1)))
+        return colors if len(colors) > 1 else []
+
+    def filter_kind(self, sheet, col):
+        """"number", "date" or "text": what most data cells of a filter column hold (picks Excel's
+        Number / Date / Text Filters menu)."""
+        r1, _, r2, _ = self.sheets[sheet].filter["range"]
+        counts = Counter()
+        for r in range(r1 + 1, r2 + 1):
+            value = self.get_value(sheet, r, col)
+            if is_number(value):
+                fmt = self.cell_display(sheet, r, col)[1]
+                counts["date" if fmt and is_date_format(fmt) else "number"] += 1
+            elif value not in (None, ""):
+                counts["text"] += 1
+        return counts.most_common(1)[0][0] if counts else "text"
+
+    def filter_match(self, sheet, r, col, crit, stats=None):
+        """Whether row r passes a filter column's criterion (see FILTER_OPS above). `stats` caches the
+        sorted numbers of each column for top-10 and average filters."""
+        if not isinstance(crit, dict):
+            return self.display_text(sheet, r, col) in crit
+        kind = crit["type"]
+        if kind == "color":
+            return self.cell_color(sheet, r, col, crit.get("what", "bg")) == crit.get("color")
+        value = self.get_value(sheet, r, col)
+        if kind == "custom":
+            text = self.display_text(sheet, r, col)
+            hits = [filter_condition(op, target, value, text) for op, target in crit["conds"]]
+            return all(hits) if crit.get("join", "and") == "and" else any(hits)
+        if not is_number(value):
+            return False
+        if kind == "dynamic":
+            first, last = dynamic_date_span(crit["kind"], dt.date.today())
+            return first <= serial_to_datetime(math.floor(value)).date() <= last
+        stats = {} if stats is None else stats
+        if col not in stats:
+            r1, _, r2, _ = self.sheets[sheet].filter["range"]
+            stats[col] = sorted(float(v) for v in (self.get_value(sheet, rr, col) for rr in range(r1 + 1, r2 + 1))
+                                if is_number(v))
+        nums = stats[col]
+        if kind == "average":
+            avg = math.fsum(nums) / len(nums)
+            return value > avg if crit.get("above", True) else value < avg
+        n = int(crit.get("n", 10))
+        if crit.get("percent"):
+            n = int(len(nums) * n / 100)
+        n = max(1, min(n, len(nums)))
+        return value <= nums[n - 1] if crit.get("bottom") else value >= nums[-n]
 
     def apply_filter(self, sheet):
         """Recompute which data rows the filter criteria hide."""
@@ -2167,13 +4526,14 @@ class Workbook:
         if not f:
             return
         r1, _, r2, _ = f["range"]
-        hidden = set()
+        hidden, stats = set(), {}
         for r in range(r1 + 1, r2 + 1):
-            for col, allowed in f["criteria"].items():
-                if self.display_text(sheet, r, col) not in allowed:
+            for col, crit in f["criteria"].items():
+                if not self.filter_match(sheet, r, col, crit, stats):
                     hidden.add(r)
                     break
         f["hidden"] = hidden
+        self.invalidate()  # SUBTOTAL results depend on which rows are filtered out
 
     # structure
     def insert_cells(self, sheet, r1, c1, r2, c2, shift="down"):
@@ -2200,6 +4560,7 @@ class Workbook:
     def delete_cols(self, sheet, at, count=1):
         self._shift(sheet, 1, at, -count)
 
+    @_bulky
     def _shift(self, sheet, axis, at, delta, band=None):
         """Insert (delta > 0) or delete (delta < 0) rows (axis 0) or columns (axis 1).
 
@@ -2228,11 +4589,24 @@ class Workbook:
 
         target = sheet.lower()
         for sh in self.sheets.values():
-            for key, raw in list(sh.cells.items()):
-                if is_formula(raw):
-                    sh.cells[key] = _rewrite_axis(raw, sh.name, target, axis, move, move_span, band)
+            formulas = [(key, raw) for key, raw in sh.cells.items() if raw[:1] == "=" and len(raw) > 1]
+            for key, raw in formulas:
+                sh.cells[key] = _rewrite_axis(raw, sh.name, target, axis, move, move_span, band)
+        for d in self.names.values():
+            d["ref"] = _rewrite_axis(d["ref"], sheet, target, axis, move, move_span, band)
+        self._names_ast.clear()
 
         def remap(d):
+            if band is None and axis == 0:  # whole rows: one pass in a comprehension (millions of cells)
+                if delta > 0:
+                    return {((r + delta, c) if r >= at else (r, c)): v for (r, c), v in d.items()
+                            if r < at or r + delta < limit}
+                return {((r + delta, c) if r >= end else (r, c)): v for (r, c), v in d.items() if not at <= r < end}
+            if band is None:
+                if delta > 0:
+                    return {((r, c + delta) if c >= at else (r, c)): v for (r, c), v in d.items()
+                            if c < at or c + delta < limit}
+                return {((r, c + delta) if c >= end else (r, c)): v for (r, c), v in d.items() if not at <= c < end}
             out = {}
             for (r, c), v in d.items():
                 idx, other = (r, c) if axis == 0 else (c, r)
@@ -2257,10 +4631,48 @@ class Workbook:
             return {n for i in indices if (n := move(i)) is not None}
 
         sh = self.sheets[sheet]
-        sh.cells, sh.formats = remap(sh.cells), remap(sh.formats)
+        sh.cells, sh.formats, sh.notes = remap(sh.cells), remap(sh.formats), remap(sh.notes)
+        sh.links = remap(sh.links)
         sh.set_merges(m for m in map(move_rect, sh.merges) if m and (m[0], m[1]) != (m[2], m[3]))
         sh.cond_formats = [dict(rule, range=rect) for rule in sh.cond_formats
                            if (rect := move_rect(rule["range"])) is not None]
+        sh.validations = [dict(rule, range=rect) for rule in sh.validations
+                          if (rect := move_rect(rule["range"])) is not None]
+        for other in self.sheets.values():  # pivots reading this sheet, wherever their reports are
+            for p in other.pivots:
+                if p["source"]["sheet"].lower() == target:
+                    p["source"]["range"] = move_rect(p["source"]["range"]) or p["source"]["range"]
+        if band is None and sh.page_setup:
+            ps = dict(sh.page_setup)
+            if ps.get("area"):
+                ps["area"] = move_rect(ps["area"])
+            if axis == 0 and ps.get("titles"):
+                span = move_span(*ps["titles"])
+                ps["titles"] = tuple(span) if span else None
+            key = "breaks" if axis == 0 else "col_breaks"
+            if ps.get(key):
+                ps[key] = sorted(move_set(ps[key]))
+            sh.page_setup = ps
+        if band is None:
+            for p in sh.pivots:
+                r, c = p["anchor"]
+                n = move(r if axis == 0 else c)
+                n = min(at, limit - 1) if n is None else n
+                p["anchor"] = (n, c) if axis == 0 else (r, n)
+                if p["rect"]:
+                    p["rect"] = move_rect(p["rect"])
+        charts = []
+        for chart in sh.charts:
+            rect = move_rect(chart["range"]) if chart.get("range") else None
+            if rect is None and chart.get("range"):  # its data is gone
+                continue
+            r, c, dx, dy = chart["anchor"]
+            if band is None:  # charts sit on whole rows/columns: they move when those do
+                n = move(r if axis == 0 else c)
+                n = min(at, limit - 1) if n is None else n
+                r, c = (n, c) if axis == 0 else (r, n)
+            charts.append(dict(chart, anchor=(r, c, dx, dy), **({"range": rect} if rect else {})))
+        sh.charts = charts
         if sh.filter:
             rect = move_rect(sh.filter["range"])
             if rect is None:
@@ -2272,22 +4684,254 @@ class Workbook:
                 elif band is None:
                     sh.filter["criteria"] = {n: v for c, v in sh.filter["criteria"].items()
                                              if (n := move(c)) is not None}
+        if band is None and sh.freeze:
+            sh.freeze = _shift_freeze(sh.freeze, axis, at, move_span)
         if band is None and axis == 0:
             sh.row_heights = {n: h for r, h in sh.row_heights.items() if (n := move(r)) is not None}
             sh.custom_rows, sh.hidden_rows = move_set(sh.custom_rows), move_set(sh.hidden_rows)
         elif band is None:
             sh.col_widths = {n: w for c, w in sh.col_widths.items() if (n := move(c)) is not None}
             sh.hidden_cols = move_set(sh.hidden_cols)
+        if band is None:
+            levels = {n: v for i, v in (sh.row_levels if axis == 0 else sh.col_levels).items()
+                      if (n := move(i)) is not None}
+            if delta > 0:  # rows inserted inside a group join it, as in Excel
+                inner = min(levels.get(at - 1, 0), levels.get(at + delta, 0))
+                levels.update({i: inner for i in range(at, min(at + delta, limit)) if inner})
+            if axis == 0:
+                sh.row_levels, sh.collapsed_rows = levels, move_set(sh.collapsed_rows)
+            else:
+                sh.col_levels, sh.collapsed_cols = levels, move_set(sh.collapsed_cols)
         self._ast.clear()
         self.invalidate()
 
+    # outline (Data > Group)
+    def _outline(self, sheet, axis):
+        sh = self.sheets[sheet]
+        if axis == 0:
+            return sh.row_levels, sh.hidden_rows, sh.collapsed_rows
+        return sh.col_levels, sh.hidden_cols, sh.collapsed_cols
+
+    def group(self, sheet, axis, i1, i2, delta=1):
+        """Group (delta 1) or ungroup (delta -1) rows (axis 0) or columns i1..i2 by one outline level.
+        Returns False when there was nothing to ungroup."""
+        levels, hidden, marks = self._outline(sheet, axis)
+        changed = False
+        for i in range(i1, i2 + 1):
+            n = max(0, min(MAX_OUTLINE, levels.get(i, 0) + delta))
+            changed |= n != levels.get(i, 0)
+            if n:
+                levels[i] = n
+            else:
+                levels.pop(i, None)
+        ends = {b + 1 for _, _, b in outline_groups(levels)}
+        marks.intersection_update(ends)
+        return changed
+
+    def clear_outline(self, sheet, axis):
+        """Ungroup everything on an axis, showing what collapsed groups had hidden."""
+        levels, hidden, marks = self._outline(sheet, axis)
+        for _, a, b in outline_groups(levels):
+            if b + 1 in marks:
+                hidden.difference_update(range(a, b + 1))
+        levels.clear()
+        marks.clear()
+
+    def set_collapsed(self, sheet, axis, level, start, end, collapsed):
+        """Collapse (hide) or expand a group; expanding keeps the collapsed groups inside it hidden."""
+        levels, hidden, marks = self._outline(sheet, axis)
+        if collapsed:
+            hidden.update(range(start, end + 1))
+            marks.add(end + 1)
+            return
+        marks.discard(end + 1)
+        hidden.difference_update(range(start, end + 1))
+        for lv, a, b in outline_groups(levels):
+            if lv > level and start <= a and b <= end and b + 1 in marks:
+                hidden.update(range(a, b + 1))
+
+    def show_level(self, sheet, axis, n):
+        """The outline's level buttons: show what is above level n, collapse every group of level n or deeper."""
+        levels, hidden, marks = self._outline(sheet, axis)
+        for i, lv in levels.items():
+            if lv >= n:
+                hidden.add(i)
+            else:
+                hidden.discard(i)
+        marks.clear()
+        marks.update(b + 1 for lv, _, b in outline_groups(levels) if lv >= n)
+
+    def remove_subtotals(self, sheet, rect):
+        """Data > Subtotal > Remove All: delete the rows holding SUBTOTAL formulas in a table and its
+        row outline. Returns the table's rectangle afterwards."""
+        r1, c1, r2, c2 = rect
+        sh = self.sheets[sheet]
+        rows = [r for r in range(r2, r1, -1)
+                if any(_SUBTOTAL_RE.match(sh.cells.get((r, c), "")) for c in range(c1, c2 + 1))]
+        for r in rows:
+            self.delete_rows(sheet, r)
+        r2 -= len(rows)
+        levels, hidden, marks = self._outline(sheet, 0)
+        for r in range(r1, r2 + 2):
+            levels.pop(r, None)
+            marks.discard(r)
+        hidden.difference_update(range(r1, r2 + 1))
+        return r1, c1, r2, c2
+
+    def add_subtotals(self, sheet, rect, by, func, columns, replace=True):
+        """Data > Subtotal on a table whose first row holds headers: after each run of equal values in
+        column `by` insert a row "<value> <name>" with =SUBTOTAL(func, ...) under `columns`, then a grand
+        total row, and outline the rows (level 1: grand total, 2: subtotals, 3: everything).
+        Returns the table's rectangle afterwards."""
+        if replace:
+            rect = self.remove_subtotals(sheet, rect)
+        r1, c1, r2, c2 = rect
+        sh = self.sheets[sheet]
+        name, grand = SUBTOTAL_NAMES.get(func, SUBTOTAL_NAMES[9])
+        runs = []
+        for r in range(r1 + 1, r2 + 1):
+            key = self.display_text(sheet, r, by)
+            if runs and runs[-1][2] == key:
+                runs[-1][1] = r
+            else:
+                runs.append([r, r, key])
+        if not runs:
+            return rect
+        bold = {"bold": True}
+
+        def total_row(row, label, first, last):
+            self.set_raw(sheet, row, by, label)
+            self.set_format(sheet, row, by, {**(self.get_format(sheet, last, by) or {}), **bold})
+            for c in columns:
+                self.set_raw(sheet, row, c, f"=SUBTOTAL({func},{range_name(first, c, last, c)})")
+                num = (self.get_format(sheet, last, c) or {}).get("num")
+                self.set_format(sheet, row, c, {**bold, **({"num": num} if num else {})})
+        offset, groups = 0, []
+        for start, end, key in runs:
+            start, end = start + offset, end + offset
+            self.insert_rows(sheet, end + 1)
+            total_row(end + 1, f"{key} {name}".strip(), start, end)
+            groups.append((start, end))
+            offset += 1
+        last = r2 + offset
+        self.insert_rows(sheet, last + 1)
+        total_row(last + 1, grand, r1 + 1, last)
+        sh.row_levels.pop(last + 1, None)  # the grand total row is not part of the outline it closes
+        self.group(sheet, 0, r1 + 1, last)
+        for start, end in groups:
+            self.group(sheet, 0, start, end)
+        self.invalidate()
+        return r1, c1, last + 1, c2
+
+    def special_cells(self, sheet, rect, kind, types=("number", "text", "logical", "error")):
+        """Home > Find & Select > Go To Special: the cells of `rect` that are notes, constants, formulas
+        (of the value types given), blanks (inside the used area), visible, with conditional formats or
+        with data validation; "last" gives the last used cell."""
+        sh = self.sheets[sheet]
+        r1, c1, r2, c2 = rect
+        rows, cols = self.used_extent(sheet)
+        r2, c2 = min(r2, rows - 1), min(c2, cols - 1)
+
+        def inside(key):
+            return r1 <= key[0] <= r2 and c1 <= key[1] <= c2
+
+        def of_type(r, c):
+            v = self.get_value(sheet, r, c)
+            kind_ = ("error" if isinstance(v, CellError) else "logical" if isinstance(v, bool)
+                     else "number" if is_number(v) else "text")
+            return kind_ in types
+        if kind == "last":
+            return [(rows - 1, cols - 1)] if rows else []
+        if kind == "notes":
+            return sorted(k for k in sh.notes if inside(k))
+        if kind in ("constants", "formulas"):
+            want = kind == "formulas"
+            return sorted(k for k, raw in sh.cells.items() if inside(k) and is_formula(raw) == want and of_type(*k))
+        if kind == "visible":
+            return [(r, c) for r in range(r1, r2 + 1) if not sh.row_hidden(r)
+                    for c in range(c1, c2 + 1) if c not in sh.hidden_cols]
+        rules = {"cf": sh.cond_formats, "validation": sh.validations}.get(kind)
+        if rules is not None:
+            return sorted({(r, c) for rule in rules for r in range(max(r1, rule["range"][0]), min(r2, rule["range"][2]) + 1)
+                           for c in range(max(c1, rule["range"][1]), min(c2, rule["range"][3]) + 1)})
+        if kind == "blanks":
+            return [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) not in sh.cells]
+        raise ValueError(kind)
+
+    @_bulky
     def snapshot(self):
-        return [(s.name, s.copy_state()) for s in self.sheets.values()]
+        return [(s.name, s.copy_state()) for s in self.sheets.values()], copy.deepcopy(self.names)
 
+    @_bulky
     def restore(self, snap):
-        self.sheets = {name: Sheet.from_state(name, state) for name, state in snap}
+        sheets, names = snap
+        self.sheets = {name: Sheet.from_state(name, state) for name, state in sheets}
+        self.names = copy.deepcopy(names)
+        self._names_ast.clear()
         self._ast.clear()
         self.invalidate()
+
+    # defined names (Formulas > Name Manager)
+    def check_name(self, name, ignore=None):
+        """Error message (shown in the UI) when `name` can't be a defined name, else None."""
+        if not name:
+            return "Tên không được để trống."
+        if len(name) > 255 or not _DEFINED_NAME_RE.match(name):
+            return ("Tên phải bắt đầu bằng chữ cái hoặc dấu gạch dưới và chỉ gồm chữ, số, dấu chấm, gạch dưới "
+                    "(không có khoảng trắng).")
+        if _REF_LIKE_RE.match(name) or name.upper() in ("TRUE", "FALSE"):
+            return "Tên không được giống địa chỉ ô (như A1, R1C1) hay TRUE/FALSE."
+        if name.upper() in self.names and name.upper() != (ignore or "").upper():
+            return "Đã có tên này trong sổ làm việc."
+        return None
+
+    def define_name(self, name, ref, comment="", old=None):
+        """Add a name, or replace `old`; ref is a formula such as '=Sheet1!$A$1:$A$9' or '=0.1'."""
+        err = self.check_name(name, ignore=old)
+        if err:
+            raise ValueError(err)
+        if old:
+            self.names.pop(old.upper(), None)
+        ref = ref.strip()
+        self.names[name.upper()] = {"name": name, "ref": normalize_formula(ref if ref.startswith("=") else "=" + ref),
+                                    "comment": comment}
+        self._names_ast.clear()
+        self.invalidate()
+
+    def sorted_names(self):
+        """The defined names' entries in natural Vietnamese alphabetical order."""
+        return sorted(self.names.values(), key=lambda d: natural_key(d["name"]))
+
+    def delete_name(self, name):
+        self.names.pop(name.upper(), None)
+        self._names_ast.clear()
+        self.invalidate()
+
+    def name_target(self, name):
+        """(sheet, (r1, c1, r2, c2)) when a name refers to a block of cells, else None."""
+        d = self.names.get(name.upper())
+        ast = parse_formula(d["ref"]) if d else None
+        if not ast or ast[0] not in ("ref", "range") or ast[1] is None:
+            return None
+        sheet = self.resolve_sheet(ast[1])
+        if sheet is None:
+            return None
+        return (sheet, ast[2:4] * 2) if ast[0] == "ref" else (sheet, ast[2:6])
+
+    def name_value(self, name):
+        """Short text of what a name gives now, for the Name Manager."""
+        try:
+            value = self._eval(self._name_ast(name.upper()), next(iter(self.sheets)))
+        except CellError as err:
+            return err.code
+        except RecursionError:
+            return REF
+        if isinstance(value, RangeRef):
+            if value.nrows * value.ncols == 1:
+                return format_value(value.value(0, 0), None)
+            values = [format_value(v, None) for _, v in zip(range(7), value.values())]
+            return "{" + "; ".join(values[:6]) + ("; ..." if len(values) > 6 else "") + "}"
+        return format_value(value, None)
 
     # serialisation
     def to_dict(self, active=None):
@@ -2305,12 +4949,49 @@ class Workbook:
                 "cond_formats": [dict(rule, range=range_name(*rule["range"])) for rule in s.cond_formats],
                 "tab_color": s.tab_color,
             }
+            if s.freeze:
+                d["freeze"] = list(s.freeze)
+            if s.row_levels or s.col_levels:
+                d["outline"] = {"rows": {str(r + 1): v for r, v in sorted(s.row_levels.items())},
+                                "cols": {col_name(c): v for c, v in sorted(s.col_levels.items())},
+                                "collapsed_rows": sorted(r + 1 for r in s.collapsed_rows),
+                                "collapsed_cols": [col_name(c) for c in sorted(s.collapsed_cols)]}
+            if s.validations:
+                d["validations"] = [dict(rule, range=range_name(*rule["range"])) for rule in s.validations]
+            if s.notes:
+                d["notes"] = {cell_name(r, c): text for (r, c), text in sorted(s.notes.items())}
+            if s.hidden:
+                d["hidden"] = True
+            if s.protection:
+                d["protection"] = {"hash": s.protection.get("hash", ""), "allow": list(s.protection.get("allow", []))}
+            if s.links:
+                d["links"] = {cell_name(r, c): link for (r, c), link in sorted(s.links.items())}
+            if s.charts:
+                d["charts"] = [dict(ch, anchor=list(ch["anchor"]), size=list(ch["size"]),
+                                    **({"range": range_name(*ch["range"])} if ch.get("range") else {}))
+                               for ch in s.charts]
+            if s.pivots:
+                d["pivots"] = [_pivot_to_dict(p) for p in s.pivots]
+            if s.page_setup:
+                ps = dict(s.page_setup)
+                if ps.get("area"):
+                    ps["area"] = range_name(*ps["area"])
+                if ps.get("titles"):
+                    ps["titles"] = [ps["titles"][0] + 1, ps["titles"][1] + 1]
+                for key in ("breaks", "col_breaks"):
+                    if ps.get(key):
+                        ps[key] = [i + 1 for i in ps[key]]
+                d["page_setup"] = ps
             if s.filter:
                 d["filter"] = {"range": range_name(*s.filter["range"]),
-                               "criteria": {col_name(c): sorted(v) for c, v in s.filter["criteria"].items()}}
+                               "criteria": {col_name(c): v if isinstance(v, dict) else sorted(v)
+                                            for c, v in s.filter["criteria"].items()}}
             return d
-        return {"format": FILE_TAG, "version": 2, "active": active,
-                "sheets": [sheet_dict(s) for s in self.sheets.values()]}
+        out = {"format": FILE_TAG, "version": 2, "active": active,
+               "sheets": [sheet_dict(s) for s in self.sheets.values()]}
+        if self.names:
+            out["names"] = [dict(d) for _, d in sorted(self.names.items())]
+        return out
 
     @classmethod
     def from_dict(cls, data):
@@ -2334,24 +5015,104 @@ class Workbook:
             sh.custom_rows = {int(r) - 1 for r in sd.get("custom_rows", [])}
             sh.hidden_rows = {int(r) - 1 for r in sd.get("hidden_rows", [])}
             sh.hidden_cols = {col_index(c) for c in sd.get("hidden_cols", [])}
+            outline = sd.get("outline") or {}
+            sh.row_levels = {int(r) - 1: int(v) for r, v in outline.get("rows", {}).items()}
+            sh.col_levels = {col_index(c): int(v) for c, v in outline.get("cols", {}).items()}
+            sh.collapsed_rows = {int(r) - 1 for r in outline.get("collapsed_rows", [])}
+            sh.collapsed_cols = {col_index(c) for c in outline.get("collapsed_cols", [])}
             sh.set_merges(m for m in map(parse_range, sd.get("merges", [])) if m)
             sh.cond_formats = [dict(rule, range=parse_range(rule["range"])) for rule in sd.get("cond_formats", [])
                                if parse_range(rule.get("range", ""))]
             sh.tab_color = sd.get("tab_color")
+            freeze = sd.get("freeze")
+            if isinstance(freeze, list) and len(freeze) == 4:
+                sh.freeze = tuple(int(v) for v in freeze)
+            sh.validations = [dict(rule, range=parse_range(rule["range"])) for rule in sd.get("validations", [])
+                              if parse_range(rule.get("range", ""))]
+            for addr, text in sd.get("notes", {}).items():
+                pos = parse_address(addr)
+                if pos and len(pos) == 2 and text:
+                    sh.notes[pos] = str(text)
+            sh.hidden = bool(sd.get("hidden"))
+            prot = sd.get("protection")
+            if isinstance(prot, dict):
+                sh.protection = {"hash": str(prot.get("hash") or ""), "allow": [str(a) for a in prot.get("allow", [])]}
+            for addr, link in sd.get("links", {}).items():
+                pos = parse_address(addr)
+                if pos and len(pos) == 2 and isinstance(link, dict) and link.get("target"):
+                    sh.links[pos] = {"target": str(link["target"]), "tip": str(link.get("tip") or "")}
+            sh.pivots = [p for p in map(_pivot_from_dict, sd.get("pivots", [])) if p]
+            ps = sd.get("page_setup")
+            if isinstance(ps, dict):
+                ps = dict(ps)
+                ps["area"] = parse_range(ps["area"]) if ps.get("area") else None
+                ps["titles"] = (int(ps["titles"][0]) - 1, int(ps["titles"][1]) - 1) if ps.get("titles") else None
+                for key in ("breaks", "col_breaks"):
+                    ps[key] = [int(i) - 1 for i in ps.get(key, [])]
+                sh.page_setup = ps
+            for ch in sd.get("charts", []):
+                if ch.get("type") == SHAPE:
+                    sh.charts.append(_shape_from_dict(ch))
+                    continue
+                if ch.get("type") == PICTURE and ch.get("image"):
+                    sh.charts.append(dict(ch, id=ch.get("id") or new_picture_id(),
+                                          anchor=tuple(ch.get("anchor", (0, 0, 0, 0))),
+                                          size=tuple(ch.get("size", CHART_SIZE))))
+                    continue
+                rect = parse_range(ch.get("range", ""))
+                if rect and ch.get("type") in CHART_TYPES:
+                    sh.charts.append(dict(ch, range=rect, anchor=tuple(ch.get("anchor", (0, 0, 0, 0))),
+                                          size=tuple(ch.get("size", CHART_SIZE))))
             f = sd.get("filter")
             if f and parse_range(f.get("range", "")):
                 sh.filter = {"range": parse_range(f["range"]), "hidden": set(),
-                             "criteria": {col_index(c): set(v) for c, v in f.get("criteria", {}).items()}}
+                             "criteria": {col_index(c): dict(v) if isinstance(v, dict) else set(v)
+                                          for c, v in f.get("criteria", {}).items()}}
         if not wb.sheets:
             wb.add_sheet()
         for name in wb.sheets:  # after every sheet exists, so cross-sheet formulas resolve
             wb.apply_filter(name)
+        if not wb.visible_sheets():
+            next(iter(wb.sheets.values())).hidden = False
+        for d in data.get("names", []):
+            if isinstance(d, dict) and wb.check_name(str(d.get("name", ""))) is None and d.get("ref"):
+                wb.define_name(d["name"], str(d["ref"]), str(d.get("comment") or ""))
         wb.active = data.get("active") if data.get("active") in wb.sheets else None
         return wb
 
 
+def _pivot_to_dict(p):
+    return dict(p, source={"sheet": p["source"]["sheet"], "range": range_name(*p["source"]["range"])},
+                anchor=cell_name(*p["anchor"]), rect=range_name(*p["rect"]) if p["rect"] else None,
+                items={f: sorted(v) for f, v in p["items"].items()}, values=[dict(v) for v in p["values"]])
+
+
+def _pivot_from_dict(d):
+    """A pivot read back from a file, or None when it is unusable."""
+    try:
+        rect, anchor = parse_range(d["source"]["range"]), parse_address(d["anchor"])
+        if not rect or not anchor or len(anchor) != 2:
+            return None
+        p = dict(d, source={"sheet": str(d["source"]["sheet"]), "range": rect}, anchor=anchor,
+                 rect=parse_range(d["rect"]) if d.get("rect") else None,
+                 items={f: set(v) for f, v in d.get("items", {}).items()},
+                 values=[dict(v) for v in d.get("values", [])])
+        for key in ("filters", "cols", "rows"):
+            p[key] = [str(f) for f in d.get(key, [])]
+        for key, default in (("sort", {}), ("group", {}), ("grand_rows", True), ("grand_cols", True),
+                             ("subtotals", True), ("layout", "compact"), ("name", "PivotTable")):
+            p.setdefault(key, default)
+        return p
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
+PIVOT_STORE = "_PyExcelPivots"  # very hidden sheet keeping pivot definitions in .xlsx files
+
+
 # ------------------------------------------------------------------ files
 
+@_bulky
 def load_workbook(path):
     ext = os.path.splitext(path)[1].lower()
     if ext in (".xlsx", ".xlsm"):
@@ -2362,6 +5123,7 @@ def load_workbook(path):
         return Workbook.from_dict(json.load(f))
 
 
+@_bulky
 def save_workbook(wb, path, active=None):
     """Write the workbook; CSV keeps only the `active` sheet's displayed values."""
     ext = os.path.splitext(path)[1].lower()
@@ -2374,28 +5136,185 @@ def save_workbook(wb, path, active=None):
             json.dump(wb.to_dict(active), f, ensure_ascii=False, indent=1)
 
 
-def _load_csv(path):
-    with open(path, "rb") as f:
-        data = f.read()
-    for enc in ("utf-8-sig", "cp1258", "latin-1"):
+# text files (.csv, .txt): reading them as Excel does
+TEXT_ENCODINGS = [("auto", "Tự động nhận"), ("utf-8", "UTF-8"), ("utf-16", "UTF-16 (Unicode)"),
+                  ("cp1258", "Windows-1258 (Tiếng Việt)"), ("cp1252", "Windows-1252 (Tây Âu)"),
+                  ("cp932", "Shift-JIS (Tiếng Nhật)"), ("tcvn3", "TCVN3 (ABC, phông .Vn...)"),
+                  ("vni", "VNI (phông VNI-...)")]
+_VN_TONE_MARKS = re.compile("[a-zA-Z\u00c0-\u01b0][\u0300\u0301\u0303\u0309\u0323]")
+_COMBINING = re.compile("[\u0300-\u036f]")
+
+
+def ansi_code_page():
+    """Windows' ANSI code page (what Excel reads a CSV without BOM with), e.g. 'cp1258' or 'cp1252'."""
+    if sys.platform == "win32":
         try:
-            text = data.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
+            import ctypes
+            return f"cp{ctypes.windll.kernel32.GetACP()}"
+        except (AttributeError, OSError):
+            pass
+    return "cp1252"
+
+
+def decode_text(data, encoding="auto"):
+    """(text, encoding) of a text file's bytes. Automatic detection follows Excel: a byte-order mark
+    decides (UTF-8, UTF-16); UTF-16 without one shows by its zero bytes; text that is valid UTF-8 is
+    UTF-8; anything else is in the Windows ANSI code page - Windows-1258 when it reads as Vietnamese.
+    Vietnamese written with separate tone marks (Windows-1258, "Unicode tổ hợp") is composed into the
+    usual precomposed letters, which is how Excel shows it."""
+    if encoding in ("tcvn3", "vni"):
+        text = legacy_vietnamese(data.decode("latin-1"), encoding)
+    elif encoding not in (None, "", "auto"):
+        text = data.decode("utf-8-sig" if encoding == "utf-8" else encoding, errors="replace")
+    elif data.startswith(b"\xef\xbb\xbf"):
+        encoding, text = "utf-8", data[3:].decode("utf-8", errors="replace")
+    elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding, text = "utf-16", data.decode("utf-16", errors="replace")
+    else:
+        head = data[:4096]
+        odd, even = head[1::2].count(0), head[0::2].count(0)
+        if len(head) >= 4 and max(odd, even) > len(head) // 6:  # UTF-16 without BOM: every other byte is 0
+            encoding = "utf-16-le" if odd > even else "utf-16-be"
+            text = data.decode(encoding, errors="replace")
+        else:
+            try:
+                encoding, text = "utf-8", data.decode("utf-8")
+            except UnicodeDecodeError:
+                text, encoding = _decode_ansi(data)
+    if _COMBINING.search(text):
+        text = unicodedata.normalize("NFC", text)
+    return text, encoding
+
+
+_DBCS_CODE_PAGES = ("cp932", "cp936", "cp949", "cp950")  # Japanese, Chinese, Korean Windows
+_PRIVATE_USE = re.compile("[\ue000-\uf8ff]")
+
+
+def _decode_ansi(data):
+    """(text, encoding) of a file in a Windows ANSI code page. On a Japanese, Chinese or Korean Windows its
+    two-byte code page comes first: text that reads in it cleanly is not Vietnamese (half-width katakana
+    such as ﾃﾞ look like a letter with a tone mark in Windows-1258), while Vietnamese read that way breaks
+    or lands in the user-defined area (ư, ơ, đ)."""
+    ansi = ansi_code_page()
+    if ansi in _DBCS_CODE_PAGES:
+        try:
+            text = data.decode(ansi)
+            if not _PRIVATE_USE.search(text):
+                return text, ansi
+        except (UnicodeDecodeError, LookupError):
+            pass
+    vietnamese = data.decode("cp1258", errors="replace")
+    if ansi == "cp1258" or _VN_TONE_MARKS.search(vietnamese):
+        return vietnamese, "cp1258"
     try:
-        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
-    except csv.Error:
-        dialect = csv.excel
+        return data.decode(ansi), ansi
+    except (UnicodeDecodeError, LookupError):
+        return data.decode("cp1252", errors="replace"), "cp1252"
+
+
+_TCVN3_FROM = "¸µ¶·¹¨¾»¼½Æ©ÊÇÈÉË®ÐÌÎÏÑªÕÒÓÔÖÝ×ØÜÞãßáâä«èåæçé¬íêëìîóïñòô­øõö÷ùýúûüþ¡¢§£¤¥¦"
+_TCVN3_TO = "áàảãạăắằẳẵặâấầẩẫậđéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵĂÂĐÊÔƠƯ"
+_TCVN3 = dict(zip(_TCVN3_FROM, _TCVN3_TO))
+_VNI_LOWER = {
+    "aù": "á", "aø": "à", "aû": "ả", "aõ": "ã", "aï": "ạ",
+    "aâ": "â", "aá": "ấ", "aà": "ầ", "aå": "ẩ", "aã": "ẫ", "aä": "ậ",
+    "aê": "ă", "aé": "ắ", "aè": "ằ", "aú": "ẳ", "aü": "ẵ", "aë": "ặ",
+    "eù": "é", "eø": "è", "eû": "ẻ", "eõ": "ẽ", "eï": "ẹ",
+    "eâ": "ê", "eá": "ế", "eà": "ề", "eå": "ể", "eã": "ễ", "eä": "ệ",
+    "í": "í", "ì": "ì", "æ": "ỉ", "ó": "ĩ", "ò": "ị",
+    "où": "ó", "oø": "ò", "oû": "ỏ", "oõ": "õ", "oï": "ọ",
+    "oâ": "ô", "oá": "ố", "oà": "ồ", "oå": "ổ", "oã": "ỗ", "oä": "ộ",
+    "ô": "ơ", "ôù": "ớ", "ôø": "ờ", "ôû": "ở", "ôõ": "ỡ", "ôï": "ợ",
+    "uù": "ú", "uø": "ù", "uû": "ủ", "uõ": "ũ", "uï": "ụ",
+    "ö": "ư", "öù": "ứ", "öø": "ừ", "öû": "ử", "öõ": "ữ", "öï": "ự",
+    "yù": "ý", "yø": "ỳ", "yû": "ỷ", "yõ": "ỹ", "î": "ỵ", "ñ": "đ"}
+_VNI = {**_VNI_LOWER, **{k.upper(): v.upper() for k, v in _VNI_LOWER.items()}}
+
+
+def legacy_vietnamese(text, kind):
+    """Text in the old 8-bit Vietnamese encodings - TCVN3 (ABC, .Vn... fonts) or VNI (VNI-... fonts), read
+    byte for byte as Latin-1 - in Unicode."""
+    if kind == "tcvn3":
+        return "".join(_TCVN3.get(ch, ch) for ch in text)
+    out, i = [], 0
+    while i < len(text):  # VNI: a letter followed by mark characters; the longest match wins
+        pair = text[i:i + 2]
+        if len(pair) == 2 and pair in _VNI:
+            out.append(_VNI[pair])
+            i += 2
+        else:
+            out.append(_VNI.get(text[i], text[i]))
+            i += 1
+    return "".join(out)
+
+
+_NUM_COMMA_DECIMAL = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d+)?")
+_NUM_DOT_DECIMAL = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
+
+
+def comma_decimals(values):
+    """True when numbers in these texts are written the Vietnamese / European way (1.234,5)."""
+    comma = dot = 0
+    for v in values:
+        v = v.strip()
+        if _NUM_COMMA_DECIMAL.fullmatch(v) and not _NUM_DOT_DECIMAL.fullmatch(v):
+            comma += 1   # 1.234,5 / 12,5 / 1.234.567
+        elif _NUM_DOT_DECIMAL.fullmatch(v) and not _NUM_COMMA_DECIMAL.fullmatch(v):
+            dot += 1     # 1,234.5 / 12.50 / 1,234,567
+    return comma > dot
+
+
+def read_text_table(data, encoding="auto", delimiter="auto", decimal_comma="auto"):
+    """Rows of a delimited text file plus what was used: (rows, encoding, delimiter, decimal_comma).
+    Numbers written as 1.234,5 become 1234.5 when the file uses decimal commas."""
+    text, encoding = decode_text(data, encoding)
+    if delimiter in (None, "", "auto"):
+        sample = text[:20000]
+        lines = [line for line in sample.splitlines()[:50] if line.strip()]
+        counts = {d: [line.count(d) for line in lines] for d in ("\t", ";", ",", "|")}
+        # the delimiter found the same number of times on most lines (Excel's list separator wins ties)
+        def score(d):
+            seen = [n for n in counts[d] if n]
+            return (min(seen) if seen and max(seen) == min(seen) else 0, len(seen)) if seen else (0, 0)
+        delimiter = max(("\t", ";", ",", "|"), key=score)
+        if score(delimiter) == (0, 0):
+            try:
+                delimiter = csv.Sniffer().sniff(sample[:4096], delimiters=",;\t|").delimiter
+            except csv.Error:
+                delimiter = ","
+    rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
+    if decimal_comma == "auto":
+        decimal_comma = delimiter != "," and comma_decimals(v for row in rows[:500] for v in row)
+    if decimal_comma:
+        for row in rows:
+            for i, v in enumerate(row):
+                s = v.strip()
+                if s and s[0] in "-0123456789" and _NUM_COMMA_DECIMAL.fullmatch(s) and ("," in s or "." in s):
+                    row[i] = s.replace(".", "").replace(",", ".")
+    return rows, encoding, delimiter, bool(decimal_comma)
+
+
+def _load_csv(path, **options):
+    with open(path, "rb") as f:
+        rows, encoding, delimiter, decimal_comma = read_text_table(f.read(), **options)
     wb = Workbook()
-    sh = wb.sheets["Sheet1"]
-    for r, row in enumerate(csv.reader(io.StringIO(text), dialect)):
-        if r >= MAX_ROWS:
-            break
-        for c, val in enumerate(row[:MAX_COLS]):
-            if val != "":
-                sh.cells[(r, c)] = val
+    wb.sheets["Sheet1"].cells = table_cells(rows)
+    wb.import_info = {"encoding": encoding, "delimiter": delimiter, "decimal_comma": decimal_comma,
+                      "truncated": len(rows) > MAX_ROWS or any(len(row) > MAX_COLS for row in rows)}
     return wb
+
+
+ENCODING_NAMES = {"utf-8": "UTF-8", "utf-16": "UTF-16", "utf-16-le": "UTF-16", "utf-16-be": "UTF-16",
+                  "cp932": "Shift-JIS (Tiếng Nhật)", "cp936": "GBK (Tiếng Trung)", "cp949": "Tiếng Hàn",
+                  "cp950": "Big5 (Tiếng Trung phồn thể)",
+                  "cp1258": "Windows-1258 (Tiếng Việt)", "cp1252": "Windows-1252", "tcvn3": "TCVN3", "vni": "VNI"}
+DELIMITER_NAMES = {",": "dấu phẩy", ";": "dấu chấm phẩy", "\t": "Tab", " ": "dấu cách", "|": "dấu |"}
+
+
+def table_cells(rows, r0=0, c0=0):
+    """{(row, col): text} of a table's non-empty values (a CellStore, built in one go)."""
+    return CellStore(((r, c), val) for r, row in enumerate(rows[:MAX_ROWS - r0], r0)
+                     for c, val in enumerate(row[:MAX_COLS - c0], c0) if val != "")
 
 
 def _save_csv(wb, sheet, path):
@@ -2408,7 +5327,7 @@ def _save_csv(wb, sheet, path):
 
 _XL_OPS = {">": "greaterThan", "<": "lessThan", ">=": "greaterThanOrEqual", "<=": "lessThanOrEqual",
            "=": "equal", "<>": "notEqual", "between": "between", "notbetween": "notBetween"}
-_XL_BORDER = {"hair": "thin", "mediumDashed": "dashed", "dashDot": "dashed", "mediumDashDot": "dashed",
+_XL_BORDER = {"mediumDashed": "dashed", "dashDot": "dashed", "mediumDashDot": "dashed",
               "dashDotDot": "dotted", "mediumDashDotDot": "dashed", "slantDashDot": "dashed"}
 
 
@@ -2424,11 +5343,18 @@ def _xl_hex(color):
 
 
 def _numfmt_from_xlsx(cell):
-    nf = cell.number_format or "General"
+    return excel_number_format(cell.number_format or "General", getattr(cell, "is_date", False))
+
+
+def excel_number_format(nf, is_date=None):
+    """PyExcel's number format for an Excel format code (from an .xlsx file or the clipboard); is_date: whether
+    it shows dates or times (None: tell from the code)."""
     if nf in ("General", "@"):
         return None if nf == "General" else "@"
     low = nf.lower()
-    if getattr(cell, "is_date", False):
+    if is_date is None:
+        is_date = bool(re.search(r"[dyhs]", re.sub(r'"[^"]*"|\\.|\[[^\]]*\]|_.|\*.', "", low)))
+    if is_date:
         if "h" in low:
             return "dd/mm/yyyy hh:mm" if ("d" in low or "y" in low) else "hh:mm"
         return "dd/mm/yyyy"
@@ -2445,6 +5371,9 @@ def _numfmt_from_xlsx(cell):
     return None
 
 
+_MAYBE_LITERAL = re.compile(r"\d|^\s*(?:true|false|#)|^[='+-]", re.I)
+
+
 def _raw_from_xlsx(cell):
     v = cell.value
     if v is None:
@@ -2459,8 +5388,8 @@ def _raw_from_xlsx(cell):
         return number_text((v.hour * 3600 + v.minute * 60 + v.second) / 86400)
     text = str(getattr(v, "text", v))  # ArrayFormula objects keep the formula in .text
     if cell.data_type == "f" and is_formula(text):
-        return normalize_formula(text.replace("_xlfn.", "").replace("_xlws.", ""))
-    return text if parse_literal(text) == (text, None) else "'" + text
+        return formula_from_file(text)
+    return _raw_text(text)
 
 
 def _format_from_xlsx(cell):
@@ -2486,7 +5415,7 @@ def _format_from_xlsx(cell):
             fmt["bg"] = bg
     al = cell.alignment
     if al is not None:
-        if al.horizontal in ("left", "center", "right"):
+        if al.horizontal in ("left", "center", "right", "centerContinuous"):
             fmt["align"] = al.horizontal
         if al.vertical in ("top", "center"):
             fmt["valign"] = al.vertical
@@ -2506,6 +5435,12 @@ def _format_from_xlsx(cell):
     numfmt = _numfmt_from_xlsx(cell)
     if numfmt:
         fmt["num"] = numfmt
+    prot = cell.protection
+    if prot is not None:
+        if prot.locked is False:
+            fmt["unlocked"] = True
+        if prot.hidden:
+            fmt["hide_formula"] = True
     return fmt
 
 
@@ -2559,36 +5494,799 @@ def _cf_rule_from_xlsx(rule):
     return None
 
 
+_XL_VALIDATION = {"whole": "whole", "decimal": "decimal", "list": "list", "date": "date",
+                  "textLength": "length", "custom": "custom"}
+_XL_ERROR_STYLES = {"stop": "stop", "warning": "warning", "information": "info"}
+
+
+def _validation_operand(formula, kind):
+    if formula is None:
+        return ""
+    text = _cf_value_from_xlsx(formula)
+    if kind == "date" and _NUM_RE.fullmatch(text):
+        return format_date(float(text), "dd/mm/yyyy")
+    return text
+
+
+def _validations_from_xlsx(ws):
+    rules = []
+    for dv in ws.data_validations.dataValidation:
+        kind = _XL_VALIDATION.get(dv.type)
+        if kind is None:
+            continue
+        rule = {"type": kind, "blank": bool(dv.allow_blank), "style": _XL_ERROR_STYLES.get(dv.errorStyle, "stop"),
+                "error_title": dv.errorTitle or "", "error": dv.error or "",
+                "prompt_title": dv.promptTitle or "", "prompt": dv.prompt or ""}
+        if kind == "list":
+            f = str(dv.formula1 or "")
+            rule["source"] = f[1:-1].replace('""', '"') if f.startswith('"') else "=" + f
+            rule["dropdown"] = not dv.showDropDown  # Excel's flag is inverted: set means "hide the arrow"
+        else:
+            rule["op"] = {v: k for k, v in _XL_OPS.items()}.get(dv.operator or "between", "between")
+            rule["v1"] = "=" + str(dv.formula1) if kind == "custom" else _validation_operand(dv.formula1, kind)
+            if rule["op"] in ("between", "notbetween"):
+                rule["v2"] = _validation_operand(dv.formula2, kind)
+        for rg in dv.sqref.ranges:
+            if rg.min_row <= MAX_ROWS and rg.min_col <= MAX_COLS:
+                rect = (rg.min_row - 1, rg.min_col - 1, min(rg.max_row, MAX_ROWS) - 1, min(rg.max_col, MAX_COLS) - 1)
+                rules.append(dict(rule, range=rect))
+    return rules
+
+
+def _xl_validation(rule):
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    kind = rule["type"]
+
+    def operand(text):
+        text = str(text or "").strip()
+        if is_formula(text):
+            return text[1:]
+        value = parse_literal(text)[0] if text else 0
+        return number_text(value) if is_number(value) else '"' + str(value).replace('"', '""') + '"'
+
+    dv = DataValidation(type={v: k for k, v in _XL_VALIDATION.items()}[kind], allow_blank=rule.get("blank", True),
+                        showErrorMessage=True, errorStyle={v: k for k, v in _XL_ERROR_STYLES.items()}.get(
+                            rule.get("style", "stop"), "stop"),
+                        errorTitle=rule.get("error_title") or None, error=rule.get("error") or None,
+                        promptTitle=rule.get("prompt_title") or None, prompt=rule.get("prompt") or None,
+                        showInputMessage=bool(rule.get("prompt")))
+    if kind == "list":
+        source = str(rule.get("source", "")).strip()
+        dv.formula1 = source[1:] if is_formula(source) else '"' + source.replace('"', '""') + '"'
+        dv.showDropDown = not rule.get("dropdown", True)
+    elif kind == "custom":
+        dv.formula1 = operand(rule.get("v1"))
+    else:
+        dv.operator = _XL_OPS.get(rule.get("op", "between"), "between")
+        dv.formula1 = operand(rule.get("v1"))
+        if rule.get("op", "between") in ("between", "notbetween"):
+            dv.formula2 = operand(rule.get("v2"))
+    dv.add(range_name(*rule["range"]))
+    return dv
+
+
+_EMU_PER_PX = 9525
+
+
+_XL_PROTECT = {"format_cells": ("formatCells",), "format_rows_cols": ("formatRows", "formatColumns"),
+               "filter": ("autoFilter",), "objects": ("objects",)}
+
+
+def _protection_from_xlsx(prot):
+    if not prot.sheet:
+        return None
+    allow = [key for key, attrs in _XL_PROTECT.items() if all(getattr(prot, a) is False for a in attrs)]
+    return {"hash": prot.password or "", "allow": allow}
+
+
+def _xl_protection(prot, protection):
+    prot.sheet = True
+    if protection.get("hash"):
+        prot.set_password(protection["hash"], already_hashed=True)
+    for key, attrs in _XL_PROTECT.items():
+        for attr in attrs:  # in the file "formatCells=0" means formatting is allowed
+            setattr(prot, attr, key not in protection.get("allow", ()))
+
+
+def _link_from_xlsx(hl):
+    target = hl.target or (f"#{hl.location}" if hl.location else "")
+    return {"target": target, "tip": hl.tooltip or ""} if target else None
+
+
+def _xl_link(cell, link):
+    from openpyxl.worksheet.hyperlink import Hyperlink
+
+    target = link["target"]
+    ref = cell.coordinate
+    if target.startswith("#"):
+        cell.hyperlink = Hyperlink(ref=ref, location=target[1:], tooltip=link.get("tip") or None)
+    else:
+        cell.hyperlink = Hyperlink(ref=ref, target=target, tooltip=link.get("tip") or None)
+
+
+def _xl_picture(picture):
+    """An openpyxl image of a picture without needing Pillow (openpyxl's own Image class opens it)."""
+    from openpyxl.drawing.image import Image
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+    from openpyxl.drawing.xdr import XDRPositiveSize2D
+
+    class RawImage(Image):
+        def __init__(self, data, fmt, size):  # noqa: super().__init__ would need Pillow
+            self.ref, self._raw, self.format = None, data, fmt
+            self.width, self.height = size
+            self.anchor = "A1"
+
+        def _data(self):
+            return self._raw
+
+    data = base64.b64decode(picture["image"])
+    img = RawImage(data, picture.get("format", "png"), picture["size"])
+    r, c, dx, dy = picture["anchor"]
+    w, h = picture["size"]
+    img.anchor = OneCellAnchor(_from=AnchorMarker(col=c, colOff=dx * _EMU_PER_PX, row=r, rowOff=dy * _EMU_PER_PX),
+                               ext=XDRPositiveSize2D(w * _EMU_PER_PX, h * _EMU_PER_PX))
+    return img
+
+
+def _pictures_from_xlsx(ws):
+    """Pictures of a sheet (openpyxl only reads them when Pillow is installed)."""
+    pictures = []
+    for img in getattr(ws, "_images", []):
+        try:
+            data = img._data()
+        except Exception:  # unreadable picture data
+            continue
+        fmt = (img.format or "png").lower().replace("jpg", "jpeg")
+        if fmt not in ("png", "gif", "jpeg"):
+            continue
+        anchor = img.anchor
+        start = getattr(anchor, "_from", None)
+        if start is None:
+            continue
+        ext = getattr(anchor, "ext", None)
+        size = ((round(ext.width / _EMU_PER_PX), round(ext.height / _EMU_PER_PX)) if ext is not None and ext.width
+                else (img.width, img.height))
+        pictures.append({"type": PICTURE, "image": base64.b64encode(data).decode("ascii"), "format": fmt,
+                         "id": new_picture_id(), "name": "", "size": (max(8, size[0]), max(8, size[1])),
+                         "anchor": (start.row, start.col, round(start.colOff / _EMU_PER_PX),
+                                    round(start.rowOff / _EMU_PER_PX))})
+    return pictures
+
+
+def _charts_from_xlsx(ws, sh):
+    """Charts whose series all come from their own sheet, each as one block of cells (approximately
+    the bounding box of its series names, values and categories)."""
+    charts = []
+    for xl in getattr(ws, "_charts", []):
+        kind = {"BarChart": "bar" if getattr(xl, "barDir", "col") == "bar" else "column", "LineChart": "line",
+                "PieChart": "pie"}.get(type(xl).__name__)
+        refs = []
+        for ser in xl.series:
+            for holder in (ser.tx, ser.val, ser.cat):
+                ref = holder and (getattr(holder, "strRef", None) or getattr(holder, "numRef", None))
+                if ref is not None and ref.f:
+                    refs.append(ref.f)
+        rects = []
+        for f in refs:
+            sheet_part, _, addr = f.rpartition("!")
+            sheet_name = sheet_part[1:-1].replace("''", "'") if sheet_part.startswith("'") else sheet_part
+            rect = parse_range(addr.replace("$", ""))
+            if rect is None or (sheet_name and sheet_name != ws.title):
+                rects = []
+                break
+            rects.append(rect)
+        if kind is None or not rects:
+            continue
+        anchor = xl.anchor
+        start = getattr(anchor, "_from", None)
+        if start is None:
+            continue
+        ext, end = getattr(anchor, "ext", None), getattr(anchor, "to", None)
+        if ext is not None and ext.width:
+            size = (round(ext.width / _EMU_PER_PX), round(ext.height / _EMU_PER_PX))
+        elif end is not None:
+            size = (sum(sh.col_widths.get(c, DEFAULT_COL_WIDTH) for c in range(start.col, end.col))
+                    + round((end.colOff - start.colOff) / _EMU_PER_PX),
+                    sum(sh.row_heights.get(r, DEFAULT_ROW_HEIGHT) for r in range(start.row, end.row))
+                    + round((end.rowOff - start.rowOff) / _EMU_PER_PX))
+        else:
+            size = CHART_SIZE
+        title = ""
+        rich = xl.title and xl.title.tx and xl.title.tx.rich
+        if rich:
+            title = "\n".join("".join(run.t or "" for run in (p.r or [])) for p in rich.p).strip()
+        charts.append({"type": kind, "title": title,
+                       "range": (min(r[0] for r in rects), min(r[1] for r in rects),
+                                 max(r[2] for r in rects), max(r[3] for r in rects)),
+                       "anchor": (start.row, start.col, round(start.colOff / _EMU_PER_PX),
+                                  round(start.rowOff / _EMU_PER_PX)),
+                       "size": (max(60, size[0]), max(40, size[1]))})
+    return charts
+
+
+def _xl_chart(wb, sheet, ws, chart):
+    from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+    from openpyxl.drawing.xdr import XDRPositiveSize2D
+
+    (r1, c1, r2, c2), by_cols, names, cats = wb.chart_layout(sheet, chart)
+    names, cats = int(names), int(cats)  # how many header lines to skip
+    kind = chart["type"]
+    xl = PieChart() if kind == "pie" else LineChart() if kind == "line" else BarChart()
+    if kind in ("column", "bar"):
+        xl.type = "col" if kind == "column" else "bar"
+    if by_cols:
+        data = Reference(ws, min_col=c1 + 1 + cats, min_row=r1 + 1, max_col=c2 + 1, max_row=r2 + 1)
+        labels = Reference(ws, min_col=c1 + 1, min_row=r1 + 1 + names, max_row=r2 + 1) if cats else None
+    else:
+        data = Reference(ws, min_col=c1 + 1, min_row=r1 + 1 + cats, max_col=c2 + 1, max_row=r2 + 1)
+        labels = Reference(ws, min_col=c1 + 1 + names, max_col=c2 + 1, min_row=r1 + 1) if cats else None
+    xl.add_data(data, titles_from_data=bool(names), from_rows=not by_cols)
+    if labels is not None:
+        xl.set_categories(labels)
+    if chart.get("title"):
+        xl.title = chart["title"]
+    r, c, dx, dy = chart["anchor"]
+    w, h = chart["size"]
+    xl.anchor = OneCellAnchor(_from=AnchorMarker(col=c, colOff=dx * _EMU_PER_PX, row=r, rowOff=dy * _EMU_PER_PX),
+                              ext=XDRPositiveSize2D(w * _EMU_PER_PX, h * _EMU_PER_PX))
+    return xl
+
+
+_XL_FILTER_OPS = {"=": "equal", "<>": "notEqual", ">": "greaterThan", ">=": "greaterThanOrEqual",
+                  "<": "lessThan", "<=": "lessThanOrEqual"}
+_XL_DYNAMIC = {kind: kind.replace("week", "Week").replace("month", "Month").replace("year", "Year")
+               for kind in DYNAMIC_FILTERS}
+
+
+def _filter_from_xlsx(fc, book):
+    """A filter column's criterion from Excel's filterColumn, or None for kinds PyExcel lacks."""
+    if fc.filters is not None:
+        allowed = {str(v) for v in fc.filters.filter}
+        if fc.filters.blank:
+            allowed.add("")
+        return allowed
+    if fc.customFilters is not None:
+        conds = []
+        for cf in fc.customFilters.customFilter:
+            op = {v: k for k, v in _XL_FILTER_OPS.items()}.get(cf.operator or "equal", "=")
+            val = str(cf.val if cf.val is not None else "")
+            core = val.strip("*")
+            if op in ("=", "<>") and len(val) > 1 and "*" not in core and "?" not in core and val != core:
+                kind = "contains" if val.startswith("*") and val.endswith("*") else "ends" if val.startswith("*") else "begins"
+                op, val = (kind if op == "=" else "n" + kind), core
+            conds.append([op, val])
+        return {"type": "custom", "join": "and" if fc.customFilters._and else "or", "conds": conds}
+    if fc.top10 is not None:
+        return {"type": "top", "n": int(fc.top10.val or 10), "bottom": fc.top10.top is False,
+                "percent": bool(fc.top10.percent)}
+    if fc.dynamicFilter is not None:
+        kind = fc.dynamicFilter.type
+        if kind in ("aboveAverage", "belowAverage"):
+            return {"type": "average", "above": kind == "aboveAverage"}
+        kind = {v: k for k, v in _XL_DYNAMIC.items()}.get(kind)
+        return {"type": "dynamic", "kind": kind} if kind else None
+    if fc.colorFilter is not None and fc.colorFilter.dxfId is not None:
+        try:
+            dxf = book._differential_styles[fc.colorFilter.dxfId]
+        except (IndexError, TypeError):
+            return None
+        cell = fc.colorFilter.cellColor is not False
+        color = (_xl_color(dxf.fill.bgColor) or _xl_color(dxf.fill.fgColor)) if cell and dxf.fill is not None else \
+            _xl_color(dxf.font.color) if not cell and dxf.font is not None else None
+        return {"type": "color", "what": "bg" if cell else "fg", "color": color}
+    return None
+
+
+def _xl_filter_column(col_id, crit, book):
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.styles.differential import DifferentialStyle
+    from openpyxl.worksheet.filters import (ColorFilter, CustomFilter, CustomFilters, DynamicFilter, FilterColumn,
+                                            Filters, Top10)
+
+    if not isinstance(crit, dict):
+        return FilterColumn(colId=col_id, filters=Filters(filter=sorted(v for v in crit if v), blank="" in crit or None))
+    kind = crit["type"]
+    if kind == "custom":
+        items = []
+        for op, val in crit["conds"][:2]:  # Excel keeps two conditions
+            val = str(val)
+            negate = op.startswith("n") and op[1:] in _TEXT_OPS
+            if (op[1:] if negate else op) in _TEXT_OPS:
+                val, op = _TEXT_OPS[op[1:] if negate else op].format(val), "<>" if negate else "="
+            else:
+                lit = parse_literal(val)[0] if val.strip() else ""
+                val = number_text(lit) if is_number(lit) else val
+            items.append(CustomFilter(operator=_XL_FILTER_OPS[op], val=val))
+        return FilterColumn(colId=col_id, customFilters=CustomFilters(customFilter=items,
+                                                                      _and=crit.get("join", "and") == "and" or None))
+    if kind == "top":
+        return FilterColumn(colId=col_id, top10=Top10(top=not crit.get("bottom") or False, val=int(crit.get("n", 10)),
+                                                      percent=bool(crit.get("percent")) or None))
+    if kind == "average":
+        return FilterColumn(colId=col_id, dynamicFilter=DynamicFilter(
+            type="aboveAverage" if crit.get("above", True) else "belowAverage"))
+    if kind == "dynamic":
+        return FilterColumn(colId=col_id, dynamicFilter=DynamicFilter(type=_XL_DYNAMIC[crit["kind"]]))
+    color = _xl_hex(crit.get("color")) or "FFFFFFFF"
+    cell = crit.get("what", "bg") == "bg"
+    dxf = (DifferentialStyle(fill=PatternFill(fill_type="solid", fgColor=color, bgColor=color)) if cell
+           else DifferentialStyle(font=Font(color=color)))
+    return FilterColumn(colId=col_id, colorFilter=ColorFilter(dxfId=book._differential_styles.add(dxf),
+                                                              cellColor=None if cell else False))
+
+
+_XL_PAPER = {9: "A4", 8: "A3", 11: "A5", 1: "Letter", 5: "Legal"}
+
+
+def _page_setup_from_xlsx(ws):
+    """The printing options PyExcel keeps (see printing.DEFAULT_SETUP), or None when all are default."""
+    ps, setup = ws.page_setup, {}
+    if ps.orientation == "landscape":
+        setup["orientation"] = "landscape"
+    paper = _XL_PAPER.get(int(ps.paperSize)) if ps.paperSize else None
+    if paper and paper != "A4":
+        setup["paper"] = paper
+    m = ws.page_margins
+    margins = [m.top, m.bottom, m.left, m.right, m.header, m.footer]
+    if margins != [0.75, 0.75, 0.7, 0.7, 0.3, 0.3] and all(v is not None for v in margins):
+        setup["margins"] = [float(v) for v in margins]
+    props = ws.sheet_properties.pageSetUpPr
+    if props is not None and props.fitToPage:
+        setup["fit"] = "page" if ps.fitToHeight not in (0, "0") else "width"
+    elif ps.scale and int(ps.scale) != 100:
+        setup["scale"] = int(ps.scale)
+    area = ws.print_area
+    if area:
+        first = area if isinstance(area, str) else area[0]
+        rect = parse_range(first.split("!")[-1].replace("$", ""))
+        if rect:
+            setup["area"] = rect
+    titles = ws.print_title_rows
+    if titles:
+        parts = titles.replace("$", "").split(":")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            setup["titles"] = (int(parts[0]) - 1, int(parts[1]) - 1)
+    opts = ws.print_options
+    for key, on in (("gridlines", opts.gridLines), ("center_h", opts.horizontalCentered),
+                    ("center_v", opts.verticalCentered)):
+        if on:
+            setup[key] = True
+    for key, hf in (("header", ws.oddHeader), ("footer", ws.oddFooter)):
+        if hf is not None and hf.center is not None and hf.center.text:
+            setup[key] = hf.center.text
+    for key, brks in (("breaks", ws.row_breaks), ("col_breaks", ws.col_breaks)):
+        ids = sorted(b.id for b in brks.brk if b.id)  # break after row/column `id`: our 0-based first of the next
+        if ids:
+            setup[key] = ids
+    return setup or None
+
+
+def _xl_page_setup(ws, setup):
+    from openpyxl.worksheet.pagebreak import Break
+    from openpyxl.worksheet.page import PageMargins
+
+    ps = ws.page_setup
+    ps.orientation = setup.get("orientation", "portrait")
+    ps.paperSize = {v: k for k, v in _XL_PAPER.items()}.get(setup.get("paper", "A4"), 9)
+    if setup.get("margins"):
+        t, b, lft, rgt, h, f = setup["margins"]
+        ws.page_margins = PageMargins(left=lft, right=rgt, top=t, bottom=b, header=h, footer=f)
+    if setup.get("fit"):
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ps.fitToWidth, ps.fitToHeight = 1, (1 if setup["fit"] == "page" else 0)
+    elif setup.get("scale", 100) != 100:
+        ps.scale = int(setup["scale"])
+    if setup.get("area"):
+        ws.print_area = range_name(*setup["area"])
+    if setup.get("titles"):
+        ws.print_title_rows = f"{setup['titles'][0] + 1}:{setup['titles'][1] + 1}"
+    ws.print_options.gridLines = bool(setup.get("gridlines")) or None
+    ws.print_options.horizontalCentered = bool(setup.get("center_h")) or None
+    ws.print_options.verticalCentered = bool(setup.get("center_v")) or None
+    if setup.get("header"):
+        ws.oddHeader.center.text = setup["header"]
+    if setup.get("footer"):
+        ws.oddFooter.center.text = setup["footer"]
+    for r in setup.get("breaks", []):
+        ws.row_breaks.append(Break(id=r))
+    for c in setup.get("col_breaks", []):
+        ws.col_breaks.append(Break(id=c))
+
+
+def _freeze_from_xlsx(ws):
+    view = ws.sheet_view
+    pane = view.pane
+    if pane is None or pane.state not in ("frozen", "frozenSplit"):
+        return None
+    origin = parse_address(view.topLeftCell or "A1")
+    r0, c0 = origin if origin and len(origin) == 2 else (0, 0)
+    ys, xs = int(pane.ySplit or 0), int(pane.xSplit or 0)
+    if not (ys or xs) or r0 + ys >= MAX_ROWS or c0 + xs >= MAX_COLS:
+        return None
+    return (r0, r0 + ys, c0, c0 + xs)
+
+
+def _names_from_xlsx(book):
+    """[(name, refers-to without '=', comment)] of the workbook's defined names (not Excel's own _xlnm ones)."""
+    try:
+        items = list(book.defined_names.values())  # openpyxl 3.1
+    except AttributeError:
+        items = list(getattr(book.defined_names, "definedName", []))
+    for ws in book.worksheets:  # names scoped to a sheet are used book-wide here
+        try:
+            items += list(ws.defined_names.values())
+        except AttributeError:
+            pass
+    return [(d.name, d.attr_text, d.comment or "") for d in items
+            if d.name and not d.name.startswith("_xlnm") and d.attr_text and not d.hidden]
+
+
+def _xl_names(book, wb):
+    from openpyxl.workbook.defined_name import DefinedName
+
+    for d in wb.names.values():
+        item = DefinedName(d["name"], attr_text=d["ref"][1:], comment=d.get("comment") or None)
+        try:
+            book.defined_names[d["name"]] = item  # openpyxl 3.1
+        except TypeError:
+            book.defined_names.append(item)
+
+
+# ------------------------------------------------------------------ fast .xlsx cell reading
+
+_XML_ATTR = re.compile(r'([\w:]+)="([^"]*)"')
+_XML_ESC = re.compile(r"&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);")
+_XML_NAMED = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+_OOXML_ESC = re.compile(r"_x([0-9A-Fa-f]{4})_")
+_SHEET_ITEM = re.compile(r'<row\b([^>]*)>'
+                         r'|<c r="([A-Z]{1,3})(\d+)"(?: s="(\d+)")?(?: t="(\w+)")?\s*(?:/>|>(.*?)</c>)'
+                         r'|<c\b([^>]*?)(?:/>|>(.*?)</c>)', re.S)
+_CELL_F = re.compile(r"<f\b([^>]*?)(?:/>|>(.*?)</f>)", re.S)
+_CELL_V = re.compile(r"<v>(.*?)</v>", re.S)
+_CELL_IS = re.compile(r"<is>(.*?)</is>", re.S)
+_TEXT_RUNS = re.compile(r"<t\b[^>]*?(?:/>|>(.*?)</t>)", re.S)
+_PHONETIC = re.compile(r"<rPh\b.*?</rPh>", re.S)
+RowDim = namedtuple("RowDim", "height hidden outlineLevel collapsed")
+
+
+def _xml_text(s):
+    """XML character data as text: entities and Excel's _xHHHH_ escapes undone."""
+    if "&" in s:
+        s = _XML_ESC.sub(lambda m: _XML_NAMED.get(m.group(1)) or chr(
+            int(m.group(1)[2:], 16) if m.group(1)[1] == "x" else int(m.group(1)[1:])), s)
+    if "_x" in s:
+        s = _OOXML_ESC.sub(lambda m: chr(int(m.group(1), 16)), s)
+    return s
+
+
+def _rich_text(xml):
+    """The text of a shared or inline string (rich-text runs joined, phonetic hints left out)."""
+    if "<rPh" in xml:
+        xml = _PHONETIC.sub("", xml)
+    return "".join(_xml_text(m.group(1) or "") for m in _TEXT_RUNS.finditer(xml))
+
+
+def _raw_text(text):
+    """A string read from a file as raw cell text (quoted when PyExcel would read it as something else)."""
+    if not _MAYBE_LITERAL.search(text):
+        return text
+    if text[:1] in "='":
+        return "'" + text
+    return text if parse_literal(text) == (text, None) else "'" + text
+
+
+class XlsxCells:
+    """The cell data of an .xlsx read straight from its XML (openpyxl builds an object per cell, which takes
+    long on big sheets), plus a copy of the file without it (`stripped`) for openpyxl to read everything else."""
+
+    def __init__(self, path):
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            book = z.read("xl/workbook.xml").decode("utf-8")
+            rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+            targets, shared = {}, None
+            for m in re.finditer(r"<Relationship\b([^>]*)/?>", rels):
+                a = dict(_XML_ATTR.findall(m.group(1)))
+                target = a.get("Target", "")
+                target = target[1:] if target.startswith("/") else "xl/" + target
+                targets[a.get("Id")] = target
+                if a.get("Type", "").endswith("/sharedStrings"):
+                    shared = target
+            self.sheets = {}
+            for m in re.finditer(r"<sheet\b([^>]*)/?>", book):
+                a = dict(_XML_ATTR.findall(m.group(1)))
+                part = targets.get(a.get("r:id"))
+                if part in names:
+                    self.sheets[_xml_text(a.get("name", ""))] = part
+            self.strings = []
+            if shared in names:
+                xml = z.read(shared).decode("utf-8")
+                self.strings = [_rich_text(si) for si in re.findall(r"<si>(.*?)</si>|<si/>", xml, re.S)]
+            self.raw_strings = None
+            self.data = {}
+            out = io.BytesIO()
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as dst:
+                parts = {part: title for title, part in self.sheets.items() if title != PIVOT_STORE}
+                for info in z.infolist():
+                    raw = z.read(info.filename)
+                    if _DRAWING_PART.fullmatch(info.filename):
+                        raw = _drop_shapes(raw)
+                    if info.filename in parts:
+                        xml = raw.decode("utf-8")
+                        m = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>(.*?)</sheetData>", xml, re.S)
+                        if m:
+                            self.data[parts[info.filename]] = m.group(1) or ""
+                            raw = (xml[:m.start()] + "<sheetData/>" + xml[m.end():]).encode("utf-8")
+                    dst.writestr(info.filename, raw)
+            out.seek(0)
+            self.stripped = out
+
+    def read(self, title, style_fmt):
+        """(cells, formats, [(row, RowDim)]) of a sheet; style_fmt(style index, numeric) gives the format of
+        a style (cells of one style share one format dict). Written for speed: the usual
+        <c r="B2" s="3" t="s"><v>7</v></c> takes the short way, anything else the general one."""
+        body = self.data.get(title)
+        cells, formats, rows = {}, {}, []
+        if not body:
+            return cells, formats, rows
+        if self.raw_strings is None:
+            self.raw_strings = [_raw_text(s) for s in self.strings]
+        strings, raw_strings = self.strings, self.raw_strings
+        letters, shared, texts, fmts, arrays = {}, {}, {}, {}, []
+        row = col = 0
+        for m in _SHEET_ITEM.finditer(body):
+            row_attrs, key, row_text, s, kind, inner, attrs, inner2 = m.groups()
+            if row_attrs is not None:  # <row r="5" ht="20" customHeight="1" hidden="1" outlineLevel="1">
+                a = dict(_XML_ATTR.findall(row_attrs))
+                row, col = int(a.get("r", row + 1)), 0
+                height = float(a["ht"]) if "ht" in a and a.get("customHeight") in ("1", "true") else None
+                if height is not None or "hidden" in a or "outlineLevel" in a or "collapsed" in a:
+                    rows.append((row, RowDim(height, a.get("hidden") in ("1", "true"),
+                                             int(a.get("outlineLevel", 0)), a.get("collapsed") in ("1", "true"))))
+                continue
+            if key is not None:  # the usual attribute order
+                row, kind, inner = int(row_text), kind or "n", inner or ""
+            else:
+                a = dict(_XML_ATTR.findall(attrs))
+                s, kind, inner, ref = a.get("s"), a.get("t", "n"), inner2 or "", a.get("r")
+                key = None
+                if ref:
+                    i = len(ref.rstrip("0123456789"))
+                    key, row = ref[:i], int(ref[i:])
+            if key is not None:
+                c = letters.get(key)
+                if c is None:
+                    c = letters[key] = col_index(key)
+                col = c + 1
+            else:
+                col += 1
+            if row > MAX_ROWS or col > MAX_COLS:
+                continue
+            pos = (row - 1, col - 1)
+            raw = None
+            try:  # a damaged value (a shared string that isn't there...) leaves the cell empty
+                if not inner:
+                    pass
+                elif inner[:3] == "<v>" and inner[-4:] == "</v>" and "<" not in inner[3:-4]:  # a value, no formula
+                    value = inner[3:-4]
+                    if kind == "s":
+                        raw = raw_strings[int(value)]
+                    elif kind == "n":
+                        if value.isdigit() and len(value) < 16 and (value[0] != "0" or value == "0"):
+                            raw = value
+                        else:
+                            number = float(value)
+                            raw = number_text(int(number) if number.is_integer() and abs(number) < 1e15 else number)
+                    else:
+                        raw = self._value(kind, value, None, strings)
+                elif inner[-9:] == "</t></is>" and (inner[:7] == "<is><t>" or inner[:28] == '<is><t xml:space="preserve">') \
+                        and "<" not in inner[7 if inner[6] == ">" else 28:-9]:
+                    text = inner[7 if inner[6] == ">" else 28:-9]
+                    raw = texts.get(text)
+                    if raw is None:
+                        raw = _raw_text(_xml_text(text))
+                        if len(texts) < 200000:  # repeated words ("Kho A") are worked out once
+                            texts[text] = raw
+                else:
+                    raw = self._general(inner, kind, pos, shared, strings, arrays)
+            except (IndexError, KeyError, ValueError, OverflowError):
+                raw = None
+            if raw:
+                cells[pos] = raw
+            if s and s != "0":
+                fk = (s, kind)
+                fmt = fmts.get(fk, False)
+                if fmt is False:
+                    fmt = fmts[fk] = style_fmt(int(s), kind in ("n", "d"))
+                if fmt:
+                    formats[pos] = fmt
+        _drop_spilled(cells, arrays)
+        return cells, formats, rows
+
+    @staticmethod
+    def _value(kind, value, inner, strings):
+        if kind == "s":
+            return _raw_text(strings[int(value)])
+        if kind == "inlineStr":
+            s = _CELL_IS.search(inner or "")
+            return _raw_text(_rich_text(s.group(1))) if s else None
+        if value is None:
+            return None
+        if kind == "b":
+            return "TRUE" if value.strip() in ("1", "true") else "FALSE"
+        if kind in ("str", "e"):
+            return _raw_text(_xml_text(value))
+        if kind == "d":
+            return number_text(date_to_serial(dt.datetime.fromisoformat(value.strip())))
+        number = float(value)
+        return number_text(int(number) if number.is_integer() and abs(number) < 1e15 else number)
+
+    def _general(self, inner, kind, pos, shared, strings, arrays):
+        """A cell with a formula, rich text or other less usual content. Array formulas add (cell, ref) to
+        `arrays`."""
+        f = _CELL_F.search(inner) if "<f" in inner else None
+        if f is not None:
+            fa = dict(_XML_ATTR.findall(f.group(1)))
+            text = _xml_text(f.group(2) or "")
+            if fa.get("t") == "array" and fa.get("ref"):
+                arrays.append((pos, fa["ref"]))
+            if fa.get("t") == "shared" and "si" in fa:
+                if text:
+                    shared[fa["si"]] = (pos, text)
+                elif fa["si"] in shared:
+                    (r0, c0), master = shared[fa["si"]]
+                    text = shift_formula("=" + master, pos[0] - r0, pos[1] - c0)[1:]
+            if text:
+                return formula_from_file(text)
+        v = _CELL_V.search(inner) if "<v" in inner else None
+        return self._value(kind, v.group(1) if v else None, inner, strings)
+
+
+_DRAWING_PART = re.compile(r"xl/drawings/[^/]+\.xml")
+_ANCHOR = re.compile(rb"<((?:[\w-]+:)?)(twoCellAnchor|oneCellAnchor|absoluteAnchor)\b.*?</\1\2>", re.S)
+_SHAPE_EL = re.compile(rb"<(?:[\w-]+:)?(?:sp|cxnSp|grpSp)[\s>/]")
+
+
+def _drop_shapes(xml):
+    """A drawing part without its shapes (anchors of pictures and charts stay): openpyxl, which reads the
+    rest, has no use for them and fails on some valid shape XML. PyExcel reads them itself."""
+    return _ANCHOR.sub(lambda m: b"" if _SHAPE_EL.search(m.group(0)) else m.group(0), xml)
+
+
+def _without_shapes(path):
+    """A copy of an .xlsx file (in memory) with the shapes taken out of its drawing parts."""
+    import zipfile
+    out = io.BytesIO()
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as dst:
+        for info in src.infolist():
+            raw = src.read(info.filename)
+            dst.writestr(info.filename, _drop_shapes(raw) if _DRAWING_PART.fullmatch(info.filename) else raw)
+    out.seek(0)
+    return out
+
+
+def _drop_spilled(cells, arrays):
+    """The values Excel saved in the rest of each array formula's range (what it spilled, or the cells of an
+    old Ctrl+Shift+Enter formula) go: the formula in the first cell spills them again."""
+    for (r0, c0), ref in arrays:
+        rect = parse_range(ref.replace("$", ""))
+        if not rect or (r0, c0) != rect[:2] or (rect[2] - r0 + 1) * (rect[3] - c0 + 1) > 1000000:
+            continue
+        for r in range(r0, min(rect[2], MAX_ROWS - 1) + 1):
+            for c in range(c0, min(rect[3], MAX_COLS - 1) + 1):
+                if (r, c) != (r0, c0) and not is_formula(cells.get((r, c))):
+                    cells.pop((r, c), None)
+
+
+def _style_formatter(book, ws):
+    """style_fmt for XlsxCells.read: the format of cell style `index` from openpyxl's stylesheet."""
+    from openpyxl.cell.cell import Cell
+    from openpyxl.styles.cell_style import StyleArray
+
+    cache = {}
+
+    def style_fmt(index, numeric):
+        key = (index, numeric)
+        if key not in cache:
+            fmt = None
+            if 0 <= index < len(book._cell_styles):
+                cell = Cell(ws, row=1, column=1, style_array=StyleArray(book._cell_styles[index]))
+                cell._value, cell.data_type = (0, "n") if numeric else ("", "s")
+                try:
+                    fmt = _format_from_xlsx(cell) or None
+                except (AttributeError, TypeError, ValueError, IndexError):
+                    fmt = None
+            cache[key] = fmt
+        return cache[key]
+    return style_fmt
+
+
 def _load_xlsx(path):
     import openpyxl
 
-    book = openpyxl.load_workbook(path)  # formulas are kept as text
+    try:
+        fast = XlsxCells(path)
+    except Exception:  # an unusual file: openpyxl reads all of it
+        fast = None
+    try:
+        source = fast.stripped if fast else _without_shapes(path)
+    except Exception:  # not even a readable zip: openpyxl says what is wrong
+        source = path
+    book = openpyxl.load_workbook(source)  # formulas are kept as text
     wb = Workbook(())
+    sheet_names = {}  # sheet titles in the file -> names here
+    store = book[PIVOT_STORE] if PIVOT_STORE in book.sheetnames else None
     for ws in book.worksheets:
+        if ws is store:
+            continue
         name = wb.add_sheet(ws.title if wb.check_sheet_name(ws.title) is None else None)
+        sheet_names[ws.title] = name
         sh = wb.sheets[name]
-        for row in ws.iter_rows(max_row=min(ws.max_row, MAX_ROWS), max_col=min(ws.max_column, MAX_COLS)):
-            for cell in row:
-                try:
-                    pos = (cell.row - 1, cell.column - 1)
-                    raw = _raw_from_xlsx(cell)
-                    fmt = _format_from_xlsx(cell)
-                except (AttributeError, TypeError, ValueError):
-                    continue  # exotic styles
-                if raw:
-                    sh.cells[pos] = raw
-                if fmt:
-                    sh.formats[pos] = fmt
+        row_dims = ws.row_dimensions.items()
+        stored = getattr(ws, "_cells", None)  # only the cells the file has (iter_rows also makes the gaps)
+        if fast is not None and ws.title in fast.data:
+            cells, formats, row_dims = fast.read(ws.title, _style_formatter(book, ws))
+            items = stored.items() if isinstance(stored, dict) else ()  # just cells with comments and links
+            cells_from_book = False
+        elif isinstance(stored, dict):
+            items = stored.items()
+        else:
+            items = (((cell.row, cell.column), cell) for row in ws.iter_rows(
+                max_row=min(ws.max_row, MAX_ROWS), max_col=min(ws.max_column, MAX_COLS)) for cell in row)
+        if fast is None or ws.title not in fast.data:
+            cells, formats, cells_from_book = {}, {}, True
+        styles, arrays = {}, []
+        for (row, col), cell in items:
+            if row > MAX_ROWS or col > MAX_COLS:
+                continue
+            pos = (row - 1, col - 1)
+            if not cells_from_book:
+                if cell.comment is not None and cell.comment.text:
+                    sh.notes[pos] = cell.comment.text.strip()
+                if cell.hyperlink is not None and (link := _link_from_xlsx(cell.hyperlink)):
+                    sh.links[pos] = link
+                continue
+            try:
+                raw = _raw_from_xlsx(cell)
+                if getattr(cell.value, "ref", None):  # an ArrayFormula
+                    arrays.append((pos, str(cell.value.ref)))
+                fmt = None
+                if cell.has_style:  # cells sharing a style share one format dict (formats are never edited in place)
+                    key = (tuple(cell._style), cell.data_type)
+                    fmt = styles.get(key)
+                    if fmt is None:
+                        fmt = styles[key] = _format_from_xlsx(cell)
+            except (AttributeError, TypeError, ValueError):
+                continue  # exotic styles
+            if raw:
+                cells[pos] = raw
+            if fmt:
+                formats[pos] = fmt
+            if cell.comment is not None and cell.comment.text:
+                sh.notes[pos] = cell.comment.text.strip()
+            if cell.hyperlink is not None:
+                link = _link_from_xlsx(cell.hyperlink)
+                if link:
+                    sh.links[pos] = link
+        _drop_spilled(cells, arrays)
+        sh.cells, sh.formats = cells, formats
         for key, dim in ws.column_dimensions.items():
             lo = dim.min or (col_index(key) + 1 if re.fullmatch(r"[A-Z]{1,3}", key) else None)
             if lo is None:
                 continue
             for c in range(lo - 1, min(dim.max or lo, MAX_COLS)):
                 if dim.width:
-                    sh.col_widths[c] = max(MIN_COL_WIDTH, round(dim.width * 7 + 5))
+                    sh.col_widths[c] = max(MIN_COL_WIDTH, round(dim.width * 7))  # (the width counts the padding)
                 if dim.hidden:
                     sh.hidden_cols.add(c)
-        for idx, dim in ws.row_dimensions.items():
+                if dim.outlineLevel:
+                    sh.col_levels[c] = min(MAX_OUTLINE, int(dim.outlineLevel))
+                if dim.collapsed:
+                    sh.collapsed_cols.add(c)
+        for idx, dim in row_dims:
             r = idx - 1
             if r >= MAX_ROWS:
                 continue
@@ -2597,9 +6295,23 @@ def _load_xlsx(path):
                 sh.custom_rows.add(r)
             if dim.hidden:
                 sh.hidden_rows.add(r)
+            if dim.outlineLevel:
+                sh.row_levels[r] = min(MAX_OUTLINE, int(dim.outlineLevel))
+            if dim.collapsed:
+                sh.collapsed_rows.add(r)
         sh.set_merges((rg.min_row - 1, rg.min_col - 1, rg.max_row - 1, rg.max_col - 1)
                       for rg in ws.merged_cells.ranges if rg.max_row <= MAX_ROWS and rg.max_col <= MAX_COLS)
+        for r1, c1, r2, c2 in sh.merges:  # as in Excel, only the first cell of a merged block keeps a value
+            if (r2 - r1 + 1) * (c2 - c1 + 1) <= 100000:
+                for key in [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) != (r1, c1)]:
+                    sh.cells.pop(key, None)
         sh.tab_color = _xl_color(ws.sheet_properties.tabColor)
+        sh.hidden = ws.sheet_state in ("hidden", "veryHidden")
+        sh.protection = _protection_from_xlsx(ws.protection)
+        sh.freeze = _freeze_from_xlsx(ws)
+        sh.validations = _validations_from_xlsx(ws)
+        sh.charts = _charts_from_xlsx(ws, sh) + _pictures_from_xlsx(ws)
+        sh.page_setup = _page_setup_from_xlsx(ws)
         rules = []
         for cf in ws.conditional_formatting:
             for xl_rule in cf.rules:
@@ -2615,12 +6327,9 @@ def _load_xlsx(path):
         if rect:
             criteria = {}
             for fc in af.filterColumn:
-                filters = getattr(fc, "filters", None)
-                if filters is not None:
-                    allowed = {str(v) for v in filters.filter}
-                    if filters.blank:
-                        allowed.add("")
-                    criteria[rect[1] + fc.colId] = allowed
+                crit = _filter_from_xlsx(fc, book)
+                if crit is not None:
+                    criteria[rect[1] + fc.colId] = crit
             sh.filter = {"range": rect, "criteria": criteria, "hidden": set()}
     if not wb.sheets:
         wb.add_sheet()
@@ -2628,10 +6337,31 @@ def _load_xlsx(path):
         if sh.filter:
             wb.apply_filter(name)
             sh.hidden_rows -= sh.filter["hidden"]  # Excel stores filtered-out rows as hidden rows
-    titles = [ws.title for ws in book.worksheets]
+    if store is not None:
+        try:
+            saved = json.loads(store["A1"].value or "{}")
+        except (TypeError, ValueError):
+            saved = {}
+        for title, pivots in saved.items():
+            if title in wb.sheets:
+                wb.sheets[title].pivots = [p for p in map(_pivot_from_dict, pivots) if p]
+    for name, ref, comment in _names_from_xlsx(book):
+        if wb.check_name(name) is None:
+            try:
+                wb.define_name(name, "=" + ref, comment)
+            except ValueError:
+                pass
+    found = _shapes_from_xlsx(path, {title: _geometry(wb.sheets[name]) for title, name in sheet_names.items()})
+    for title, objects in found.items():
+        wb.sheets[sheet_names[title]].charts.extend(objects)
+    titles = [ws.title for ws in book.worksheets if ws is not store]
     names = list(wb.sheets)
+    if not wb.visible_sheets():
+        wb.sheets[names[0]].hidden = False
     if book.active is not None and book.active.title in titles:
         wb.active = names[titles.index(book.active.title)]
+    if wb.active and wb.sheets[wb.active].hidden:
+        wb.active = wb.visible_sheets()[0]
     return wb
 
 
@@ -2711,70 +6441,402 @@ def _xl_cf_rule(rule):
     return None
 
 
+FAST_SAVE_CELLS = 20000  # sheets with more cells than this get their cell XML written by PyExcel itself
+_XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def _xl_cell_value(raw, fmt):
+    """(value for openpyxl, implied number format, written as text?) of a cell's raw text. Control
+    characters XML can't hold are written as Excel's _xHHHH_ escapes."""
+    if raw is None:
+        return None, None, False
+    if _XML_BAD.search(raw):
+        raw = _XML_BAD.sub(lambda m: f"_x{ord(m.group()):04X}_", raw)
+    if fmt.get("num") == "@":
+        return (raw[1:] if raw.startswith("'") else raw), None, True
+    if raw[:1] == "=" and len(raw) > 1:
+        return file_formula(raw), None, False
+    if not _MAYBE_LITERAL.search(raw):  # words: nothing to read as a number or date
+        return raw, None, True
+    if raw.isdigit() and raw.isascii() and (raw[0] != "0" or raw == "0") and len(raw) < 16:
+        return int(raw), None, False
+    value, implied = parse_literal(raw)
+    return value, implied, isinstance(value, str)
+
+
+def _xl_apply_style(cell, fmt, numfmt):
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
+
+    if numfmt:
+        cell.number_format = _xl_number_format(numfmt)
+    if any(fmt.get(k) for k in ("font", "size", "bold", "italic", "underline", "strike", "fg")):
+        underline = fmt.get("underline")
+        cell.font = Font(name=fmt.get("font") or "Calibri", size=fmt.get("size") or 11,
+                         bold=bool(fmt.get("bold")), italic=bool(fmt.get("italic")),
+                         underline="double" if underline == "double" else ("single" if underline else None),
+                         strike=bool(fmt.get("strike")), color=_xl_hex(fmt.get("fg")))
+    if fmt.get("bg"):
+        cell.fill = PatternFill("solid", fgColor=_xl_hex(fmt["bg"]))
+    if any(fmt.get(k) for k in ("align", "valign", "wrap", "indent", "rotate")):
+        rot = fmt.get("rotate") or 0
+        cell.alignment = Alignment(horizontal=fmt.get("align"), vertical=fmt.get("valign"),
+                                   wrap_text=bool(fmt.get("wrap")), indent=int(fmt.get("indent") or 0),
+                                   text_rotation=rot if rot >= 0 else 90 - rot)
+    if any(fmt.get(k) for k in BORDER_KEYS):
+        sides = [Side(style=v[0], color=_xl_hex(v[1])) if v else Side() for v in map(fmt.get, BORDER_KEYS)]
+        cell.border = Border(top=sides[0], bottom=sides[1], left=sides[2], right=sides[3])
+    if fmt.get("unlocked") or fmt.get("hide_formula"):
+        cell.protection = Protection(locked=not fmt.get("unlocked"), hidden=bool(fmt.get("hide_formula")))
+
+
+
+
+def _xml_escape(s):
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if _XML_BAD.search(s):
+        s = _XML_BAD.sub(lambda m: f"_x{ord(m.group()):04X}_", s)
+    return s
+
+
+def _sheet_data_xml(sh, ws, book, arrays=_NO_SPILLS):
+    """(<sheetData> XML, dimension ref) of a sheet's cells and row settings, with the styles registered in
+    the openpyxl book so they land in styles.xml (openpyxl would build an object for every cell)."""
+    from openpyxl.cell.cell import Cell
+
+    style_ids, letters, numbers, values = {}, {}, {}, {}
+    cells, formats = sh.cells, sh.formats
+
+    def style_id(fmt, numfmt):
+        key = (id(fmt), numfmt)
+        index = style_ids.get(key)
+        if index is None:
+            cell = Cell(ws, row=1, column=1)
+            _xl_apply_style(cell, fmt, numfmt)
+            index = style_ids[key] = book._cell_styles.add(cell._style) if cell.has_style else 0
+        return index
+
+    rows = {}
+    for key in set(cells) | set(formats):
+        rows.setdefault(key[0], []).append(key[1])
+    hidden = sh.hidden_rows | (sh.filter["hidden"] if sh.filter else set())
+    dim_rows = set(sh.row_heights) | hidden | set(sh.row_levels) | sh.collapsed_rows
+    out = []
+    empty = {}
+    for r in sorted(set(rows) | dim_rows):
+        attrs = f'<row r="{r + 1}"'
+        if r in sh.row_heights:
+            attrs += f' ht="{round(sh.row_heights[r] * 0.75, 2)}" customHeight="1"'
+        if r in hidden:
+            attrs += ' hidden="1"'
+        if r in sh.row_levels:
+            attrs += f' outlineLevel="{sh.row_levels[r]}"'
+        if r in sh.collapsed_rows:
+            attrs += ' collapsed="1"'
+        out.append(attrs + ">")
+        for c in sorted(rows.get(r, ())):
+            letter = letters.get(c)
+            if letter is None:
+                letter = letters[c] = col_name(c)
+            ref = f"{letter}{r + 1}"
+            fmt = formats.get((r, c)) or empty
+            raw = cells.get((r, c))
+            if fmt is empty and raw is not None:
+                found = values.get(raw)  # unformatted cells: the same text reads the same way
+                if found is None:
+                    found = _xl_cell_value(raw, fmt)
+                    if len(values) < 200000:
+                        values[raw] = found
+                value, implied, text = found
+            else:
+                value, implied, text = _xl_cell_value(raw, fmt)
+            index = style_id(fmt, fmt.get("num") or implied) if fmt or implied else 0
+            s = f' s="{index}"' if index else ""
+            if value is None:
+                out.append(f'<c r="{ref}"{s}/>')
+            elif text:
+                out.append(f'<c r="{ref}"{s} t="inlineStr"><is><t xml:space="preserve">{_xml_escape(value)}</t></is></c>')
+            elif isinstance(value, bool):
+                out.append(f'<c r="{ref}"{s} t="b"><v>{int(value)}</v></c>')
+            elif isinstance(value, str):  # a formula
+                if (r, c) in arrays:
+                    out.append(f'<c r="{ref}"{s} cm="1"><f t="array" ref="{range_name(*arrays[(r, c)])}">'
+                               f'{_xml_escape(value[1:])}</f></c>')
+                else:
+                    out.append(f'<c r="{ref}"{s}><f>{_xml_escape(value[1:])}</f></c>')
+            else:
+                v = numbers.get(value)
+                if v is None:
+                    v = str(int(value)) if float(value).is_integer() and abs(value) < 1e15 else repr(float(value))
+                    if len(numbers) < 100000:
+                        numbers[value] = v
+                out.append(f'<c r="{ref}"{s}><v>{v}</v></c>')
+        out.append("</row>")
+    rows_used, cols_used = cells.extent()
+    dimension = range_name(0, 0, max(rows_used, 1) - 1, max(cols_used, 1) - 1)
+    return "<sheetData>" + "".join(out) + "</sheetData>", dimension
+
+
+_DYNAMIC_ARRAY_METADATA = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+    'xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="1">'
+    '<metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" '
+    'splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/>'
+    '</metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}">'
+    '<xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata>'
+    '<cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>')
+_ARRAY_CELL_RE = re.compile(r'<c ((?:(?!cm=)[^>/])*)>(<f t="array")')
+
+
+def _put_sheet_data(buffer, path, sheets, dynamic=False, drawings=None):
+    """Write the .xlsx openpyxl made (in buffer) to path with the cell XML of `sheets` put in. With
+    `dynamic`, array formulas are marked as dynamic arrays (cm="1" and the metadata part it points to), so
+    Excel 365 spills them rather than treating them as old Ctrl+Shift+Enter formulas. `drawings`: {sheet
+    name: DrawingML anchors of its shapes}, added to the sheet's drawing part (made when it has none)."""
+    import zipfile
+
+    with zipfile.ZipFile(buffer) as src:
+        parts = _sheet_parts(src)
+        names = set(src.namelist())
+        wanted = {parts[title]: xml for title, xml in sheets.items() if title in parts}
+        append, created = {}, {}  # drawing part -> anchors; sheet part -> (new drawing part, anchors)
+        n = 1
+        for title, anchors in (drawings or {}).items():
+            part = parts.get(title)
+            if not part:
+                continue
+            existing = [d for d in drawingml.drawing_parts(src, part) if d in names]
+            if existing:
+                append[existing[0]] = anchors
+            else:
+                while f"xl/drawings/drawing{n}.xml" in names:
+                    n += 1
+                created[part] = (f"xl/drawings/drawing{n}.xml", anchors)
+                names.add(created[part][0])
+        rels_of = {f"{p.rsplit('/', 1)[0]}/_rels/{p.rsplit('/', 1)[1]}.rels": p for p in created}
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as dst:
+            for info in src.infolist():
+                data = src.read(info.filename)
+                if info.filename in wanted or (dynamic and info.filename in parts.values()) or info.filename in created:
+                    xml = data.decode("utf-8")
+                    if info.filename in wanted:
+                        body, dimension = wanted[info.filename]
+                        m = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>.*?</sheetData>", xml, re.S)
+                        xml = xml[:m.start()] + body + xml[m.end():]
+                        xml = re.sub(r'<dimension ref="[^"]*"\s*/>', f'<dimension ref="{dimension}"/>', xml, count=1)
+                    if dynamic:
+                        xml = _ARRAY_CELL_RE.sub(r'<c \1 cm="1">\2', xml)
+                    if info.filename in created:
+                        xml = _with_drawing_element(xml)
+                    data = xml.encode("utf-8")
+                elif info.filename in append:
+                    xml = data.decode("utf-8")
+                    m = re.search(r"</[\w:]*wsDr>\s*$", xml)
+                    if m:
+                        xml = xml[:m.start()] + append[info.filename] + xml[m.start():]
+                    data = xml.encode("utf-8")
+                elif info.filename in rels_of:
+                    target = created[rels_of[info.filename]][0].split("/", 1)[1]
+                    data = data.replace(b"</Relationships>", _drawing_rel(target) + b"</Relationships>")
+                elif info.filename == "[Content_Types].xml" and (dynamic or created):
+                    extra = b""
+                    if dynamic:
+                        extra += (b'<Override PartName="/xl/metadata.xml" ContentType="application/'
+                                  b'vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/>')
+                    for drawing, _ in created.values():
+                        extra += (f'<Override PartName="/{drawing}" ContentType="{drawingml.DRAWING_CONTENT_TYPE}"/>'
+                                  .encode("utf-8"))
+                    data = data.replace(b"</Types>", extra + b"</Types>")
+                elif dynamic and info.filename == "xl/_rels/workbook.xml.rels":
+                    data = data.replace(b"</Relationships>", b'<Relationship Id="rIdPyExcelMeta" Type="http://schemas.'
+                                        b'openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" '
+                                        b'Target="metadata.xml"/></Relationships>')
+                dst.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+            for rels, part in rels_of.items():
+                if rels not in src.namelist():
+                    target = created[part][0].split("/", 1)[1]
+                    dst.writestr(rels, b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="'
+                                 b'http://schemas.openxmlformats.org/package/2006/relationships">' + _drawing_rel(target)
+                                 + b"</Relationships>", compress_type=zipfile.ZIP_DEFLATED)
+            for drawing, anchors in created.values():
+                xml = drawingml.empty_drawing().replace("></xdr:wsDr>", f">{anchors}</xdr:wsDr>")
+                dst.writestr(drawing, xml.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
+            if dynamic:
+                dst.writestr("xl/metadata.xml", _DYNAMIC_ARRAY_METADATA, compress_type=zipfile.ZIP_DEFLATED)
+
+
+def _drawing_rel(target):
+    return (f'<Relationship Id="rIdPyShapes" Type="{drawingml.DRAWING_REL}" Target="../{target}"/>').encode("utf-8")
+
+
+_AFTER_DRAWING = re.compile(r"<(?:legacyDrawing|legacyDrawingHF|drawingHF|picture|oleObjects|controls|"
+                            r"webPublishItems|tableParts|extLst)\b|</worksheet>")
+
+
+def _with_drawing_element(xml):
+    """A worksheet's XML with <drawing> pointing at its new drawing part, where the schema wants it."""
+    m = _AFTER_DRAWING.search(xml)
+    if not m:
+        return xml
+    element = f'<drawing xmlns:r="{drawingml.NS["r"]}" r:id="rIdPyShapes"/>'
+    return xml[:m.start()] + element + xml[m.start():]
+
+
+def _geometry(sh):
+    """Pixel positions of a sheet's rows and columns, for placing its shapes in files."""
+    return drawingml.SheetGeometry(sh, DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, MAX_ROWS, MAX_COLS)
+
+
+def _shapes_from_xlsx(path, sheet_names):
+    """{sheet name: [shape dicts]} of the shapes in an .xlsx file's drawing parts (openpyxl skips them)."""
+    import zipfile
+    found = {}
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            for title, part in _sheet_parts(z).items():
+                if title not in sheet_names:
+                    continue
+                for drawing in drawingml.drawing_parts(z, part):
+                    if drawing in names:
+                        found.setdefault(title, []).extend(drawingml.shapes_from_drawing(
+                            z.read(drawing), sheet_names[title], new_picture_id))
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return {}
+    return found
+
+
+def _sheet_parts(z):
+    """{sheet name: worksheet part path} of an open .xlsx zip."""
+    book = z.read("xl/workbook.xml").decode("utf-8")
+    rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    targets = {}
+    for m in re.finditer(r"<Relationship\b([^>]*)/?>", rels):
+        a = dict(_XML_ATTR.findall(m.group(1)))
+        target = a.get("Target", "")
+        targets[a.get("Id")] = target[1:] if target.startswith("/") else "xl/" + target
+    out = {}
+    for m in re.finditer(r"<sheet\b([^>]*)/?>", book):
+        a = dict(_XML_ATTR.findall(m.group(1)))
+        if a.get("r:id") in targets:
+            out[_xml_text(a.get("name", ""))] = targets[a["r:id"]]
+    return out
+
+
 def _save_xlsx(wb, path, active=None):
     import openpyxl
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
     book = openpyxl.Workbook()
     book.remove(book.active)
+    from openpyxl.comments import Comment
+
+    from openpyxl.worksheet.formula import ArrayFormula
+
+    fast_sheets, dynamic, drawings = {}, False, {}
     for sh in wb.sheets.values():
         ws = book.create_sheet(sh.name)
-        for r, c in set(sh.cells) | set(sh.formats):
-            cell = ws.cell(row=r + 1, column=c + 1)
-            raw = sh.cells.get((r, c))
-            fmt = sh.formats.get((r, c)) or {}
-            implied = None
-            if raw is not None:
-                as_text = fmt.get("num") == "@"
-                if as_text:
-                    value = raw[1:] if raw.startswith("'") else raw
-                elif is_formula(raw):
-                    value = raw
-                else:
-                    value, implied = parse_literal(raw)
-                cell.value = value
-                if isinstance(value, str) and (as_text or not is_formula(raw)):
-                    cell.data_type = "s"
-            numfmt = fmt.get("num") or implied
-            if numfmt:
-                cell.number_format = _xl_number_format(numfmt)
-            if any(fmt.get(k) for k in ("font", "size", "bold", "italic", "underline", "strike", "fg")):
-                underline = fmt.get("underline")
-                cell.font = Font(name=fmt.get("font") or "Calibri", size=fmt.get("size") or 11,
-                                 bold=bool(fmt.get("bold")), italic=bool(fmt.get("italic")),
-                                 underline="double" if underline == "double" else ("single" if underline else None),
-                                 strike=bool(fmt.get("strike")), color=_xl_hex(fmt.get("fg")))
-            if fmt.get("bg"):
-                cell.fill = PatternFill("solid", fgColor=_xl_hex(fmt["bg"]))
-            if any(fmt.get(k) for k in ("align", "valign", "wrap", "indent", "rotate")):
-                rot = fmt.get("rotate") or 0
-                cell.alignment = Alignment(horizontal=fmt.get("align"), vertical=fmt.get("valign"),
-                                           wrap_text=bool(fmt.get("wrap")), indent=int(fmt.get("indent") or 0),
-                                           text_rotation=rot if rot >= 0 else 90 - rot)
-            if any(fmt.get(k) for k in BORDER_KEYS):
-                sides = [Side(style=v[0], color=_xl_hex(v[1])) if v else Side() for v in map(fmt.get, BORDER_KEYS)]
-                cell.border = Border(top=sides[0], bottom=sides[1], left=sides[2], right=sides[3])
+        arrays = wb.spill_areas(sh.name)
+        for (r, c) in sh.cells.formulas():  # and those that work on arrays or can't spill (#SPILL!)
+            raw = sh.cells[(r, c)]
+            if (r, c) not in arrays and (_dynamic_formula(raw) or _may_array(raw) and
+                                         wb.get_value(sh.name, r, c) == CellError(SPILL)):
+                arrays[(r, c)] = (r, c, r, c)
+        dynamic = dynamic or bool(arrays)
+        for (r, c), text in sh.notes.items():
+            comment = Comment(text, FILE_TAG)
+            comment.width, comment.height = 200, max(60, 20 * (text.count("\n") + 2))
+            ws.cell(row=r + 1, column=c + 1).comment = comment
+        for (r, c), link in sh.links.items():
+            _xl_link(ws.cell(row=r + 1, column=c + 1), link)
+        if len(sh.cells) + len(sh.formats) > FAST_SAVE_CELLS:  # big sheet: cell XML written directly
+            fast_sheets[ws.title] = _sheet_data_xml(sh, ws, book, arrays)
+        else:
+            for r, c in set(sh.cells) | set(sh.formats):
+                cell = ws.cell(row=r + 1, column=c + 1)
+                fmt = sh.formats.get((r, c)) or {}
+                value, implied, text = _xl_cell_value(sh.cells.get((r, c)), fmt)
+                if value is not None:
+                    cell.value = ArrayFormula(range_name(*arrays[(r, c)]), value) if (r, c) in arrays else value
+                    if text:
+                        cell.data_type = "s"
+                _xl_apply_style(cell, fmt, fmt.get("num") or implied)
+        # widths in Excel's unit, 1/7 of the default font's digit cell (padding included), and PyExcel's
+        # default column width as the sheet's, so things placed over the cells sit where they do here
+        ws.sheet_format.defaultColWidth = round(DEFAULT_COL_WIDTH / 7, 4)
         for c, width in sh.col_widths.items():
-            ws.column_dimensions[col_name(c)].width = max(1.0, (width - 5) / 7)
+            ws.column_dimensions[col_name(c)].width = max(1.0, width / 7)
         for c in sh.hidden_cols:
             ws.column_dimensions[col_name(c)].hidden = True
-        for r, height in sh.row_heights.items():
-            ws.row_dimensions[r + 1].height = round(height * 0.75, 2)
-        for r in sh.hidden_rows | (sh.filter["hidden"] if sh.filter else set()):
-            ws.row_dimensions[r + 1].hidden = True
+        if ws.title not in fast_sheets:  # (the fast writer puts these on its <row> elements)
+            for r, height in sh.row_heights.items():
+                ws.row_dimensions[r + 1].height = round(height * 0.75, 2)
+            for r in sh.hidden_rows | (sh.filter["hidden"] if sh.filter else set()):
+                ws.row_dimensions[r + 1].hidden = True
+            for r, level in sh.row_levels.items():
+                ws.row_dimensions[r + 1].outlineLevel = level
+            for r in sh.collapsed_rows:
+                ws.row_dimensions[r + 1].collapsed = True
+        for c, level in sh.col_levels.items():
+            ws.column_dimensions[col_name(c)].outlineLevel = level
+        for c in sh.collapsed_cols:
+            ws.column_dimensions[col_name(c)].collapsed = True
+        if sh.row_levels:
+            ws.sheet_format.outlineLevelRow = max(sh.row_levels.values())
+        if sh.col_levels:
+            ws.sheet_format.outlineLevelCol = max(sh.col_levels.values())
         for m in sh.merges:
             ws.merge_cells(start_row=m[0] + 1, start_column=m[1] + 1, end_row=m[2] + 1, end_column=m[3] + 1)
         if sh.tab_color:
             ws.sheet_properties.tabColor = _xl_hex(sh.tab_color)
+        if sh.hidden:
+            ws.sheet_state = "hidden"
+        if sh.protection:
+            _xl_protection(ws.protection, sh.protection)
+        if sh.freeze:
+            r0, r1, c0, c1 = sh.freeze
+            ws.freeze_panes = cell_name(r1 - r0, c1 - c0)  # sets up the panes as if frozen from A1...
+            ws.sheet_view.pane.topLeftCell = cell_name(r1, c1)
+            if (r0, c0) != (0, 0):
+                ws.sheet_view.topLeftCell = cell_name(r0, c0)  # ...then moves them to where they start
         if sh.filter:
             r1, c1, r2, c2 = sh.filter["range"]
             ws.auto_filter.ref = range_name(r1, c1, r2, c2)
-            for col, allowed in sorted(sh.filter["criteria"].items()):
-                ws.auto_filter.add_filter_column(col - c1, sorted(v for v in allowed if v), blank="" in allowed)
+            for col, crit in sorted(sh.filter["criteria"].items()):
+                ws.auto_filter.filterColumn.append(_xl_filter_column(col - c1, crit, book))
+        for rule in sh.validations:
+            if rule.get("type", "any") != "any":
+                ws.add_data_validation(_xl_validation(rule))
+        for chart in sh.charts:
+            if chart["type"] == PICTURE:
+                picture = _xl_picture(chart)
+                if picture is not None:
+                    ws.add_image(picture)
+            elif chart["type"] == SHAPE:
+                continue  # written into the drawing part afterwards (openpyxl has no shapes)
+            else:
+                ws.add_chart(_xl_chart(wb, sh.name, ws, chart))
+        if any(chart["type"] == SHAPE for chart in sh.charts):
+            drawings[ws.title] = drawingml.anchors_xml(sh.charts, _geometry(sh))
+        if sh.page_setup:
+            _xl_page_setup(ws, sh.page_setup)
         for rule in reversed(sh.cond_formats):  # Excel: the first rule added gets the top priority
             xl_rule = _xl_cf_rule(rule)
             if xl_rule is not None:
                 ws.conditional_formatting.add(range_name(*rule["range"]), xl_rule)
-    if active in wb.sheets:
-        book.active = list(wb.sheets).index(active)
-    book.save(path)
+    pivots = {sh.name: [_pivot_to_dict(p) for p in sh.pivots] for sh in wb.sheets.values() if sh.pivots}
+    if pivots:  # Excel shows the reports as plain cells; PyExcel reads the definitions back from here
+        store = book.create_sheet(PIVOT_STORE)
+        store["A1"] = json.dumps(pivots, ensure_ascii=False)
+        store.sheet_state = "veryHidden"
+    _xl_names(book, wb)
+    if active not in wb.sheets or wb.sheets[active].hidden:
+        active = wb.visible_sheets()[0]
+    book.active = list(wb.sheets).index(active)
+    for ws in book.worksheets:  # Excel opens on the active sheet; others must not look selected
+        ws.sheet_view.tabSelected = ws is book.active
+    if not fast_sheets and not dynamic and not drawings:
+        book.save(path)
+        return
+    buffer = io.BytesIO()
+    book.save(buffer)
+    _put_sheet_data(buffer, path, fast_sheets, dynamic, drawings)

@@ -1,14 +1,16 @@
 """Dialog boxes for PyExcel: Format Cells, conditional-formatting rules, sorting, series,
 insert/delete cells, paste special, the filter dropdown, insert function, format as table,
-remove duplicates and rule management."""
+remove duplicates, rule management, data validation (with its in-cell list) and notes."""
 
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
 import formula_engine as fe
+import printing
 from function_info import CATEGORIES, FUNCTION_INFO
 from ribbon import GROUP_LINE, HOVER_BG, STANDARD_COLORS, TEXT_FG, Popup, color_popup, theme_palette
+from screens import center_on
 
 SYMBOLS = ["₫", "$", "€", "¥", "£", "Không"]
 LONG_DATE = 'dddd, "ngày" dd "tháng" mm "năm" yyyy'
@@ -19,7 +21,7 @@ FRACTION_TYPES = ["# ?/?", "# ??/??", "# ???/???"]
 NUM_CATEGORIES = ["Chung", "Số", "Tiền tệ", "Kế toán", "Ngày", "Thời gian", "Phần trăm", "Phân số",
                   "Khoa học", "Văn bản", "Tùy chỉnh"]
 BORDER_NAMES = [("thin", "Mảnh"), ("medium", "Vừa"), ("thick", "Dày"), ("double", "Kép"),
-                ("dashed", "Gạch"), ("dotted", "Chấm")]
+                ("dashed", "Gạch"), ("dotted", "Chấm"), ("hair", "Chấm rất mảnh")]
 CF_PRESETS = [("Tô đỏ nhạt, chữ đỏ sẫm", {"bg": "#ffc7ce", "fg": "#9c0006"}),
               ("Tô vàng, chữ vàng sẫm", {"bg": "#ffeb9c", "fg": "#9c5700"}),
               ("Tô xanh lá, chữ xanh sẫm", {"bg": "#c6efce", "fg": "#006100"}),
@@ -100,13 +102,12 @@ class Dialog(tk.Toplevel):
         ttk.Button(bar, text="Hủy", command=self.cancel, width=10).pack(side="right")
         ttk.Button(bar, text=ok_text, command=self.ok, width=10).pack(side="right", padx=(0, 6))
         self.bind("<Return>", lambda e: self.ok())
+        return bar
 
     def show(self, focus=None):
         self.update_idletasks()
-        top = self.master.winfo_toplevel()
-        x = top.winfo_rootx() + (top.winfo_width() - self.winfo_reqwidth()) // 2
-        y = top.winfo_rooty() + (top.winfo_height() - self.winfo_reqheight()) // 3
-        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        x, y = center_on(self, self.master, self.winfo_reqwidth(), self.winfo_reqheight(), rise=3)
+        self.geometry(f"+{x}+{y}")
         self.deiconify()
         self.grab_set()
         (focus or self).focus_set()
@@ -164,7 +165,7 @@ class ColorButton(tk.Frame):
 class FormatCellsDialog(Dialog):
     """Excel's Format Cells (Ctrl+1). collect() returns only what the user changed."""
 
-    TABS = ("number", "align", "font", "border", "fill")
+    TABS = ("number", "align", "font", "border", "fill", "protection")
 
     def __init__(self, master, ui, fmt, sample, families, default_family, tab="number", merged=False,
                  multi_rows=False, multi_cols=False):
@@ -179,6 +180,7 @@ class FormatCellsDialog(Dialog):
         self._font_tab()
         self._border_tab()
         self._fill_tab()
+        self._protection_tab()
         self.nb.select(self.TABS.index(tab) if tab in self.TABS else 0)
         self.add_buttons()
 
@@ -302,7 +304,8 @@ class FormatCellsDialog(Dialog):
         self.nb.add(page, text="Căn chỉnh")
         box = ttk.LabelFrame(page, text="Căn chỉnh văn bản", padding=8)
         box.grid(row=0, column=0, sticky="nsew")
-        self.h_names = {"Chung": None, "Trái (thụt lề)": "left", "Giữa": "center", "Phải (thụt lề)": "right"}
+        self.h_names = {"Chung": None, "Trái (thụt lề)": "left", "Giữa": "center", "Phải (thụt lề)": "right",
+                        "Căn giữa trong vùng chọn": "centerContinuous"}
         self.v_names = {"Trên": "top", "Giữa": "center", "Dưới": None}
         ttk.Label(box, text="Ngang:").grid(row=0, column=0, sticky="w")
         self.h_var = tk.StringVar(value=next(k for k, v in self.h_names.items() if v == self.fmt.get("align")))
@@ -517,7 +520,7 @@ class FormatCellsDialog(Dialog):
         cv.create_text(150, 75, text="Văn bản", fill="#999")
         style, color = self._line()
         width = {"medium": 2, "thick": 3}.get(style, 1)
-        dash = {"dashed": "-", "dotted": "."}.get(style, "")
+        dash = {"dashed": "-", "dotted": ".", "hair": "."}.get(style, "")
         lines = {"top": (x0, y0, x1, y0), "bottom": (x0, y1, x1, y1), "left": (x0, y0, x0, y1),
                  "right": (x1, y0, x1, y1), "inside_h": (x0, 60, x1, 60), "inside_v": (110, y0, 110, y1)}
         for key, pts in lines.items():
@@ -544,6 +547,18 @@ class FormatCellsDialog(Dialog):
         self.fill_preview = tk.Label(page, width=40, height=2, relief="solid", bd=1)
         self.fill_preview.pack(anchor="w")
         self._set_fill(self.fill_color)
+
+    # protection
+    def _protection_tab(self):
+        page = ttk.Frame(self.nb, padding=10)
+        self.nb.add(page, text="Bảo vệ")
+        self.locked_var = tk.BooleanVar(value=not self.fmt.get("unlocked"))
+        self.hidden_var = tk.BooleanVar(value=bool(self.fmt.get("hide_formula")))
+        ttk.Checkbutton(page, text="Khóa", variable=self.locked_var).pack(anchor="w")
+        ttk.Checkbutton(page, text="Ẩn công thức", variable=self.hidden_var).pack(anchor="w", pady=(4, 0))
+        ttk.Label(page, text="Khóa ô hoặc ẩn công thức chỉ có tác dụng khi trang tính được bảo vệ\n"
+                             "(Xem lại → Bảo vệ Trang tính).", foreground="#666", justify="left").pack(anchor="w",
+                                                                                                    pady=(12, 0))
 
     def _set_fill(self, color):
         self.fill_color = color
@@ -587,6 +602,10 @@ class FormatCellsDialog(Dialog):
         if self.border_touched:
             line = self._line()
             out["borders"] = {k: (line if v.get() else None) for k, v in self.edge_vars.items()}
+        if (not self.locked_var.get()) != bool(self.fmt.get("unlocked")):
+            out["unlocked"] = True if not self.locked_var.get() else None
+        if self.hidden_var.get() != bool(self.fmt.get("hide_formula")):
+            out["hide_formula"] = True if self.hidden_var.get() else None
         return out
 
 
@@ -721,9 +740,11 @@ class SeriesDialog(Dialog):
 class ChoiceDialog(Dialog):
     """A list of radio options (Insert/Delete cells, ...)."""
 
-    def __init__(self, master, title, options, default=None):
+    def __init__(self, master, title, options, default=None, prompt=None):
         super().__init__(master, title)
         self.var = tk.StringVar(value=default or options[0][1])
+        if prompt:
+            ttk.Label(self.body, text=prompt, justify="left").pack(anchor="w", pady=(0, 8))
         for text, value in options:
             ttk.Radiobutton(self.body, text=text, value=value, variable=self.var).pack(anchor="w", pady=1)
         self.add_buttons()
@@ -748,9 +769,12 @@ class PasteSpecialDialog(Dialog):
         box = ttk.LabelFrame(self.body, text="Dán", padding=6)
         box.pack(fill="x")
         self.mode = tk.StringVar(value="all")
-        for text, value in (("Tất cả", "all"), ("Công thức", "formulas"), ("Giá trị", "values"),
-                            ("Định dạng", "formats")):
-            ttk.Radiobutton(box, text=text, value=value, variable=self.mode).pack(anchor="w")
+        options = (("Tất cả (giữ định dạng nguồn)", "all"), ("Công thức", "formulas"), ("Giá trị", "values"),
+                   ("Định dạng", "formats"), ("Tất cả trừ viền", "no_borders"), ("Độ rộng cột", "widths"),
+                   ("Giá trị và định dạng số", "values_num"), ("Tất cả và giữ độ rộng cột nguồn", "all_widths"))
+        for k, (text, value) in enumerate(options):
+            ttk.Radiobutton(box, text=text, value=value, variable=self.mode).grid(row=k % 4, column=k // 4, sticky="w",
+                                                                                 padx=(0, 16))
         self.skip = tk.BooleanVar()
         self.transpose = tk.BooleanVar()
         ttk.Checkbutton(self.body, text="Bỏ qua ô trống", variable=self.skip).pack(anchor="w", pady=(8, 0))
@@ -758,7 +782,10 @@ class PasteSpecialDialog(Dialog):
         self.add_buttons()
 
     def collect(self):
-        return {"mode": self.mode.get(), "skip_blanks": self.skip.get(), "transpose": self.transpose.get()}
+        mode = self.mode.get()
+        widths = mode == "all_widths"
+        return {"mode": "all" if widths else mode, "widths": widths, "skip_blanks": self.skip.get(),
+                "transpose": self.transpose.get()}
 
 
 class FunctionDialog(Dialog):
@@ -894,28 +921,76 @@ class ManageRulesDialog(Dialog):
         return self.rules
 
 
-class FilterPopup:
-    """Excel's filter dropdown: sorting, clearing, search and a checklist of values."""
+FILTER_OP_LABELS = [("=", "bằng"), ("<>", "không bằng"), (">", "lớn hơn"), (">=", "lớn hơn hoặc bằng"),
+                    ("<", "nhỏ hơn"), ("<=", "nhỏ hơn hoặc bằng"), ("begins", "bắt đầu bằng"),
+                    ("nbegins", "không bắt đầu bằng"), ("ends", "kết thúc bằng"), ("nends", "không kết thúc bằng"),
+                    ("contains", "có chứa"), ("ncontains", "không chứa")]
+DATE_OP_LABELS = {">": "sau", ">=": "sau hoặc bằng", "<": "trước", "<=": "trước hoặc bằng"}
+DYNAMIC_LABELS = {"tomorrow": "Ngày mai", "today": "Hôm nay", "yesterday": "Hôm qua", "nextweek": "Tuần tới",
+                  "thisweek": "Tuần này", "lastweek": "Tuần trước", "nextmonth": "Tháng tới", "thismonth": "Tháng này",
+                  "lastmonth": "Tháng trước", "nextyear": "Năm tới", "thisyear": "Năm nay", "lastyear": "Năm trước"}
 
-    def __init__(self, master, ui, title, values, selected, x, y, on_sort, on_clear, on_apply):
-        self.values, self.on_apply = values, on_apply
+
+def describe_filter(crit, kind="text"):
+    """A short Vietnamese description of a column's filter, e.g. 'lớn hơn 10 và nhỏ hơn 20'."""
+    if crit is None:
+        return ""
+    if not isinstance(crit, dict):
+        return f"{len(crit)} giá trị được chọn"
+    labels = dict(FILTER_OP_LABELS, **(DATE_OP_LABELS if kind == "date" else {}))
+    t = crit["type"]
+    if t == "custom":
+        return (" và " if crit.get("join", "and") == "and" else " hoặc ").join(
+            f"{labels[op]} “{value}”" for op, value in crit["conds"])
+    if t == "top":
+        return (f"{'dưới' if crit.get('bottom') else 'trên'} {crit.get('n', 10)}"
+                f"{'%' if crit.get('percent') else ' mục'}")
+    if t == "average":
+        return "trên trung bình" if crit.get("above", True) else "dưới trung bình"
+    if t == "dynamic":
+        return DYNAMIC_LABELS[crit["kind"]].lower()
+    return ("màu ô " if crit.get("what", "bg") == "bg" else "màu phông ") + (crit.get("color") or "tự động")
+
+
+class FilterPopup:
+    """Excel's AutoFilter dropdown: sort (also by colour), clear, filter by colour, the Number / Text /
+    Date Filters menu, a search box and the checklist of values.
+
+    kind is "number", "date" or "text"; colors {"bg": [...], "fg": [...]} the colours to offer (None means
+    no fill / automatic); active the column's current criterion. Callbacks: on_sort(descending),
+    on_sort_color(what, color), on_clear(), on_apply(set of texts or None for all), on_criterion(criterion)
+    and on_dialog(name, preset) for the "custom" and "top" dialogs."""
+
+    def __init__(self, master, ui, title, values, selected, x, y, *, kind="text", colors=None, active=None,
+                 on_sort, on_clear, on_apply, on_sort_color=None, on_criterion=None, on_dialog=None, icons=None):
+        self.values, self.on_apply, self.ui, self.icons = values, on_apply, ui, icons
+        self.active, self.kind = active, kind
+        self.on_criterion, self.on_dialog = on_criterion, on_dialog
+        colors = colors or {}
         self.pop = pop = Popup(master, x, y)
         f = pop.inner
-        pad = ui.px(6)
-
-        def entry(text, command, enabled=True):
-            lbl = tk.Label(f, text=text, bg="#ffffff", fg=TEXT_FG if enabled else "#a0a0a0", anchor="w",
-                           font=ui.font, padx=pad, pady=ui.px(3))
-            lbl.pack(fill="x", padx=2)
-            if enabled:
-                lbl.bind("<Enter>", lambda e: lbl.config(bg=HOVER_BG))
-                lbl.bind("<Leave>", lambda e: lbl.config(bg="#ffffff"))
-                lbl.bind("<ButtonRelease-1>", lambda e: (pop.close(), command()))
-
-        entry("↑  Sắp xếp từ A đến Z", lambda: on_sort(False))
-        entry("↓  Sắp xếp từ Z đến A", lambda: on_sort(True))
+        self.pad = pad = ui.px(6)
+        asc, desc = {"number": ("Sắp xếp từ nhỏ nhất đến lớn nhất", "Sắp xếp từ lớn nhất đến nhỏ nhất"),
+                     "date": ("Sắp xếp từ cũ nhất đến mới nhất", "Sắp xếp từ mới nhất đến cũ nhất")}.get(
+            kind, ("Sắp xếp từ A đến Z", "Sắp xếp từ Z đến A"))
+        has_colors = bool(colors.get("bg") or colors.get("fg"))
+        self._entry(f, "sort_az", asc, lambda: on_sort(False))
+        self._entry(f, "sort_za", desc, lambda: on_sort(True))
+        self._entry(f, "sort_color", "Sắp xếp theo màu", lambda w: self._color_menu(w, colors, on_sort_color),
+                    has_colors and on_sort_color is not None, submenu=True)
         tk.Frame(f, bg=GROUP_LINE, height=1).pack(fill="x", padx=2, pady=2)
-        entry(f"✕  Xóa bộ lọc khỏi “{title}”", on_clear, selected is not None)
+        self._entry(f, "filter_clear", f"Xóa bộ lọc khỏi “{title}”", on_clear, active is not None)
+        color_on = isinstance(active, dict) and active["type"] == "color"
+        self._entry(f, "filter_color", "Lọc theo màu",
+                    lambda w: self._color_menu(w, colors, lambda what, c: on_criterion(
+                        {"type": "color", "what": what, "color": c}), active if color_on else None),
+                    has_colors and on_criterion is not None, submenu=True, checked=color_on)
+        rules_on = isinstance(active, dict) and active["type"] != "color"
+        label = {"number": "Bộ lọc số", "date": "Bộ lọc ngày"}.get(kind, "Bộ lọc văn bản")
+        self._entry(f, None, label, self._rules_menu, on_criterion is not None, submenu=True, checked=rules_on)
+        if active is not None and not isinstance(active, set):
+            tk.Label(f, text="Đang lọc: " + describe_filter(active, kind), bg="#ffffff", fg="#2b579a", anchor="w",
+                     font=ui.small_font, padx=pad, wraplength=ui.px(250), justify="left").pack(fill="x", padx=2)
         tk.Frame(f, bg=GROUP_LINE, height=1).pack(fill="x", padx=2, pady=2)
         self.search = tk.StringVar()
         search = ttk.Entry(f, textvariable=self.search, width=30, font=ui.font)
@@ -933,9 +1008,10 @@ class FilterPopup:
         pop.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(-round(e.delta / 120) or -1, "units"))
         self.vars = {v: tk.BooleanVar(value=selected is None or v in selected) for v in values}
         self.all_var = tk.BooleanVar(value=all(var.get() for var in self.vars.values()))
+        self.changed = False  # OK without touching the list keeps a rule filter as it is
         self.font = ui.font
         self._fill()
-        self.search.trace_add("write", lambda *a: self._fill())
+        self.search.trace_add("write", lambda *a: (setattr(self, "changed", True), self._fill()))
         buttons = tk.Frame(f, bg="#ffffff")
         buttons.pack(fill="x", padx=pad, pady=pad)
         ttk.Button(buttons, text="Hủy", width=9, command=pop.close).pack(side="right")
@@ -943,6 +1019,120 @@ class FilterPopup:
         pop.show()
         search.focus_set()
         pop.bind("<Return>", lambda e: self._ok())
+
+    def _entry(self, parent, icon, text, command, enabled=True, submenu=False, checked=False, swatch=None,
+               popup=None):
+        """A menu-like row; `command` takes the row widget when it opens a submenu. Picking an entry of a
+        submenu (`popup`) closes it and the dropdown before running the command."""
+        # a picture (or a blank one, to keep labels aligned), unless a colour swatch stands in for it
+        image = self.icons.get(icon) if self.icons is not None and swatch is None else None
+        row = tk.Frame(parent, bg="#ffffff")
+        row.pack(fill="x", padx=2)
+        widgets, sw = [row], None
+        if swatch is not None:
+            sw = tk.Label(row, text="", bg=swatch[0], width=2, relief="solid", bd=1)
+            sw.pack(side="left", padx=(self.pad, 0), pady=2)
+            widgets.append(sw)
+        lbl = tk.Label(row, text=("✓ " if checked else "") + text, bg="#ffffff",
+                       fg=TEXT_FG if enabled else "#a0a0a0", anchor="w", font=self.ui.font, padx=self.pad,
+                       pady=self.ui.px(3), **({"image": image, "compound": "left"} if image is not None else {}))
+        lbl.pack(side="left", fill="x", expand=True)
+        widgets.append(lbl)
+        if submenu:
+            arrow = tk.Label(row, text="›", bg="#ffffff", fg="#606060" if enabled else "#c0c0c0", font=self.ui.font,
+                             padx=self.pad)
+            arrow.pack(side="right")
+            widgets.append(arrow)
+        if not enabled:
+            return row
+
+        def hover(on):
+            for w in widgets:
+                if w is not sw:
+                    w.config(bg=HOVER_BG if on else "#ffffff")
+
+        def run(e):
+            if submenu:
+                command(row)
+            elif popup is not None:
+                popup.close()
+                self.pop.close()
+                command()
+            else:
+                self.pop.close()
+                command()
+        for w in widgets:
+            w.bind("<Enter>", lambda e: hover(True))
+            w.bind("<Leave>", lambda e: hover(False))
+            w.bind("<ButtonRelease-1>", run)
+        return row
+
+    def _submenu(self, row, items):
+        """A dropdown to the right of `row`: items are (icon, label, command[, checked, swatch]) or None."""
+        sub = Popup(self.pop, row.winfo_rootx() + row.winfo_width(), row.winfo_rooty())
+        for item in items:
+            if item is None:
+                tk.Frame(sub.inner, bg=GROUP_LINE, height=1).pack(fill="x", padx=2, pady=2)
+            elif item[2] is None:  # a heading
+                tk.Label(sub.inner, text=item[1], bg="#f3f3f3", fg="#555555", anchor="w", font=self.ui.small_font,
+                         padx=self.pad, pady=self.ui.px(2)).pack(fill="x", padx=2)
+            else:
+                icon, label, command = item[:3]
+                checked = len(item) > 3 and item[3]
+                swatch = item[4] if len(item) > 4 else None
+                self._entry(sub.inner, icon, label, command, checked=checked, swatch=swatch, popup=sub)
+        sub.show()
+
+    def _color_menu(self, row, colors, pick, active=None):
+        items = []
+        for what, heading, none_label in (("bg", "Theo màu ô", "Không tô"), ("fg", "Theo màu phông", "Tự động")):
+            if not colors.get(what):
+                continue
+            items.append((None, heading, None))
+            for color in colors[what]:
+                checked = active is not None and active.get("what") == what and active.get("color") == color
+                swatch = (color or ("#ffffff" if what == "bg" else "#000000"),)
+                items.append((None, (color or none_label).upper() if color else none_label,
+                              lambda w=what, c=color: pick(w, c), checked, swatch))
+        self._submenu(row, items)
+
+    def _rules_menu(self, row):
+        active = self.active if isinstance(self.active, dict) else {}
+        on, dialog = self.on_criterion, self.on_dialog
+
+        def custom(*conds, join="and"):
+            return lambda: dialog("custom", {"type": "custom", "join": join, "conds": [[op, ""] for op in conds]})
+
+        def current_or(preset):  # "Custom Filter..." starts from the filter in place, like Excel
+            return lambda: dialog("custom", active if active.get("type") == "custom" else preset)
+
+        if self.kind == "date":
+            items = [(None, "Bằng...", custom("=")), (None, "Trước...", custom("<")), (None, "Sau...", custom(">")),
+                     (None, "Nằm giữa...", custom(">=", "<=")), None]
+            for i, kind in enumerate(DYNAMIC_LABELS):
+                items.append((None, DYNAMIC_LABELS[kind], lambda k=kind: on({"type": "dynamic", "kind": k}),
+                              active.get("type") == "dynamic" and active.get("kind") == kind))
+                if i % 3 == 2:
+                    items.append(None)
+        elif self.kind == "number":
+            items = [(None, "Bằng...", custom("=")), (None, "Không bằng...", custom("<>")),
+                     (None, "Lớn hơn...", custom(">")), (None, "Lớn hơn hoặc bằng...", custom(">=")),
+                     (None, "Nhỏ hơn...", custom("<")), (None, "Nhỏ hơn hoặc bằng...", custom("<=")),
+                     (None, "Nằm giữa...", custom(">=", "<=")), None,
+                     ("rank_top", "10 mục đầu...", lambda: dialog("top", active if active.get("type") == "top" else
+                                                                 {"type": "top", "n": 10}), active.get("type") == "top"),
+                     ("rank_above", "Trên trung bình", lambda: on({"type": "average", "above": True}),
+                      active.get("type") == "average" and active.get("above", True)),
+                     ("rank_below", "Dưới trung bình", lambda: on({"type": "average", "above": False}),
+                      active.get("type") == "average" and not active.get("above", True)), None]
+        else:
+            items = [(None, "Bằng...", custom("=")), (None, "Không bằng...", custom("<>")), None,
+                     (None, "Bắt đầu bằng...", custom("begins")), (None, "Kết thúc bằng...", custom("ends")), None,
+                     (None, "Có chứa...", custom("contains")), (None, "Không chứa...", custom("ncontains")), None]
+        items.append(("filter", "Bộ lọc tùy chỉnh...", current_or({"type": "custom", "join": "and",
+                                                                    "conds": [["=", ""]]}),
+                      active.get("type") == "custom"))
+        self._submenu(row, items)
 
     def _visible(self):
         q = self.search.get().strip().lower()
@@ -960,14 +1150,1219 @@ class FilterPopup:
         self.canvas.yview_moveto(0)
 
     def _toggle_all(self):
+        self.changed = True
         for v in self._visible():
             self.vars[v].set(self.all_var.get())
 
     def _sync_all(self):
+        self.changed = True
         self.all_var.set(all(self.vars[v].get() for v in self._visible()))
 
     def _ok(self):
         visible = set(self._visible())
         allowed = {v for v, var in self.vars.items() if var.get() and v in visible}
         self.pop.close()
-        self.on_apply(None if allowed == set(self.values) else allowed)
+        if self.changed or not isinstance(self.active, dict):
+            self.on_apply(None if allowed == set(self.values) else allowed)
+
+
+class CustomFilterDialog(Dialog):
+    """Excel's Custom AutoFilter: one or two conditions joined by And / Or. collect() gives the criterion."""
+
+    def __init__(self, master, title, values, crit, kind="text"):
+        super().__init__(master, "Bộ lọc tự động tùy chỉnh")
+        self.labels = [(op, DATE_OP_LABELS.get(op, label) if kind == "date" else label)
+                       for op, label in FILTER_OP_LABELS]
+        conds = [list(c) for c in crit.get("conds", [])][:2] + [["", ""]] * 2
+        ttk.Label(self.body, text="Hiện các hàng có:").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.body, text=title, font=("TkDefaultFont", 9, "bold")).grid(row=1, column=0, columnspan=2,
+                                                                                sticky="w", pady=(2, 6))
+        self.ops, self.vals = [], []
+        for i in range(2):
+            op = tk.StringVar(value=dict(self.labels).get(conds[i][0], ""))
+            box = ttk.Combobox(self.body, values=([""] if i else []) + [label for _, label in self.labels],
+                               textvariable=op, state="readonly", width=20)
+            box.grid(row=2 + 2 * i, column=0, sticky="w", pady=2)
+            val = tk.StringVar(value=conds[i][1])
+            entry = ttk.Combobox(self.body, values=[v for v in values if v][:500], textvariable=val, width=26)
+            entry.grid(row=2 + 2 * i, column=1, sticky="w", padx=(6, 0), pady=2)
+            self.ops.append(op)
+            self.vals.append(val)
+            if i == 0:
+                self.first = entry
+                self.join = tk.StringVar(value=crit.get("join", "and"))
+                row = ttk.Frame(self.body)
+                row.grid(row=3, column=0, columnspan=2, sticky="w", padx=20)
+                ttk.Radiobutton(row, text="Và", value="and", variable=self.join).pack(side="left")
+                ttk.Radiobutton(row, text="Hoặc", value="or", variable=self.join).pack(side="left", padx=12)
+        ttk.Label(self.body, text="Dùng ? thay cho một ký tự bất kỳ\nDùng * thay cho một chuỗi ký tự bất kỳ",
+                  foreground="#666").grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.first)
+
+    def collect(self):
+        ops = {label: op for op, label in self.labels}
+        conds = [[ops[o.get()], v.get().strip()] for o, v in zip(self.ops, self.vals) if o.get()]
+        if not conds:
+            self.bell()
+            return None
+        return {"type": "custom", "join": self.join.get(), "conds": conds}
+
+
+class Top10Dialog(Dialog):
+    """Excel's Top 10 AutoFilter: the top or bottom n items or percent."""
+
+    def __init__(self, master, crit):
+        super().__init__(master, "Bộ lọc 10 mục đầu")
+        ttk.Label(self.body, text="Hiện").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self.side = tk.StringVar(value="Dưới" if crit.get("bottom") else "Trên")
+        ttk.Combobox(self.body, values=["Trên", "Dưới"], textvariable=self.side, state="readonly",
+                     width=8).grid(row=1, column=0)
+        self.n = tk.StringVar(value=str(crit.get("n", 10)))
+        self.spin = ttk.Spinbox(self.body, from_=1, to=500, textvariable=self.n, width=6)
+        self.spin.grid(row=1, column=1, padx=6)
+        self.unit = tk.StringVar(value="Phần trăm" if crit.get("percent") else "Mục")
+        ttk.Combobox(self.body, values=["Mục", "Phần trăm"], textvariable=self.unit, state="readonly",
+                     width=10).grid(row=1, column=2)
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.spin)
+
+    def collect(self):
+        try:
+            n = int(self.n.get())
+        except ValueError:
+            n = 0
+        if not 1 <= n <= (100 if self.unit.get() == "Phần trăm" else 500):
+            self.bell()
+            return None
+        return {"type": "top", "n": n, "bottom": self.side.get() == "Dưới", "percent": self.unit.get() == "Phần trăm"}
+
+
+VALIDATION_ALLOW = [("any", "Bất kỳ giá trị nào"), ("whole", "Số nguyên"), ("decimal", "Số thập phân"),
+                    ("list", "Danh sách"), ("date", "Ngày"), ("length", "Độ dài văn bản"), ("custom", "Tùy chỉnh")]
+VALIDATION_OPS = [("between", "nằm giữa"), ("notbetween", "không nằm giữa"), ("=", "bằng"), ("<>", "khác"),
+                  (">", "lớn hơn"), ("<", "nhỏ hơn"), (">=", "lớn hơn hoặc bằng"), ("<=", "nhỏ hơn hoặc bằng")]
+ERROR_STYLES = [("stop", "Dừng"), ("warning", "Cảnh báo"), ("info", "Thông tin")]
+
+
+def _text_box(master, text, height):
+    box = tk.Text(master, width=46, height=height, wrap="word", font="TkDefaultFont", relief="solid", bd=1,
+                  highlightthickness=0)
+    box.insert("1.0", text or "")
+    return box
+
+
+class ValidationDialog(Dialog):
+    """Excel's Data Validation: what may be typed, the message shown while the cell is selected and
+    the alert for a wrong entry. collect() returns the rule without its range, or {"clear": True}."""
+
+    def __init__(self, master, rule):
+        super().__init__(master, "Xác thực dữ liệu")
+        rule = rule or {}
+        kind = rule.get("type", "any")
+        nb = ttk.Notebook(self.body)
+        nb.pack(fill="both", expand=True)
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Cài đặt")
+        ttk.Label(f, text="Cho phép:").grid(row=0, column=0, sticky="w")
+        self.allow = tk.StringVar(value=dict(VALIDATION_ALLOW)[kind])
+        allow_box = ttk.Combobox(f, values=[label for _, label in VALIDATION_ALLOW], textvariable=self.allow,
+                                 state="readonly", width=24)
+        allow_box.grid(row=1, column=0, sticky="w")
+        self.blank = tk.BooleanVar(value=rule.get("blank", True))
+        ttk.Checkbutton(f, text="Bỏ qua ô trống", variable=self.blank).grid(row=1, column=1, sticky="w", padx=12)
+        self.op_label = ttk.Label(f, text="Dữ liệu:")
+        self.op_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.op = tk.StringVar(value=dict(VALIDATION_OPS)[rule.get("op", "between")])
+        self.op_box = ttk.Combobox(f, values=[label for _, label in VALIDATION_OPS], textvariable=self.op,
+                                   state="readonly", width=24)
+        self.op_box.grid(row=3, column=0, sticky="w")
+        self.v1 = tk.StringVar(value=rule.get("source", "") if kind == "list" else rule.get("v1", ""))
+        self.v2 = tk.StringVar(value=rule.get("v2", ""))
+        self.label1 = ttk.Label(f)
+        self.label1.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.entry1 = ttk.Entry(f, textvariable=self.v1, width=48)
+        self.entry1.grid(row=5, column=0, columnspan=2, sticky="we")
+        self.label2 = ttk.Label(f)
+        self.label2.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.entry2 = ttk.Entry(f, textvariable=self.v2, width=48)
+        self.entry2.grid(row=7, column=0, columnspan=2, sticky="we")
+        self.dropdown = tk.BooleanVar(value=rule.get("dropdown", True))
+        self.dropdown_check = ttk.Checkbutton(f, text="Hiện mũi tên thả xuống trong ô", variable=self.dropdown)
+        self.dropdown_check.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        for box in (allow_box, self.op_box):
+            box.bind("<<ComboboxSelected>>", lambda e: self._update())
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Thông báo nhập")
+        ttk.Label(f, text="Khi chọn ô, hiện thông báo này:").pack(anchor="w")
+        ttk.Label(f, text="Tiêu đề:").pack(anchor="w", pady=(8, 0))
+        self.prompt_title = tk.StringVar(value=rule.get("prompt_title", ""))
+        ttk.Entry(f, textvariable=self.prompt_title, width=48).pack(anchor="w")
+        ttk.Label(f, text="Thông báo:").pack(anchor="w", pady=(8, 0))
+        self.prompt = _text_box(f, rule.get("prompt"), 5)
+        self.prompt.pack(anchor="w")
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Cảnh báo lỗi")
+        ttk.Label(f, text="Khi nhập dữ liệu không hợp lệ, hiện cảnh báo:").pack(anchor="w")
+        ttk.Label(f, text="Kiểu:").pack(anchor="w", pady=(8, 0))
+        self.style = tk.StringVar(value=dict(ERROR_STYLES)[rule.get("style", "stop")])
+        ttk.Combobox(f, values=[label for _, label in ERROR_STYLES], textvariable=self.style, state="readonly",
+                     width=14).pack(anchor="w")
+        ttk.Label(f, text="Tiêu đề:").pack(anchor="w", pady=(8, 0))
+        self.error_title = tk.StringVar(value=rule.get("error_title", ""))
+        ttk.Entry(f, textvariable=self.error_title, width=48).pack(anchor="w")
+        ttk.Label(f, text="Thông báo lỗi:").pack(anchor="w", pady=(8, 0))
+        self.error = _text_box(f, rule.get("error"), 4)
+        self.error.pack(anchor="w")
+
+        bar = self.add_buttons()
+        ttk.Button(bar, text="Xóa tất cả", command=self._clear).pack(side="left")
+        self.unbind("<Return>")  # Enter belongs to the multi-line message boxes
+        self._update()
+
+    def _kind(self):
+        return next(k for k, label in VALIDATION_ALLOW if label == self.allow.get())
+
+    def _op(self):
+        return next(k for k, label in VALIDATION_OPS if label == self.op.get())
+
+    def _update(self):
+        kind, op = self._kind(), self._op()
+        numeric = kind in ("whole", "decimal", "date", "length")
+        two = numeric and op in ("between", "notbetween")
+        word = {"date": "Ngày", "length": "Độ dài"}.get(kind, "Giá trị")
+        for widget, shown in ((self.op_label, numeric), (self.op_box, numeric), (self.label1, kind != "any"),
+                              (self.entry1, kind != "any"), (self.label2, two), (self.entry2, two),
+                              (self.dropdown_check, kind == "list")):
+            if shown:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        if kind == "list":
+            self.label1.config(text="Nguồn (ví dụ  Có,Không  hoặc  =$A$1:$A$10):")
+        elif kind == "custom":
+            self.label1.config(text="Công thức phải cho kết quả TRUE (ví dụ  =A1>0):")
+        elif two:
+            self.label1.config(text=f"{word} tối thiểu:")
+            self.label2.config(text=f"{word} tối đa:")
+        else:
+            self.label1.config(text=f"{word}:")
+
+    def _clear(self):
+        self.result = {"clear": True}
+        self.destroy()
+
+    def collect(self):
+        kind, op = self._kind(), self._op()
+        rule = {"type": kind, "blank": self.blank.get(),
+                "style": next(k for k, label in ERROR_STYLES if label == self.style.get()),
+                "error_title": self.error_title.get().strip(), "error": self.error.get("1.0", "end").strip(),
+                "prompt_title": self.prompt_title.get().strip(), "prompt": self.prompt.get("1.0", "end").strip()}
+        v1, v2 = self.v1.get().strip(), self.v2.get().strip()
+        if kind == "any":
+            return rule
+        if not v1:
+            self.bell()
+            return None
+        if kind == "list":
+            return dict(rule, source=v1, dropdown=self.dropdown.get())
+        if kind == "custom":
+            return dict(rule, v1=v1 if v1.startswith("=") else "=" + v1)
+        values = [v1, v2] if op in ("between", "notbetween") else [v1]
+        for v in values:
+            if not (fe.is_formula(v) or fe.is_number(fe.parse_literal(v)[0])):
+                self.bell()
+                return None
+        rule.update(op=op, v1=v1)
+        if len(values) == 2:
+            rule["v2"] = v2
+        return rule
+
+
+class NoteDialog(Dialog):
+    """Text of a cell note; collect() returns it ("" removes the note)."""
+
+    def __init__(self, master, cell, text):
+        super().__init__(master, f"Ghi chú - {cell}")
+        self.box = _text_box(self.body, text, 7)
+        self.box.pack(fill="both", expand=True)
+        ttk.Label(self.body, text="Ctrl+Enter để lưu.", foreground="#666").pack(anchor="w", pady=(4, 0))
+        self.add_buttons()
+        self.unbind("<Return>")
+        self.box.bind("<Control-Return>", lambda e: (self.ok(), "break")[1])
+
+    def show(self):
+        self.box.mark_set("insert", "end")
+        return super().show(self.box)
+
+    def collect(self):
+        return self.box.get("1.0", "end").strip()
+
+
+class ListPopup:
+    """The in-cell dropdown of a list validation: click or Enter picks an item."""
+
+    def __init__(self, master, ui, items, current, x, y, width, on_pick):
+        self.on_pick, self.items = on_pick, items
+        self.pop = pop = Popup(master, x, y)
+        holder = tk.Frame(pop.inner, bg="#ffffff")
+        holder.pack(fill="both", expand=True)
+        self.listbox = lb = tk.Listbox(holder, height=min(8, max(1, len(items))), activestyle="none",
+                                       font=ui.font, relief="flat", bd=0, highlightthickness=0,
+                                       selectbackground="#cce4f7", selectforeground=TEXT_FG,
+                                       width=max(4, round(width / max(1, ui.font.measure("0")))))
+        if len(items) > 8:
+            bar = ttk.Scrollbar(holder, orient="vertical", command=lb.yview)
+            lb.config(yscrollcommand=bar.set)
+            bar.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+        for item in items:
+            lb.insert("end", item)
+        index = next((i for i, item in enumerate(items) if item.lower() == (current or "").lower()), 0)
+        lb.selection_set(index)
+        lb.activate(index)
+        lb.see(index)
+        lb.bind("<ButtonRelease-1>", lambda e: self._pick())
+        lb.bind("<Return>", lambda e: self._pick())
+        lb.bind("<Motion>", lambda e: (lb.selection_clear(0, "end"), lb.selection_set(lb.nearest(e.y))))
+        pop.show()
+        lb.focus_set()
+
+    def _pick(self):
+        sel = self.listbox.curselection()
+        self.pop.close()
+        if sel:
+            self.on_pick(self.items[sel[0]])
+
+
+CHART_KINDS = [("column", "Cột"), ("bar", "Thanh"), ("line", "Đường"), ("pie", "Tròn")]
+
+
+class ChartDialog(Dialog):
+    """Type, data range and title of a chart; collect() returns them as a dict."""
+
+    def __init__(self, master, chart):
+        super().__init__(master, "Biểu đồ")
+        f = self.body
+        ttk.Label(f, text="Kiểu biểu đồ:").grid(row=0, column=0, sticky="w", pady=3)
+        self.kind = tk.StringVar(value=dict(CHART_KINDS)[chart["type"]])
+        ttk.Combobox(f, values=[label for _, label in CHART_KINDS], textvariable=self.kind, state="readonly",
+                     width=12).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Vùng dữ liệu:").grid(row=1, column=0, sticky="w", pady=3)
+        self.range_var = tk.StringVar(value=fe.range_name(*chart["range"]))
+        self.range_entry = ttk.Entry(f, textvariable=self.range_var, width=30)
+        self.range_entry.grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Tiêu đề:").grid(row=2, column=0, sticky="w", pady=3)
+        self.title_var = tk.StringVar(value=chart.get("title", ""))
+        ttk.Entry(f, textvariable=self.title_var, width=30).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Để trống tiêu đề: biểu đồ một chuỗi lấy tên chuỗi làm tiêu đề.",
+                  foreground="#666").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.range_entry)
+
+    def collect(self):
+        rect = fe.parse_range(self.range_var.get().replace("$", "").strip())
+        if rect is None:
+            self.bell()
+            return None
+        return {"type": next(k for k, label in CHART_KINDS if label == self.kind.get()), "range": rect,
+                "title": self.title_var.get().strip()}
+
+
+class PivotDialog(Dialog):
+    """Create PivotTable: the source range, and a new sheet or a place on an existing one. collect()
+    gives {"source": (sheet, rect), "new_sheet": bool, "dest": (sheet, row, col)}."""
+
+    def __init__(self, master, wb, sheet, rect):
+        super().__init__(master, "Tạo PivotTable")
+        self.wb, self.sheet = wb, sheet
+        ttk.Label(self.body, text="Chọn dữ liệu cần phân tích (gồm hàng tiêu đề):").pack(anchor="w")
+        self.source = tk.StringVar(value=f"{fe.quote_sheet(sheet)}!{fe.range_name(*rect)}")
+        self.entry = ttk.Entry(self.body, textvariable=self.source, width=40)
+        self.entry.pack(anchor="w", pady=(4, 10))
+        ttk.Label(self.body, text="Chọn nơi đặt báo cáo PivotTable:").pack(anchor="w")
+        self.new_sheet = tk.BooleanVar(value=True)
+        ttk.Radiobutton(self.body, text="Trang tính mới", value=True, variable=self.new_sheet).pack(anchor="w")
+        row = ttk.Frame(self.body)
+        row.pack(anchor="w", pady=(2, 0))
+        ttk.Radiobutton(row, text="Trang tính hiện có, tại ô:", value=False, variable=self.new_sheet).pack(side="left")
+        self.dest = tk.StringVar(value="")
+        dest = ttk.Entry(row, textvariable=self.dest, width=18)
+        dest.pack(side="left", padx=6)
+        dest.bind("<FocusIn>", lambda e: self.new_sheet.set(False))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.entry)
+
+    def _place(self, text):
+        """(sheet, a, b) from 'B3', 'Sheet2!B3' or 'Sheet2!B3:D9' (a, b: the cell or range tuple)."""
+        sheet_text, _, addr = text.strip().rpartition("!")
+        sheet = self.sheet
+        if sheet_text:
+            name = sheet_text[1:-1].replace("''", "'") if sheet_text.startswith("'") else sheet_text
+            sheet = self.wb.resolve_sheet(name)
+        return sheet, fe.parse_address(addr.replace("$", ""))
+
+    def collect(self):
+        sheet, rect = self._place(self.source.get())
+        if sheet is None or rect is None or len(rect) != 4 or rect[2] <= rect[0]:
+            self.bell()
+            return None
+        result = {"source": (sheet, rect), "new_sheet": self.new_sheet.get(), "dest": None}
+        if not result["new_sheet"]:
+            dest_sheet, cell = self._place(self.dest.get())
+            if dest_sheet is None or cell is None:
+                self.bell()
+                return None
+            result["dest"] = (dest_sheet, cell[0], cell[1])
+        return result
+
+
+PIVOT_FORMATS = [("Giống dữ liệu nguồn", None), ("Chung", "General"), ("Số: 1,234", "#,##0"),
+                 ("Số: 1,234.56", "#,##0.00"), ("Phần trăm: 12%", "0%"), ("Phần trăm: 12.34%", "0.00%")]
+
+
+class ValueFieldDialog(Dialog):
+    """Value Field Settings: caption, summary function, 'show values as' and number format."""
+
+    def __init__(self, master, value, funcs, show_as):
+        super().__init__(master, "Cài đặt trường giá trị")
+        self.funcs, self.show_as = funcs, show_as
+        ttk.Label(self.body, text=f"Trường nguồn:  {value['field']}").pack(anchor="w")
+        ttk.Label(self.body, text="Tên tùy chỉnh:").pack(anchor="w", pady=(8, 0))
+        self.name = tk.StringVar(value=value.get("name") or "")
+        self.entry = ttk.Entry(self.body, textvariable=self.name, width=40)
+        self.entry.pack(anchor="w")
+        ttk.Label(self.body, text="(để trống: tự đặt theo hàm, ví dụ “Tổng của …”)", foreground="#666").pack(anchor="w")
+        ttk.Label(self.body, text="Tóm tắt giá trị theo:").pack(anchor="w", pady=(8, 0))
+        self.listbox = tk.Listbox(self.body, height=7, exportselection=False, activestyle="none")
+        for key, label in funcs.items():
+            self.listbox.insert("end", label)
+        index = list(funcs).index(value["func"])
+        self.listbox.selection_set(index)
+        self.listbox.see(index)
+        self.listbox.pack(fill="x")
+        ttk.Label(self.body, text="Hiển thị giá trị dưới dạng:").pack(anchor="w", pady=(8, 0))
+        self.show_var = tk.StringVar(value=show_as[value.get("show", "normal")])
+        ttk.Combobox(self.body, values=list(show_as.values()), textvariable=self.show_var, state="readonly",
+                     width=30).pack(anchor="w")
+        ttk.Label(self.body, text="Định dạng số:").pack(anchor="w", pady=(8, 0))
+        self.num = tk.StringVar(value=next((label for label, f in PIVOT_FORMATS if f == value.get("num")),
+                                           value.get("num") or PIVOT_FORMATS[0][0]))
+        ttk.Combobox(self.body, values=[label for label, _ in PIVOT_FORMATS], textvariable=self.num,
+                     width=30).pack(anchor="w")
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.entry)
+
+    def collect(self):
+        sel = self.listbox.curselection()
+        func = list(self.funcs)[sel[0]] if sel else "sum"
+        num = dict(PIVOT_FORMATS).get(self.num.get(), self.num.get().strip() or None)
+        return {"name": self.name.get().strip() or None, "func": func,
+                "show": next(k for k, label in self.show_as.items() if label == self.show_var.get()), "num": num}
+
+
+class PivotFieldDialog(Dialog):
+    """Settings of a row, column or filter field: item order, date grouping and the items shown."""
+
+    def __init__(self, master, field, items, allowed, descending, group, groups, is_date):
+        super().__init__(master, f"Cài đặt trường - {field}")
+        self.items, self.groups = items, groups
+        self.order = tk.StringVar(value="desc" if descending else "asc")
+        row = ttk.Frame(self.body)
+        row.pack(anchor="w")
+        ttk.Label(row, text="Sắp xếp mục:").pack(side="left")
+        ttk.Radiobutton(row, text="A → Z", value="asc", variable=self.order).pack(side="left", padx=6)
+        ttk.Radiobutton(row, text="Z → A", value="desc", variable=self.order).pack(side="left")
+        self.group = tk.StringVar(value=groups[group])
+        if is_date:
+            row = ttk.Frame(self.body)
+            row.pack(anchor="w", pady=(8, 0))
+            ttk.Label(row, text="Nhóm ngày theo:").pack(side="left")
+            ttk.Combobox(row, values=list(groups.values()), textvariable=self.group, state="readonly",
+                         width=14).pack(side="left", padx=6)
+            ttk.Label(self.body, text="(đổi cách nhóm sẽ chọn lại tất cả các mục)", foreground="#666").pack(anchor="w")
+        ttk.Label(self.body, text="Hiện các mục:").pack(anchor="w", pady=(8, 2))
+        holder = ttk.Frame(self.body)
+        holder.pack(fill="both")
+        canvas = tk.Canvas(holder, width=280, height=200, bg="#ffffff", highlightthickness=1,
+                           highlightbackground="#c8c8c8")
+        bar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        canvas.config(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both")
+        bar.pack(side="right", fill="y")
+        inner = tk.Frame(canvas, bg="#ffffff")
+        canvas.create_window(0, 0, window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.config(scrollregion=canvas.bbox("all")))
+        self.vars = {item: tk.BooleanVar(value=allowed is None or item in allowed) for item in items}
+        self.all_var = tk.BooleanVar(value=all(v.get() for v in self.vars.values()))
+        tk.Checkbutton(inner, text="(Chọn tất cả)", variable=self.all_var, bg="#ffffff", anchor="w",
+                       command=lambda: [v.set(self.all_var.get()) for v in self.vars.values()]).pack(fill="x")
+        for item in items[:2000]:
+            tk.Checkbutton(inner, text=item, variable=self.vars[item], bg="#ffffff", anchor="w").pack(fill="x")
+        self.add_buttons()
+
+    def collect(self):
+        allowed = {item for item, var in self.vars.items() if var.get()}
+        if not allowed:
+            self.bell()
+            return None
+        group = next(k for k, label in self.groups.items() if label == self.group.get())
+        return {"desc": self.order.get() == "desc", "group": group,
+                "items": None if len(allowed) == len(self.items) else allowed}
+
+
+class PivotOptionsDialog(Dialog):
+    """PivotTable options: name, layout, subtotals and grand totals."""
+
+    def __init__(self, master, pivot):
+        super().__init__(master, "Tùy chọn PivotTable")
+        ttk.Label(self.body, text="Tên PivotTable:").grid(row=0, column=0, sticky="w")
+        self.name = tk.StringVar(value=pivot["name"])
+        self.entry = ttk.Entry(self.body, textvariable=self.name, width=28)
+        self.entry.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(self.body, text="Bố cục báo cáo:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.layout = tk.StringVar(value=pivot["layout"])
+        row = ttk.Frame(self.body)
+        row.grid(row=1, column=1, sticky="w", pady=(8, 0), padx=6)
+        ttk.Radiobutton(row, text="Thu gọn", value="compact", variable=self.layout).pack(side="left")
+        ttk.Radiobutton(row, text="Dạng bảng", value="tabular", variable=self.layout).pack(side="left", padx=8)
+        self.flags = {}
+        for i, (key, text) in enumerate((("subtotals", "Hiện tổng phụ"), ("grand_rows", "Tổng Cuối cho các hàng"),
+                                         ("grand_cols", "Tổng Cuối cho các cột"))):
+            self.flags[key] = tk.BooleanVar(value=pivot[key])
+            ttk.Checkbutton(self.body, text=text, variable=self.flags[key]).grid(row=2 + i, column=0, columnspan=2,
+                                                                                 sticky="w", pady=(6 if i == 0 else 0, 0))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.entry)
+
+    def collect(self):
+        if not self.name.get().strip():
+            self.bell()
+            return None
+        return {"name": self.name.get().strip(), "layout": self.layout.get(),
+                **{key: var.get() for key, var in self.flags.items()}}
+
+
+PAPER_LABELS = {"A4": "A4 (21 × 29,7 cm)", "A3": "A3 (29,7 × 42 cm)", "A5": "A5 (14,8 × 21 cm)",
+                "Letter": "Letter (21,59 × 27,94 cm)", "Legal": "Legal (21,59 × 35,56 cm)"}
+HEADER_PRESETS = ["(không có)", "Trang &P", "Trang &P / &N", "Trang &P của &N", "&A", "&F", "&A – Trang &P",
+                  "&D &T"]
+MARGIN_NAMES = ("Trên", "Dưới", "Trái", "Phải", "Đầu trang", "Chân trang")
+
+
+def _cm(inches):
+    return f"{inches * 2.54:.2f}".replace(".", ",")
+
+
+class PageSetupDialog(Dialog):
+    """Page Setup with Excel's four tabs: page (orientation, scaling, paper), margins (cm), header/footer
+    and sheet (print area, rows to repeat, gridlines). collect() returns the whole setup dict."""
+
+    TABS = ("page", "margins", "header", "sheet")
+
+    def __init__(self, master, setup, tab="page"):
+        super().__init__(master, "Thiết lập Trang")
+        self.setup = setup
+        nb = ttk.Notebook(self.body)
+        nb.pack(fill="both", expand=True)
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Trang")
+        ttk.Label(f, text="Hướng giấy").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.orient = tk.StringVar(value=setup["orientation"])
+        row = ttk.Frame(f)
+        row.grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 10))
+        ttk.Radiobutton(row, text="Dọc", value="portrait", variable=self.orient).pack(side="left")
+        ttk.Radiobutton(row, text="Ngang", value="landscape", variable=self.orient).pack(side="left", padx=16)
+        ttk.Label(f, text="Co giãn").grid(row=2, column=0, columnspan=3, sticky="w")
+        self.fit = tk.StringVar(value=setup["fit"] or "scale")
+        self.scale = tk.StringVar(value=str(setup["scale"] or 100))
+        ttk.Radiobutton(f, text="Điều chỉnh theo:", value="scale", variable=self.fit).grid(
+            row=3, column=0, sticky="w", padx=12, pady=2)
+        ttk.Spinbox(f, from_=10, to=400, increment=5, textvariable=self.scale, width=6,
+                    command=lambda: self.fit.set("scale")).grid(row=3, column=1, sticky="w")
+        ttk.Label(f, text="% kích thước thường").grid(row=3, column=2, sticky="w", padx=4)
+        ttk.Radiobutton(f, text="Vừa tất cả các cột trên một trang", value="width", variable=self.fit).grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=12, pady=2)
+        ttk.Radiobutton(f, text="Vừa toàn bộ trang tính trên một trang", value="page", variable=self.fit).grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=12, pady=2)
+        ttk.Label(f, text="Khổ giấy:").grid(row=6, column=0, sticky="w", pady=(12, 0))
+        self.paper = tk.StringVar(value=PAPER_LABELS.get(setup["paper"], PAPER_LABELS["A4"]))
+        ttk.Combobox(f, values=list(PAPER_LABELS.values()), textvariable=self.paper, state="readonly",
+                     width=24).grid(row=6, column=1, columnspan=2, sticky="w", pady=(12, 0))
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Lề")
+        self.margins = []
+        for i, name in enumerate(MARGIN_NAMES):
+            ttk.Label(f, text=name + ":").grid(row=i // 2, column=(i % 2) * 2, sticky="w", pady=3,
+                                               padx=(0 if i % 2 == 0 else 20, 6))
+            var = tk.StringVar(value=_cm(setup["margins"][i]))
+            ttk.Spinbox(f, from_=0, to=10, increment=0.1, textvariable=var, width=7).grid(
+                row=i // 2, column=(i % 2) * 2 + 1, sticky="w")
+            self.margins.append(var)
+        ttk.Label(f, text="(đơn vị: cm)", foreground="#666").grid(row=3, column=0, columnspan=4, sticky="w",
+                                                                 pady=(2, 10))
+        ttk.Label(f, text="Căn giữa trên trang").grid(row=4, column=0, columnspan=4, sticky="w")
+        self.center_h = tk.BooleanVar(value=setup["center_h"])
+        self.center_v = tk.BooleanVar(value=setup["center_v"])
+        ttk.Checkbutton(f, text="Theo chiều ngang", variable=self.center_h).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=12, pady=2)
+        ttk.Checkbutton(f, text="Theo chiều dọc", variable=self.center_v).grid(
+            row=5, column=2, columnspan=2, sticky="w", pady=2)
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Đầu trang/Chân trang")
+        self.header = tk.StringVar(value=setup["header"] or HEADER_PRESETS[0])
+        self.footer = tk.StringVar(value=setup["footer"] or HEADER_PRESETS[0])
+        for i, (label, var) in enumerate((("Đầu trang:", self.header), ("Chân trang:", self.footer))):
+            ttk.Label(f, text=label).grid(row=i, column=0, sticky="w", pady=4)
+            ttk.Combobox(f, values=HEADER_PRESETS, textvariable=var, width=34).grid(row=i, column=1, sticky="w",
+                                                                                   padx=6)
+        ttk.Label(f, text="Có thể gõ chữ tùy ý kèm các mã:\n&P số trang   &N tổng số trang   &D ngày   &T giờ\n"
+                          "&A tên trang tính   &F tên tệp", foreground="#666", justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="Trang tính")
+        ttk.Label(f, text="Vùng in:").grid(row=0, column=0, sticky="w", pady=4)
+        self.area = tk.StringVar(value=fe.range_name(*setup["area"]) if setup["area"] else "")
+        ttk.Entry(f, textvariable=self.area, width=20).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="để trống: in phần có dữ liệu", foreground="#666").grid(row=0, column=2, sticky="w")
+        ttk.Label(f, text="Hàng lặp lại ở đầu trang:").grid(row=1, column=0, sticky="w", pady=4)
+        self.titles = tk.StringVar(value=printing.title_rows_text(setup["titles"]))
+        ttk.Entry(f, textvariable=self.titles, width=20).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="ví dụ: $1:$2", foreground="#666").grid(row=1, column=2, sticky="w")
+        self.gridlines = tk.BooleanVar(value=setup["gridlines"])
+        ttk.Checkbutton(f, text="In đường lưới", variable=self.gridlines).grid(row=2, column=0, columnspan=3,
+                                                                             sticky="w", pady=(10, 0))
+        nb.select(self.TABS.index(tab) if tab in self.TABS else 0)
+        self.add_buttons()
+
+    def collect(self):
+        try:
+            scale = int(float(self.scale.get().replace(",", ".")))
+            margins = [m if v.get().strip() == _cm(m) else round(float(v.get().replace(",", ".")) / 2.54, 4)
+                       for v, m in zip(self.margins, self.setup["margins"])]  # untouched: exact inches
+        except ValueError:
+            self.bell()
+            return None
+        area_text = self.area.get().replace("$", "").strip()
+        area = fe.parse_range(area_text) if area_text else None
+        titles = printing.parse_title_rows(self.titles.get())
+        if not 10 <= scale <= 400 or min(margins) < 0 or area_text and area is None or titles is False:
+            self.bell()
+            return None
+        paper = next(k for k, label in PAPER_LABELS.items() if label == self.paper.get())
+        header, footer = (v.get().strip() for v in (self.header, self.footer))
+        return dict(self.setup, orientation=self.orient.get(), paper=paper, scale=scale,
+                    fit=None if self.fit.get() == "scale" else self.fit.get(), margins=margins,
+                    center_h=self.center_h.get(), center_v=self.center_v.get(),
+                    header="" if header == HEADER_PRESETS[0] else header,
+                    footer="" if footer == HEADER_PRESETS[0] else footer,
+                    area=area, titles=titles, gridlines=self.gridlines.get())
+
+
+SUBTOTAL_FUNCS = [(9, "Tổng"), (3, "Đếm"), (1, "Trung bình"), (4, "Lớn nhất"), (5, "Nhỏ nhất"), (6, "Tích"),
+                  (2, "Đếm số"), (7, "Độ lệch chuẩn"), (8, "Độ lệch chuẩn tổng thể"), (10, "Phương sai"),
+                  (11, "Phương sai tổng thể")]
+
+
+class SubtotalDialog(Dialog):
+    """Data > Subtotal. collect() gives {"by": col, "func": SUBTOTAL number, "columns": [cols], "replace": bool};
+    the Remove All button gives {"remove": True}."""
+
+    def __init__(self, master, columns):
+        super().__init__(master, "Tổng phụ")
+        self.columns = columns
+        labels = [text or f"Cột {fe.col_name(c)}" for c, text in columns]
+        f = self.body
+        ttk.Label(f, text="Tại mỗi thay đổi trong:").pack(anchor="w")
+        self.by = ttk.Combobox(f, values=labels, state="readonly", width=34)
+        self.by.current(0)
+        self.by.pack(anchor="w", fill="x", pady=(2, 8))
+        ttk.Label(f, text="Dùng hàm:").pack(anchor="w")
+        self.func = ttk.Combobox(f, values=[name for _, name in SUBTOTAL_FUNCS], state="readonly", width=34)
+        self.func.current(0)
+        self.func.pack(anchor="w", fill="x", pady=(2, 8))
+        ttk.Label(f, text="Thêm tổng phụ vào:").pack(anchor="w")
+        box = ttk.Frame(f)
+        box.pack(fill="both", expand=True, pady=(2, 8))
+        self.targets = tk.Listbox(box, selectmode="multiple", exportselection=False, height=min(7, len(labels)),
+                                  activestyle="none")
+        bar = ttk.Scrollbar(box, command=self.targets.yview)
+        self.targets.configure(yscrollcommand=bar.set)
+        self.targets.pack(side="left", fill="both", expand=True)
+        if len(labels) > 7:
+            bar.pack(side="right", fill="y")
+        for label in labels:
+            self.targets.insert("end", label)
+        self.targets.selection_set(len(labels) - 1)
+        self.targets.see(len(labels) - 1)
+        self.replace = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="Thay thế tổng phụ hiện có", variable=self.replace).pack(anchor="w")
+        ttk.Label(f, text="Tổng phụ nằm bên dưới mỗi nhóm; hãy sắp xếp bảng theo cột nhóm trước.",
+                  foreground="#666").pack(anchor="w", pady=(6, 0))
+        bar = self.add_buttons()
+        ttk.Button(bar, text="Loại bỏ Tất cả", command=self.remove_all).pack(side="left")
+
+    def remove_all(self):
+        self.result = {"remove": True}
+        self.destroy()
+
+    def collect(self):
+        picked = [self.columns[i][0] for i in self.targets.curselection()]
+        if not picked:
+            self.bell()
+            return None
+        return {"by": self.columns[self.by.current()][0], "func": SUBTOTAL_FUNCS[self.func.current()][0],
+                "columns": picked, "replace": self.replace.get()}
+
+
+class DefineNameDialog(Dialog):
+    """New Name / Edit Name: name, comment and what it refers to. collect() gives (name, ref, comment)."""
+
+    def __init__(self, master, wb, name="", ref="", comment="", old=None):
+        super().__init__(master, "Sửa Tên" if old else "Tên Mới")
+        self.wb, self.old = wb, old
+        f = self.body
+        ttk.Label(f, text="Tên:").grid(row=0, column=0, sticky="w", pady=3)
+        self.name = tk.StringVar(value=name)
+        self.name_entry = ttk.Entry(f, textvariable=self.name, width=36)
+        self.name_entry.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Phạm vi:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(f, text="Sổ làm việc").grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Ghi chú:").grid(row=2, column=0, sticky="nw", pady=3)
+        self.comment = tk.Text(f, width=36, height=3, wrap="word", font=tkfont.nametofont("TkDefaultFont"))
+        self.comment.insert("1.0", comment)
+        self.comment.grid(row=2, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(f, text="Tham chiếu tới:").grid(row=3, column=0, sticky="w", pady=3)
+        self.ref = tk.StringVar(value=ref)
+        ttk.Entry(f, textvariable=self.ref, width=36).grid(row=3, column=1, sticky="w", padx=6)
+        ttk.Label(f, text="Ví dụ: =Sheet1!$B$2:$B$20 hoặc một hằng số như =0,1", foreground="#666").grid(
+            row=4, column=1, sticky="w", padx=6)
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.name_entry)
+
+    def collect(self):
+        name, ref = self.name.get().strip(), self.ref.get().strip()
+        err = self.wb.check_name(name, ignore=self.old)
+        if err is None and not ref.lstrip("="):
+            err = "Hãy nhập vùng hoặc giá trị mà tên tham chiếu tới."
+        if err is None and fe.parse_formula(ref if ref.startswith("=") else "=" + ref)[1] == fe.SYNTAX:
+            err = "Tham chiếu không hợp lệ."
+        if err:
+            from tkinter import messagebox
+            messagebox.showerror("Tên", err, parent=self)
+            return None
+        return name, ref, self.comment.get("1.0", "end").strip()
+
+
+class NameManagerDialog(Dialog):
+    """Name Manager: the workbook's names with value, reference and comment; New / Edit / Delete call
+    back into the app (which keeps undo) and the list is read again afterwards."""
+
+    def __init__(self, master, wb, on_new, on_edit, on_delete, on_go):
+        super().__init__(master, "Trình Quản lý Tên")
+        self.resizable(True, True)
+        self.wb, self.on_new, self.on_edit, self.on_delete, self.on_go = wb, on_new, on_edit, on_delete, on_go
+        f = self.body
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="Mới...", command=self._new).pack(side="left")
+        self.edit_btn = ttk.Button(bar, text="Sửa...", command=self._edit)
+        self.edit_btn.pack(side="left", padx=6)
+        self.del_btn = ttk.Button(bar, text="Xóa", command=self._delete)
+        self.del_btn.pack(side="left")
+        cols = ("value", "ref", "comment")
+        self.tree = ttk.Treeview(f, columns=cols, height=10, selectmode="browse")
+        for col, text, width in (("#0", "Tên", 150), ("value", "Giá trị", 170), ("ref", "Tham chiếu tới", 210),
+                                 ("comment", "Ghi chú", 150)):
+            self.tree.heading(col, text=text, anchor="w")
+            self.tree.column(col, width=width, anchor="w")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._sync())
+        self.tree.bind("<Double-1>", lambda e: self._edit())
+        self.tree.bind("<Delete>", lambda e: self._delete())
+        ttk.Label(f, text="Nhấp đúp để sửa. Tên dùng được trong công thức, ví dụ =SUM(ĐơnGiá).",
+                  foreground="#666").pack(anchor="w", pady=(6, 0))
+        bar = ttk.Frame(self, padding=(12, 0, 12, 12))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Đóng", command=self.cancel, width=10).pack(side="right")
+        ttk.Button(bar, text="Chọn vùng", command=self._go).pack(side="right", padx=6)
+        self.reload()
+
+    def reload(self, select=None):
+        self.tree.delete(*self.tree.get_children())
+        for d in self.wb.sorted_names():
+            key = d["name"].upper()
+            self.tree.insert("", "end", iid=key, text=d["name"],
+                             values=(self.wb.name_value(key), d["ref"], d.get("comment", "")))
+        if select and select.upper() in self.wb.names:
+            self.tree.selection_set(select.upper())
+            self.tree.see(select.upper())
+        self._sync()
+
+    def _current(self):
+        sel = self.tree.selection()
+        return self.wb.names[sel[0]]["name"] if sel and sel[0] in self.wb.names else None
+
+    def _sync(self):
+        state = "normal" if self._current() else "disabled"
+        self.edit_btn.configure(state=state)
+        self.del_btn.configure(state=state)
+
+    def _new(self):
+        self.reload(self.on_new(self))
+
+    def _edit(self):
+        name = self._current()
+        if name:
+            self.reload(self.on_edit(self, name))
+
+    def _delete(self):
+        from tkinter import messagebox
+        name = self._current()
+        if name and messagebox.askyesno("Trình Quản lý Tên", f"Xóa tên {name}?", parent=self):
+            self.on_delete(name)
+            self.reload()
+
+    def _go(self):
+        name = self._current()
+        if name and self.on_go(name):
+            self.cancel()
+
+
+class CreateNamesDialog(Dialog):
+    """Create Names from Selection: which edge of the block holds the labels."""
+
+    def __init__(self, master, top=True, left=False):
+        super().__init__(master, "Tạo Tên từ Vùng chọn")
+        ttk.Label(self.body, text="Tạo tên từ giá trị ở:").pack(anchor="w", pady=(0, 4))
+        self.vars = {}
+        for key, text, on in (("top", "Hàng trên cùng", top), ("left", "Cột bên trái", left),
+                              ("bottom", "Hàng dưới cùng", False), ("right", "Cột bên phải", False)):
+            self.vars[key] = tk.BooleanVar(value=on)
+            ttk.Checkbutton(self.body, text=text, variable=self.vars[key]).pack(anchor="w", padx=8, pady=1)
+        self.add_buttons()
+
+    def collect(self):
+        picked = {k for k, v in self.vars.items() if v.get()}
+        if not picked:
+            self.bell()
+            return None
+        return picked
+
+
+class HyperlinkDialog(Dialog):
+    """Insert Hyperlink (Ctrl+K): a web page or file, a place in this workbook, or an e-mail address.
+    collect() gives {"text", "target", "tip"}; Remove Link gives {"remove": True}."""
+
+    KINDS = (("web", "Trang web hoặc tệp"), ("place", "Vị trí trong tài liệu này"), ("mail", "Địa chỉ email"))
+
+    def __init__(self, master, text, link, sheets, names, cell, base_dir=None):
+        super().__init__(master, "Sửa Liên kết" if link else "Chèn Liên kết")
+        self.base_dir = base_dir
+        f = self.body
+        target = (link or {}).get("target", "")
+        kind = "place" if target.startswith("#") else "mail" if target.lower().startswith("mailto:") else "web"
+        ttk.Label(f, text="Văn bản hiển thị:").grid(row=0, column=0, sticky="w", pady=3)
+        self.text = tk.StringVar(value=text)
+        ttk.Entry(f, textvariable=self.text, width=44).grid(row=0, column=1, columnspan=2, sticky="we", padx=6)
+        self.kind = tk.StringVar(value=kind)
+        row = ttk.Frame(f)
+        row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        for key, label in self.KINDS:
+            ttk.Radiobutton(row, text=label, value=key, variable=self.kind, command=self._switch).pack(
+                side="left", padx=(0, 12))
+        self.pages = {}
+        page = self.pages["web"] = ttk.Frame(f)
+        ttk.Label(page, text="Địa chỉ:").grid(row=0, column=0, sticky="w", pady=3)
+        self.address = tk.StringVar(value=target if kind == "web" else "")
+        self.address_entry = ttk.Entry(page, textvariable=self.address, width=40)
+        self.address_entry.grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Button(page, text="Duyệt tệp...", command=self._browse).grid(row=0, column=2)
+        ttk.Label(page, text="Ví dụ: https://www.google.com hoặc D:\\Ho so\\bang_gia.xlsx", foreground="#666").grid(
+            row=1, column=1, columnspan=2, sticky="w", padx=6)
+        page = self.pages["place"] = ttk.Frame(f)
+        place = target[1:] if kind == "place" else ""
+        sheet_part, _, cell_part = place.rpartition("!")
+        ttk.Label(page, text="Trang tính / tên:").grid(row=0, column=0, sticky="w", pady=3)
+        self.sheet_names, self.name_list = list(sheets), list(names)
+        choices = self.sheet_names + self.name_list
+        self.sheet = ttk.Combobox(page, values=choices, state="readonly", width=30)
+        current = sheet_part.strip("'").replace("''", "'") if sheet_part else (place if place in names else "")
+        self.sheet.set(current if current in choices else (sheets[0] if sheets else ""))
+        self.sheet.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(page, text="Ô:").grid(row=1, column=0, sticky="w", pady=3)
+        self.cell = tk.StringVar(value=cell_part or (cell if not place else ""))
+        ttk.Entry(page, textvariable=self.cell, width=12).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(page, text="(bỏ trống khi chọn một tên)", foreground="#666").grid(row=2, column=1, sticky="w", padx=6)
+        page = self.pages["mail"] = ttk.Frame(f)
+        mail = target[7:] if kind == "mail" else ""
+        address, _, query = mail.partition("?")
+        ttk.Label(page, text="Email:").grid(row=0, column=0, sticky="w", pady=3)
+        self.mail = tk.StringVar(value=address)
+        ttk.Entry(page, textvariable=self.mail, width=40).grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Label(page, text="Tiêu đề:").grid(row=1, column=0, sticky="w", pady=3)
+        subject = query[8:] if query.lower().startswith("subject=") else ""
+        self.subject = tk.StringVar(value=subject)
+        ttk.Entry(page, textvariable=self.subject, width=40).grid(row=1, column=1, sticky="we", padx=6)
+        ttk.Label(f, text="Chú thích khi rê chuột:").grid(row=3, column=0, sticky="w", pady=(10, 3))
+        self.tip = tk.StringVar(value=(link or {}).get("tip", ""))
+        ttk.Entry(f, textvariable=self.tip, width=44).grid(row=3, column=1, columnspan=2, sticky="we", padx=6,
+                                                          pady=(10, 3))
+        bar = self.add_buttons()
+        if link:
+            ttk.Button(bar, text="Loại bỏ Liên kết", command=self._remove).pack(side="left")
+        self._switch()
+
+    def show(self):
+        return super().show(self.address_entry)
+
+    def _switch(self):
+        for key, page in self.pages.items():
+            if key == self.kind.get():
+                page.grid(row=2, column=0, columnspan=3, sticky="we")
+            else:
+                page.grid_remove()
+
+    def _browse(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self, title="Chọn tệp", initialdir=self.base_dir or None)
+        if path:
+            self.address.set(path)
+            if not self.text.get().strip():
+                import os
+                self.text.set(os.path.basename(path))
+
+    def _remove(self):
+        self.result = {"remove": True}
+        self.destroy()
+
+    def collect(self):
+        kind = self.kind.get()
+        if kind == "web":
+            target = self.address.get().strip()
+            if target and "://" not in target and target.lower().startswith("www."):
+                target = "http://" + target
+        elif kind == "place":
+            where, cell = self.sheet.get(), self.cell.get().strip().replace("$", "").upper()
+            if where in self.name_list and not cell:
+                target = f"#{where}"
+            elif where not in self.sheet_names or (cell and fe.parse_range(cell) is None):
+                self.bell()
+                return None
+            else:
+                target = f"#{fe.quote_sheet(where)}!{cell or 'A1'}"
+        else:
+            address = self.mail.get().strip()
+            target = f"mailto:{address}" + (f"?subject={self.subject.get().strip()}" if self.subject.get().strip()
+                                            else "") if address else ""
+        if not target:
+            self.bell()
+            return None
+        text = self.text.get().strip() or (target[1:] if target.startswith("#") else
+                                           target[7:].split("?")[0] if kind == "mail" else target)
+        return {"text": text, "target": target, "tip": self.tip.get().strip()}
+
+
+class GoToSpecialDialog(Dialog):
+    """Go To Special: which kind of cells to select. collect() gives (kind, value types)."""
+
+    KINDS = (("notes", "Ghi chú"), ("constants", "Hằng số"), ("formulas", "Công thức"), ("blanks", "Ô trống"),
+             ("region", "Vùng hiện tại"), ("last", "Ô cuối cùng"), ("visible", "Chỉ các ô hiển thị"),
+             ("cf", "Định dạng có điều kiện"), ("validation", "Xác thực dữ liệu"))
+    TYPES = (("number", "Số"), ("text", "Văn bản"), ("logical", "Lô-gic"), ("error", "Lỗi"))
+
+    def __init__(self, master):
+        super().__init__(master, "Đi tới Đặc biệt")
+        f = self.body
+        ttk.Label(f, text="Chọn:").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.kind = tk.StringVar(value="constants")
+        for i, (key, label) in enumerate(self.KINDS):
+            ttk.Radiobutton(f, text=label, value=key, variable=self.kind, command=self._sync).grid(
+                row=1 + i % 5, column=i // 5 * 2, sticky="w", padx=(0, 18), pady=1)
+        box = ttk.Frame(f)
+        box.grid(row=1, column=1, rowspan=4, sticky="nw", padx=(0, 18))
+        self.types = {}
+        for key, label in self.TYPES:
+            self.types[key] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(box, text=label, variable=self.types[key]).pack(anchor="w")
+        self.type_box = box
+        ttk.Label(f, text="Khi chỉ chọn một ô, PyExcel tìm trong cả trang tính.", foreground="#666").grid(
+            row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.add_buttons()
+        self._sync()
+
+    def _sync(self):
+        state = "normal" if self.kind.get() in ("constants", "formulas") else "disabled"
+        for child in self.type_box.winfo_children():
+            child.configure(state=state)
+
+    def collect(self):
+        types = tuple(k for k, v in self.types.items() if v.get())
+        if self.kind.get() in ("constants", "formulas") and not types:
+            self.bell()
+            return None
+        return self.kind.get(), types
+
+
+class TextToColumnsDialog(Dialog):
+    """Data > Text to Columns: delimiters or fixed widths, with a preview of the first rows.
+    collect() gives {"delimiters", "merge", "breaks" (None when delimited), "as_text"}."""
+
+    DELIMS = (("\t", "Tab"), (";", "Dấu chấm phẩy ;"), (",", "Dấu phẩy ,"), (" ", "Dấu cách"))
+
+    def __init__(self, master, samples):
+        super().__init__(master, "Chuyển Văn bản thành Cột")
+        self.samples = samples
+        f = self.body
+        self.mode = tk.StringVar(value="delimited")
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        ttk.Radiobutton(top, text="Phân tách bằng ký tự", value="delimited", variable=self.mode,
+                        command=self.update).pack(side="left")
+        ttk.Radiobutton(top, text="Độ rộng cố định", value="fixed", variable=self.mode,
+                        command=self.update).pack(side="left", padx=16)
+        box = ttk.LabelFrame(f, text="Dấu phân tách", padding=6)
+        box.pack(fill="x", pady=6)
+        # Tab, semicolon or comma found in every row is the likely separator; spaces only when nothing else
+        guess = next((d for d in ("\t", ";", ",") if samples and all(d in s for s in samples)), " ")
+        self.delims = {}
+        for i, (d, label) in enumerate(self.DELIMS):
+            self.delims[d] = tk.BooleanVar(value=d == guess and any(d in s for s in samples))
+            ttk.Checkbutton(box, text=label, variable=self.delims[d], command=self.update).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 18))
+        ttk.Label(box, text="Khác:").grid(row=2, column=0, sticky="w")
+        self.other = tk.StringVar()
+        entry = ttk.Entry(box, textvariable=self.other, width=4)
+        entry.grid(row=2, column=0, sticky="e", padx=(0, 18))
+        self.other.trace_add("write", lambda *a: self.update())
+        self.merge = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Coi các dấu liên tiếp là một", variable=self.merge, command=self.update).grid(
+            row=2, column=1, sticky="w")
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        ttk.Label(row, text="Vị trí ngắt (độ rộng cố định), ví dụ 5, 12:").pack(side="left")
+        self.breaks = tk.StringVar()
+        ttk.Entry(row, textvariable=self.breaks, width=16).pack(side="left", padx=6)
+        self.breaks.trace_add("write", lambda *a: self.update())
+        self.as_text = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Giữ dạng văn bản (không đổi 0912... thành số)", variable=self.as_text).pack(
+            anchor="w", pady=(6, 0))
+        ttk.Label(f, text="Xem trước:").pack(anchor="w", pady=(8, 2))
+        self.preview = ttk.Treeview(f, show="headings", height=6)
+        self.preview.pack(fill="both", expand=True)
+        self.add_buttons()
+        self.update()
+
+    def options(self):
+        if self.mode.get() == "fixed":
+            try:
+                breaks = sorted({int(x) for x in self.breaks.get().replace(";", ",").split(",") if x.strip()})
+            except ValueError:
+                breaks = []
+            return {"delimiters": "", "merge": False, "breaks": breaks, "as_text": self.as_text.get()}
+        delims = "".join(d for d, var in self.delims.items() if var.get()) + self.other.get()[:1]
+        return {"delimiters": delims, "merge": self.merge.get(), "breaks": None, "as_text": self.as_text.get()}
+
+    def update(self):
+        opts = self.options()
+        rows = [fe.split_text(s, opts["delimiters"], opts["merge"], opts["breaks"]) for s in self.samples[:8]]
+        width = max((len(r) for r in rows), default=1)
+        cols = [f"c{i}" for i in range(width)]
+        self.preview.configure(columns=cols)
+        for i, col in enumerate(cols):
+            self.preview.heading(col, text=f"Cột {i + 1}")
+            self.preview.column(col, width=110, anchor="w")
+        self.preview.delete(*self.preview.get_children())
+        for r in rows:
+            self.preview.insert("", "end", values=[p.strip() for p in r])
+
+    def collect(self):
+        opts = self.options()
+        if self.mode.get() == "fixed" and not opts["breaks"] or self.mode.get() == "delimited" and not opts["delimiters"]:
+            self.bell()
+            return None
+        return opts
+
+
+class ProtectSheetDialog(Dialog):
+    """Protect Sheet: an optional password and what users may still do. collect() gives (password, allow)."""
+
+    def __init__(self, master):
+        super().__init__(master, "Bảo vệ Trang tính")
+        f = self.body
+        ttk.Label(f, text="Mật khẩu để bỏ bảo vệ (không bắt buộc):").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.pw = tk.StringVar()
+        self.pw_entry = ttk.Entry(f, textvariable=self.pw, show="*", width=30)
+        self.pw_entry.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 6))
+        ttk.Label(f, text="Nhập lại mật khẩu:").grid(row=2, column=0, columnspan=2, sticky="w")
+        self.pw2 = tk.StringVar()
+        ttk.Entry(f, textvariable=self.pw2, show="*", width=30).grid(row=3, column=0, columnspan=2, sticky="w",
+                                                                     pady=(2, 10))
+        ttk.Label(f, text="Cho phép người dùng:").grid(row=4, column=0, columnspan=2, sticky="w")
+        self.allow = {}
+        for i, (key, label) in enumerate(fe.PROTECT_OPTIONS):
+            self.allow[key] = tk.BooleanVar(value=key == "outline")
+            ttk.Checkbutton(f, text=label, variable=self.allow[key]).grid(row=5 + i, column=0, columnspan=2,
+                                                                         sticky="w", padx=8)
+        ttk.Label(f, text="Chỉ các ô đã bỏ khóa (Định dạng ô → Bảo vệ) mới sửa được nội dung.\n"
+                          "Lưu ý: mật khẩu kiểu Excel chỉ chống sửa nhầm, không phải mã hóa.",
+                  foreground="#666", justify="left").grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.add_buttons()
+
+    def show(self):
+        return super().show(self.pw_entry)
+
+    def collect(self):
+        if self.pw.get() != self.pw2.get():
+            from tkinter import messagebox
+            messagebox.showerror("Bảo vệ Trang tính", "Hai lần nhập mật khẩu không khớp.", parent=self)
+            return None
+        return self.pw.get(), [k for k, v in self.allow.items() if v.get()]
+
+
+class TextImportDialog(Dialog):
+    """Data > From Text/CSV: choose the encoding, delimiter and number style with a live preview.
+    collect() gives the options for formula_engine.read_text_table."""
+
+    DELIMS = [("auto", "Tự động nhận"), (",", "Dấu phẩy ,"), (";", "Dấu chấm phẩy ;"), ("\t", "Tab"),
+              (" ", "Dấu cách"), ("|", "Dấu |")]
+    DECIMALS = [("auto", "Tự động nhận"), (False, "1,234.5 (dấu chấm thập phân)"), (True, "1.234,5 (dấu phẩy thập phân)")]
+
+    def __init__(self, master, data, name):
+        super().__init__(master, f"Nhập văn bản: {name}")
+        self.data = data[:400000]  # the preview reads the beginning of the file
+        f = self.body
+        self.boxes = {}
+        for row, (key, label, choices) in enumerate((("encoding", "Bảng mã:", fe.TEXT_ENCODINGS),
+                                                     ("delimiter", "Dấu phân cách:", self.DELIMS),
+                                                     ("decimal", "Kiểu số:", self.DECIMALS))):
+            ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            box = ttk.Combobox(f, values=[text for _, text in choices], state="readonly", width=34)
+            box.current(0)
+            box.grid(row=row, column=1, sticky="w", padx=6, pady=2)
+            box.bind("<<ComboboxSelected>>", lambda e: self.update())
+            self.boxes[key] = (box, choices)
+        self.found = ttk.Label(f, foreground="#666")
+        self.found.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 6))
+        box = ttk.Frame(f, width=760, height=290)  # a fixed window on the preview: wide files scroll
+        box.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        box.grid_propagate(False)
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+        self.preview = ttk.Treeview(box, show="headings", height=12)
+        bar = ttk.Scrollbar(box, orient="horizontal", command=self.preview.xview)
+        self.preview.configure(xscrollcommand=bar.set)
+        self.preview.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=1, column=0, sticky="ew")
+        ttk.Label(f, text="Dữ liệu sẽ được đưa vào một trang tính mới.", foreground="#666").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.add_buttons("Nhập")
+        self.update()
+
+    def options(self):
+        out = {}
+        for key, (box, choices) in self.boxes.items():
+            out[key] = choices[box.current()][0]
+        return {"encoding": out["encoding"], "delimiter": out["delimiter"], "decimal_comma": out["decimal"]}
+
+    def update(self):
+        rows, encoding, delimiter, decimal_comma = fe.read_text_table(self.data, **self.options())
+        self.found.configure(text=f"Đang đọc: {fe.ENCODING_NAMES.get(encoding, encoding)}, "
+                                  f"{fe.DELIMITER_NAMES.get(delimiter, repr(delimiter))}, "
+                                  f"số kiểu {'1.234,5' if decimal_comma else '1,234.5'}")
+        rows = rows[:30]
+        width = min(40, max((len(r) for r in rows), default=1))
+        cols = [f"c{i}" for i in range(width)]
+        self.preview.configure(columns=cols)
+        for i, col in enumerate(cols):
+            self.preview.heading(col, text=fe.col_name(i))
+            self.preview.column(col, width=110, anchor="w", stretch=False)
+        self.preview.delete(*self.preview.get_children())
+        for row in rows:
+            self.preview.insert("", "end", values=[v.replace("\n", " ") for v in row[:width]])
+
+    def collect(self):
+        return self.options()
+
+
+class PdfImportDialog(Dialog):
+    """Tiện ích > Nhập PDF: which pages, one sheet each or all on one, and what to take besides the text.
+    collect() gives pdf_import.Options."""
+
+    def __init__(self, master, name, count, kinds):
+        super().__init__(master, "Nhập PDF")
+        import pdf_import
+        self.count, self.pdf_import = count, pdf_import
+        f = self.body
+        ttk.Label(f, text=f"{name}  —  {count} trang", font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        text, scanned = kinds
+        row = 1
+        if scanned and not text:
+            ttk.Label(f, foreground="#c00000", wraplength=420, justify="left",
+                      text="PDF này có vẻ là bản quét (mỗi trang là một ảnh): không có chữ để lấy - nhận dạng chữ "
+                           "(OCR) chưa có trong PyExcel. Ảnh các trang sẽ được chèn vào trang tính.").grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row += 1
+        ttk.Label(f, text="Trang:").grid(row=row, column=0, sticky="w", pady=(10, 2))
+        self.pages = tk.StringVar(value="" if count <= 50 else "1-50")
+        entry = ttk.Entry(f, textvariable=self.pages, width=24)
+        entry.grid(row=row, column=1, sticky="w", pady=(10, 2))
+        self.entry = entry
+        ttk.Label(f, text="để trống = tất cả; ví dụ 1-3, 5", foreground="#666").grid(
+            row=row + 1, column=1, sticky="w")
+        self.one = tk.BooleanVar(value=count > 5)
+        box = ttk.LabelFrame(f, text="Đặt vào", padding=6)
+        box.grid(row=row + 2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Radiobutton(box, text="Mỗi trang PDF thành một trang tính", value=False, variable=self.one).pack(anchor="w")
+        ttk.Radiobutton(box, text="Tất cả vào một trang tính, trang nọ nối trang kia", value=True,
+                        variable=self.one).pack(anchor="w")
+        box = ttk.LabelFrame(f, text="Lấy thêm", padding=6)
+        box.grid(row=row + 3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.flags = {}
+        for key, label in (("borders", "Đường kẻ bảng thành viền ô, ô tô màu thành màu nền"),
+                           ("drawings", "Hình vẽ khác (đường xiên, đường cong, hình) thành hình vẽ"),
+                           ("pictures", "Ảnh trong PDF thành ảnh"),
+                           ("numbers", "Chữ số thành số (1,234.5 → 1234,5) để tính toán được")):
+            self.flags[key] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(box, text=label, variable=self.flags[key]).pack(anchor="w")
+        ttk.Label(f, foreground="#666", wraplength=420, justify="left",
+                  text="Bố cục giữ như trong PDF: cột và hàng đặt theo vị trí chữ và đường kẻ. Chữ trong ô bảng "
+                       "được gộp ô và căn lề như bản gốc.").grid(row=row + 4, column=0, columnspan=2, sticky="w",
+                                                                 pady=(8, 0))
+        self.error = ttk.Label(f, foreground="#c00000")
+        self.error.grid(row=row + 5, column=0, columnspan=2, sticky="w")
+        self.add_buttons("Nhập")
+
+    def show(self):
+        return super().show(self.entry)
+
+    def collect(self):
+        pages = self.pdf_import.parse_pages(self.pages.get(), self.count)
+        if pages is None:
+            self.error.configure(text="Không đọc được danh sách trang (ví dụ: 1-3, 5).")
+            self.bell()
+            return None
+        flags = {k: v.get() for k, v in self.flags.items()}
+        return self.pdf_import.Options(pages=pages, one_sheet=self.one.get(), **flags)

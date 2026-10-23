@@ -7,8 +7,11 @@ tooltips.
 """
 
 import math
+import os
 import tkinter as tk
 import tkinter.font as tkfont
+
+from screens import keep_on_screen
 
 RIBBON_BG = "#f3f3f3"
 TAB_BAR_BG = "#217346"
@@ -271,9 +274,9 @@ def _icon_sort_filter(cv, P, k, c):
 
 def _icon_sort(cv, P, k, c, desc):
     top, bottom = ("Z", "A") if desc else ("A", "Z")
-    _glyph(cv, P, k, 5, 4, top, 7, BLUE, "bold")
-    _glyph(cv, P, k, 5, 11.5, bottom, 7, DARK, "bold")
-    _arrow(cv, P, k, 11.5, 2, 11.5, 14, DARK, 1.2)
+    _glyph(cv, P, k, 5, 4, top, 7, c or BLUE, "bold")
+    _glyph(cv, P, k, 5, 11.5, bottom, 7, c or DARK, "bold")
+    _arrow(cv, P, k, 11.5, 2, 11.5, 14, c or DARK, 1.2)
 
 
 def _icon_filter(cv, P, k, c, clear=False):
@@ -377,6 +380,648 @@ def _icon_info(cv, P, k, c):
     _glyph(cv, P, k, 8, 8, "i", 10, "#ffffff", "bold", family="Georgia")
 
 
+def _icon_freeze(cv, P, k, c):
+    _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 4, GRAY, "#ffffff")
+    cv.create_rectangle(*P(1.5, 1.5, 14.5, 4.75), fill="#bdd7ee", outline=GRAY)
+    cv.create_rectangle(*P(1.5, 1.5, 4.75, 14.5), fill="#bdd7ee", outline=GRAY)
+    cv.create_line(*P(1.5, 4.75, 14.5, 4.75), fill=BLUE, width=max(1, round(1.4 * k)))
+    cv.create_line(*P(4.75, 1.5, 4.75, 14.5), fill=BLUE, width=max(1, round(1.4 * k)))
+
+
+def _icon_validation(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 3, 12.5, 8), fill="#ffffff", outline=GRAY)
+    cv.create_rectangle(*P(9, 3, 12.5, 8), fill="#e8e8e8", outline=GRAY)
+    cv.create_polygon(*P(9.75, 4.75, 11.75, 4.75, 10.75, 6.5), fill=DARK, outline="")
+    cv.create_line(*P(5, 12, 7.5, 14.5, 14.5, 7.5), fill=GREEN, width=max(2, round(1.8 * k)))
+    cv.create_line(*P(1.5, 10, 4.5, 13), fill=RED, width=max(1, round(1.4 * k)))
+    cv.create_line(*P(4.5, 10, 1.5, 13), fill=RED, width=max(1, round(1.4 * k)))
+
+
+def _icon_note(cv, P, k, c, delete=False):
+    cv.create_polygon(*P(2, 2, 14, 2, 14, 10.5, 10.5, 14, 2, 14), fill="#fff2a8", outline="#b89b00")
+    cv.create_polygon(*P(10.5, 14, 10.5, 10.5, 14, 10.5), fill="#e6cf4f", outline="#b89b00")
+    _lines(cv, P, k, [(4, 5, 12), (4, 7.5, 12), (4, 10, 9)], GRAY)
+    if delete:
+        cv.create_line(*P(9, 9, 15.5, 15.5), fill=RED, width=max(2, round(1.6 * k)))
+        cv.create_line(*P(15.5, 9, 9, 15.5), fill=RED, width=max(2, round(1.6 * k)))
+
+
+def _icon_note_step(cv, P, k, c, forward):
+    cv.create_polygon(*P(5, 2, 14, 2, 14, 9, 11, 12, 5, 12), fill="#fff2a8", outline="#b89b00")
+    if forward:
+        _arrow(cv, P, k, 1, 14, 8, 14, BLUE)
+    else:
+        _arrow(cv, P, k, 8, 14, 1, 14, BLUE)
+
+
+CHART_COLORS = ("#4472c4", "#ed7d31", "#a5a5a5", "#ffc000", "#5b9bd5", "#70ad47")
+
+
+def _icon_chart(cv, P, k, c, kind="column"):
+    if kind == "pie":
+        cv.create_arc(*P(1.5, 1.5, 14.5, 14.5), start=90, extent=-130, fill=CHART_COLORS[0], outline="#ffffff")
+        cv.create_arc(*P(1.5, 1.5, 14.5, 14.5), start=-40, extent=-110, fill=CHART_COLORS[1], outline="#ffffff")
+        cv.create_arc(*P(1.5, 1.5, 14.5, 14.5), start=-150, extent=-120, fill=CHART_COLORS[3], outline="#ffffff")
+        return
+    cv.create_line(*P(1.5, 1.5, 1.5, 14.5, 14.5, 14.5), fill=GRAY)
+    if kind == "line":
+        cv.create_line(*P(2.5, 11, 6, 7, 9, 9, 14, 3), fill=CHART_COLORS[0], width=max(2, round(1.6 * k)))
+        cv.create_line(*P(2.5, 13, 6, 11, 9, 12, 14, 8), fill=CHART_COLORS[1], width=max(2, round(1.6 * k)))
+    elif kind == "bar":
+        for i, (w, color) in enumerate(((9, CHART_COLORS[0]), (12, CHART_COLORS[1]), (6, CHART_COLORS[0]))):
+            cv.create_rectangle(*P(1.5, 2.5 + i * 4, 1.5 + w, 5 + i * 4), fill=color, outline="")
+    else:
+        for i, (h, color) in enumerate(((6, CHART_COLORS[0]), (10, CHART_COLORS[1]), (8, CHART_COLORS[0]),
+                                        (12, CHART_COLORS[1]))):
+            cv.create_rectangle(*P(3 + i * 3, 14.5 - h, 5 + i * 3, 14.5), fill=color, outline="")
+
+
+# menu icons ----------------------------------------------------------------------------------------
+
+def _dots(cv, P, k, x0, y0, x1, y1, color="#a6a6a6"):
+    """A dotted horizontal or vertical line (one-unit dots, Excel's 'no border here' grid)."""
+    n = round(max(abs(x1 - x0), abs(y1 - y0)) / 2)
+    for i in range(n + 1):
+        x, y = x0 + (x1 - x0) * i / max(1, n), y0 + (y1 - y0) * i / max(1, n)
+        cv.create_rectangle(*P(x - 0.45, y - 0.45, x + 0.45, y + 0.45), fill=color, outline="")
+
+
+_BORDER_EDGES = {"bottom": "B", "top": "T", "left": "L", "right": "R", "none": "", "all": "TBLRHV",
+                 "outside": "TBLR", "thick_outside": "tblr", "bottom_double": "d", "thick_bottom": "b",
+                 "top_bottom": "TB", "top_thick_bottom": "Tb", "top_double_bottom": "Td"}
+
+
+def _icon_border(cv, P, k, c, kind):
+    """Excel's border-menu pictures: a dotted 2 x 2 grid with the borders `kind` draws in solid black
+    (upper case thin, lower case thick, d a double bottom line)."""
+    lines = {"T": (2, 2, 14, 2), "B": (2, 14, 14, 14), "L": (2, 2, 2, 14), "R": (14, 2, 14, 14),
+             "H": (2, 8, 14, 8), "V": (8, 2, 8, 14)}
+    for seg in lines.values():
+        _dots(cv, P, k, *seg)
+    for code in _BORDER_EDGES[kind]:
+        if code == "d":
+            for y in (12.6, 14.4):
+                cv.create_line(*P(1.6, y, 14.4, y), fill="#000000", width=max(1, round(0.9 * k)))
+            continue
+        x0, y0, x1, y1 = lines[code.upper()]
+        thick = code.islower()
+        grow = 0.6 if thick else 0.4
+        cv.create_line(*P(x0 - grow * (x0 != x1), y0 - grow * (y0 != y1), x1 + grow * (x0 != x1), y1 + grow * (y0 != y1)),
+                       fill="#000000", width=max(2 if thick else 1, round((2.3 if thick else 1.15) * k)))
+
+
+def _icon_line_style(cv, P, k, c, style):
+    color = "#262626"
+    if style == "double":
+        for y in (6.5, 9.5):
+            cv.create_line(*P(1, y, 15, y), fill=color, width=max(1, round(k)))
+    elif style == "dotted":
+        _dots(cv, P, k, 1.5, 8, 14.5, 8, color)
+    elif style == "hair":
+        _dots(cv, P, k, 1.5, 8, 14.5, 8, "#8c8c8c")
+    elif style == "dashed":
+        for x in (1, 6, 11):
+            cv.create_line(*P(x, 8, x + 3.5, 8), fill=color, width=max(1, round(1.2 * k)))
+    else:
+        width = {"thin": 1.1, "medium": 2.2, "thick": 3.4}[style]
+        cv.create_line(*P(1, 8, 15, 8), fill=color, width=max(1, round(width * k)))
+
+
+def _pencil(cv, P, k, ox=0.0, oy=0.0, s=1.0):
+    def Q(*xy):
+        return P(*[ox + v * s if i % 2 == 0 else oy + v * s for i, v in enumerate(xy)])
+    cv.create_polygon(*Q(4, 11, 11, 4, 13.5, 6.5, 6.5, 13.5), fill="#ffd65c", outline="#8a6a3a")
+    cv.create_polygon(*Q(11, 4, 12.5, 2.5, 15, 5, 13.5, 6.5), fill="#e07b7b", outline="#8a6a3a")
+    cv.create_polygon(*Q(4, 11, 6.5, 13.5, 2.5, 15), fill="#5c5c5c", outline="")
+
+
+def _icon_line_color(cv, P, k, c):
+    _pencil(cv, P, k, 0, -1.5, 0.95)
+    cv.create_rectangle(*P(1, 13.5, 15, 15.6), fill=c or "#000000", outline="")
+
+
+def _clipboard(cv, P, k):
+    cv.create_rectangle(*P(1.5, 2.5, 10, 14.5), fill="#d9b278", outline="#8a6a3a")
+    cv.create_rectangle(*P(3.8, 1, 7.7, 4), fill="#8c8c8c", outline="#5c5c5c")
+
+
+def _icon_paste_as(cv, P, k, c, kind):
+    """The clipboard with a sheet showing what is pasted: formulas, values, formats, transposed, special."""
+    _clipboard(cv, P, k)
+    cv.create_rectangle(*P(6.5, 6.5, 15.5, 15.5), fill="#ffffff", outline="#6b6b6b")
+    if kind == "formulas":
+        _glyph(cv, P, k, 11, 10.8, "fx", 7.5, BLUE, slant="italic", family="Cambria")
+    elif kind == "values":
+        _glyph(cv, P, k, 11, 11, "123", 5.5, DARK, "bold")
+    elif kind == "formats":
+        cv.create_rectangle(*P(8, 8, 14, 10.5), fill="#ffd65c", outline="#b38f00")
+        cv.create_line(*P(11, 10.5, 11, 14.5), fill="#8a5a2b", width=max(2, round(1.6 * k)))
+    elif kind == "transpose":
+        cv.create_line(*P(8.5, 8, 8.5, 13.5, 13.5, 13.5), fill=BLUE, width=max(1, round(1.2 * k)), arrow="last",
+                       arrowshape=(round(3 * k), round(3.5 * k), round(1.6 * k)))
+        _lines(cv, P, k, [(10.5, 8.5, 14), (10.5, 10.5, 14)], "#9a9a9a")
+    else:
+        _lines(cv, P, k, [(8, 9, 14), (8, 11, 14), (8, 13, 12)], "#9a9a9a")
+        cv.create_oval(*P(12, 11.5, 15.5, 15), fill=GREEN, outline="")
+
+
+def _icon_underline_double(cv, P, k, c):
+    _glyph(cv, P, k, 8, 6.5, "U", 11, DARK)
+    _lines(cv, P, k, [(3.5, 12.5, 12.5), (3.5, 14.5, 12.5)])
+
+
+def _icon_merge_kind(cv, P, k, c, kind):
+    if kind == "across":
+        for y0 in (2, 8.5):
+            cv.create_rectangle(*P(1.5, y0, 14.5, y0 + 5.5), outline=GRAY, fill="#ffffff")
+            cv.create_line(*P(4, y0 + 2.75, 12, y0 + 2.75), fill=BLUE, width=max(1, round(1.1 * k)), arrow="both",
+                           arrowshape=(round(2.5 * k), round(3 * k), round(1.4 * k)))
+    elif kind == "cells":
+        cv.create_rectangle(*P(1.5, 3, 14.5, 13), outline=GRAY, fill="#ddebf7")
+        _dots(cv, P, k, 8, 3, 8, 13, "#9fc5e8")
+    else:  # unmerge
+        _grid(cv, P, k, 1.5, 3, 14.5, 13, 2, GRAY, "#ffffff")
+        _arrow(cv, P, k, 6.5, 8, 2.5, 8, BLUE, 1.1)
+        _arrow(cv, P, k, 9.5, 8, 13.5, 8, BLUE, 1.1)
+
+
+def _icon_text_angle(cv, P, k, c, angle):
+    if angle == 255:  # stacked letters
+        _glyph(cv, P, k, 6, 4.5, "a", 8, DARK)
+        _glyph(cv, P, k, 6, 10.5, "b", 8, DARK)
+        _arrow(cv, P, k, 12, 2, 12, 14.5, BLUE, 1)
+        return
+    rad = math.radians(angle)
+    dx, dy = math.cos(rad), -math.sin(rad)
+    px, py = -dy, dx  # perpendicular, towards the lower side of the text
+    _glyph(cv, P, k, 8 - 1.8 * px, 8 - 1.8 * py, "ab", 8.5, DARK, angle=angle)
+    _arrow(cv, P, k, 8 - 5.5 * dx + 4 * px, 8 - 5.5 * dy + 4 * py, 8 + 5.5 * dx + 4 * px, 8 + 5.5 * dy + 4 * py, BLUE, 1)
+
+
+def _icon_cf_kind(cv, P, k, c, kind):
+    """Conditional-formatting pictures: highlight rules, top/bottom rules, data bars, colour scales, manage."""
+    if kind == "highlight":
+        _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+        cv.create_rectangle(*P(5.83, 5.83, 10.17, 10.17), fill="#ffc7ce", outline="#9c0006")
+    elif kind == "topbottom":
+        for i, (w, color) in enumerate(((12, "#f8696b"), (9, "#bfbfbf"), (6, "#bfbfbf"))):
+            cv.create_rectangle(*P(2, 2.5 + 4.2 * i, 2 + w, 5.5 + 4.2 * i), fill=color, outline="")
+        _glyph(cv, P, k, 12, 12.5, "10", 6, DARK, "bold")
+    elif kind == "databar":
+        for i, w in enumerate((11, 6, 8.5)):
+            cv.create_rectangle(*P(1.5, 1.5 + 4.5 * i, 14.5, 5.5 + 4.5 * i), fill="#ffffff", outline="#bfbfbf")
+            cv.create_rectangle(*P(2.2, 2.2 + 4.5 * i, 2.2 + w, 4.8 + 4.5 * i), fill=c or "#638ec6", outline="")
+    elif kind == "scale":
+        colors = (c or "#63be7b,#ffeb84,#f8696b").split(",")
+        if len(colors) == 2:
+            colors = [colors[0], mix(colors[0], colors[1], 0.5), colors[1]]
+        for i, color in enumerate(colors):
+            cv.create_rectangle(*P(2.5, 1.5 + 4.4 * i, 13.5, 5.9 + 4.4 * i), fill=color, outline="#a6a6a6")
+    else:  # manage
+        for i, color in enumerate(("#f8696b", "#63be7b", "#638ec6")):
+            cv.create_rectangle(*P(1.5, 2 + 4.5 * i, 5, 5.5 + 4.5 * i), fill=color, outline="")
+            cv.create_line(*P(6.5, 3.75 + 4.5 * i, 14.5, 3.75 + 4.5 * i), fill=DARK, width=max(1, round(k)))
+
+
+def _icon_cf_rule(cv, P, k, c, text):
+    cv.create_rectangle(*P(1.5, 3, 14.5, 13), fill="#ffc7ce", outline="#9c0006")
+    _glyph(cv, P, k, 8, 8, text, 9 if len(text) < 2 else 7, "#9c0006", "bold")
+
+
+def _icon_rank(cv, P, k, c, text, up):
+    _glyph(cv, P, k, 6, 8, text, 7 if len(text) > 1 else 9, DARK, "bold")
+    if up:
+        _arrow(cv, P, k, 13, 14, 13, 2, GREEN, 1.6)
+    else:
+        _arrow(cv, P, k, 13, 2, 13, 14, RED, 1.6)
+
+
+def _icon_stat(cv, P, k, c, kind):
+    """Autosum variants: average, count, maximum, minimum."""
+    if kind == "count":
+        _glyph(cv, P, k, 8, 8, "123", 7, BLUE, "bold")
+        return
+    heights = (6, 11, 8)
+    pick = {"max": 1, "min": 0}.get(kind)
+    for i, h in enumerate(heights):
+        color = BLUE if i == pick or kind == "avg" else "#bfbfbf"
+        cv.create_rectangle(*P(2 + 4.3 * i, 14.5 - h, 5.5 + 4.3 * i, 14.5), fill=color, outline="")
+    if kind == "avg":
+        cv.create_line(*P(1, 6.3, 15, 6.3), fill=RED, width=max(1, round(1.2 * k)))
+
+
+def _icon_sort_custom(cv, P, k, c):
+    _lines(cv, P, k, [(1.5, 3, 9), (1.5, 6.5, 9), (1.5, 10, 9), (1.5, 13.5, 9)])
+    _arrow(cv, P, k, 12.5, 2, 12.5, 14.5, BLUE, 1.4)
+
+
+def _icon_filter_variant(cv, P, k, c, kind):
+    cv.create_polygon(*P(1.5, 2, 12, 2, 8, 7, 8, 12.5, 5.5, 14, 5.5, 7), fill="#7f9fcf", outline=BLUE)
+    if kind == "reapply":
+        cv.create_arc(*P(8.5, 8.5, 15.5, 15.5), start=90, extent=270, style="arc", outline=GREEN,
+                      width=max(1, round(1.4 * k)))
+        cv.create_polygon(*P(11, 7.3, 13.4, 8.8, 11, 10.3), fill=GREEN)
+    else:  # filter by the selected cell's value
+        cv.create_rectangle(*P(9.5, 9.5, 15.5, 15.5), fill="#ffd65c", outline="#b38f00")
+
+
+def _icon_fill_dir(cv, P, k, c, direction):
+    vertical = direction in ("down", "up")
+    box = (3, 1.5, 13, 14.5) if vertical else (1.5, 3, 14.5, 13)
+    cv.create_rectangle(*P(*box), fill="#ddebf7", outline="#7f9fcf")
+    ends = {"down": (8, 3.5, 8, 13), "up": (8, 12.5, 8, 3), "right": (3.5, 8, 13, 8), "left": (12.5, 8, 3, 8)}
+    _arrow(cv, P, k, *ends[direction], BLUE, 2)
+
+
+def _icon_fill_series(cv, P, k, c):
+    for i, digit in enumerate("123"):
+        cv.create_rectangle(*P(3, 1.5 + 4.4 * i, 13, 5.5 + 4.4 * i), fill="#ddebf7", outline="#7f9fcf")
+        _glyph(cv, P, k, 8, 3.6 + 4.4 * i, digit, 5.5, BLUE, "bold")
+
+
+def _eraser(cv, P, k, ox, oy, s):
+    def Q(*xy):
+        return P(*[ox + v * s if i % 2 == 0 else oy + v * s for i, v in enumerate(xy)])
+    cv.create_polygon(*Q(1.5, 11, 6.5, 6, 10, 9.5, 5, 14.5), fill="#f4b6c2", outline="#a05a6a")
+    cv.create_polygon(*Q(6.5, 6, 11, 1.5, 14.5, 5, 10, 9.5), fill="#ffffff", outline="#a05a6a")
+
+
+def _icon_clear_what(cv, P, k, c, what):
+    if what == "formats":
+        _glyph(cv, P, k, 5, 5, "A", 9, RED, "bold")
+        cv.create_rectangle(*P(1, 9, 8, 10.5), fill="#ffd65c", outline="")
+    else:  # contents
+        _lines(cv, P, k, [(1.5, 3, 9), (1.5, 6, 9), (1.5, 9, 6)], GRAY)
+    _eraser(cv, P, k, 5, 5, 0.7)
+
+
+def _icon_replace(cv, P, k, c):
+    _glyph(cv, P, k, 5, 4.5, "ab", 7, GRAY)
+    _glyph(cv, P, k, 10.5, 12, "ac", 7, BLUE, "bold")
+    cv.create_line(*P(2.5, 8, 2.5, 12, 6, 12), fill=DARK, width=max(1, round(k)), arrow="last",
+                   arrowshape=(round(2.5 * k), round(3 * k), round(1.4 * k)))
+
+
+def _icon_goto(cv, P, k, c):
+    _grid(cv, P, k, 5, 5, 15, 15, 2, GRAY, "#ffffff")
+    cv.create_rectangle(*P(10, 10, 15, 15), fill="#c6e0b4", outline=GREEN)
+    _arrow(cv, P, k, 1.5, 1.5, 9.5, 9.5, BLUE, 1.6)
+
+
+def _icon_size(cv, P, k, c, axis, auto):
+    """Row height / column width (auto: fit to the contents)."""
+    if axis == "row":
+        _lines(cv, P, k, [(1.5, 3.5, 14.5), (1.5, 12.5, 14.5)], GRAY)
+        line = (5 if auto else 8, 4.5, 5 if auto else 8, 11.5)
+    else:
+        cv.create_line(*P(3.5, 1.5, 3.5, 14.5), fill=GRAY, width=max(1, round(k)))
+        cv.create_line(*P(12.5, 1.5, 12.5, 14.5), fill=GRAY, width=max(1, round(k)))
+        line = (4.5, 5 if auto else 8, 11.5, 5 if auto else 8)
+    cv.create_line(*P(*line), fill=BLUE, width=max(1, round(1.3 * k)), arrow="both",
+                   arrowshape=(round(2.5 * k), round(3 * k), round(1.5 * k)))
+    if auto:
+        _glyph(cv, P, k, 10.5 if axis == "row" else 8, 8 if axis == "row" else 11.5, "A", 7, DARK, "bold")
+
+
+def _icon_hide(cv, P, k, c, axis, show):
+    _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+    band = (1.5, 5.83, 14.5, 10.17) if axis == "row" else (5.83, 1.5, 10.17, 14.5)
+    cv.create_rectangle(*P(*band), fill="#9fc5e8" if show else "#a6a6a6", outline=GRAY)
+    if not show:
+        x0, y0, x1, y1 = band
+        cv.create_line(*P(x0 + 1, y0 + 1, x1 - 1, y1 - 1), fill="#ffffff", width=max(1, round(k)))
+
+
+def _sheet(cv, P, k, x0, y0, x1, y1):
+    _grid(cv, P, k, x0, y0, x1, y1, 3, GRAY, "#ffffff")
+    cv.create_rectangle(*P(x0, y0, x1, y0 + (y1 - y0) / 3), fill="#c6e0b4", outline=GRAY)
+
+
+def _icon_sheet_op(cv, P, k, c, op):
+    if op == "copy":
+        _sheet(cv, P, k, 1, 1, 10.5, 10.5)
+        _sheet(cv, P, k, 5.5, 5.5, 15, 15)
+    elif op == "rename":
+        _sheet(cv, P, k, 1, 1, 12, 12)
+        _pencil(cv, P, k, 5, 5, 0.65)
+    elif op == "delete":
+        _sheet(cv, P, k, 1, 1, 12, 12)
+        cv.create_line(*P(9.5, 9.5, 15.5, 15.5), fill=RED, width=max(2, round(1.8 * k)))
+        cv.create_line(*P(15.5, 9.5, 9.5, 15.5), fill=RED, width=max(2, round(1.8 * k)))
+    elif op in ("hide", "unhide"):
+        _sheet(cv, P, k, 1, 1, 12, 12)
+        cv.create_oval(*P(7, 9, 15.5, 14.5), fill="#ffffff", outline=DARK)
+        cv.create_oval(*P(9.7, 10.2, 12.8, 13.3), fill=DARK, outline="")
+        if op == "hide":
+            cv.create_line(*P(7, 15.5, 15.5, 8), fill=RED, width=max(1, round(1.4 * k)))
+    elif op == "tab_color":
+        cv.create_polygon(*P(1, 4, 15, 4, 13.5, 11, 2.5, 11), fill="#ffffff", outline=GRAY)
+        cv.create_rectangle(*P(2.5, 11, 13.5, 13.5), fill=c or "#ed7d31", outline="")
+    else:  # move left / right
+        cv.create_polygon(*P(4, 9, 12, 9, 11, 14, 5, 14), fill="#ffffff", outline=GRAY)
+        if op == "left":
+            _arrow(cv, P, k, 14, 4.5, 2, 4.5, BLUE, 1.6)
+        else:
+            _arrow(cv, P, k, 2, 4.5, 14, 4.5, BLUE, 1.6)
+
+
+def _icon_file(cv, P, k, c, kind):
+    if c and kind in ("open", "new"):  # one colour (white on the title bar)
+        width = max(1, round(1.2 * k))
+        if kind == "open":
+            cv.create_line(*P(1.5, 13.5, 1.5, 3, 6, 3, 7.5, 4.5, 13, 4.5, 13, 7.5), fill=c, width=width)
+            cv.create_polygon(*P(1.5, 13.5, 4, 7.5, 15.5, 7.5, 13, 13.5), fill="", outline=c, width=width)
+        else:
+            cv.create_polygon(*P(3, 1.5, 9.5, 1.5, 13, 5, 13, 14.5, 3, 14.5), fill="", outline=c, width=width)
+            cv.create_line(*P(9.5, 1.5, 9.5, 5, 13, 5), fill=c, width=width)
+        return
+    if kind == "open":
+        cv.create_polygon(*P(1, 3, 6, 3, 7.5, 5, 14, 5, 14, 14, 1, 14), fill="#ffd65c", outline="#b38f00")
+        cv.create_polygon(*P(1, 14, 3.5, 8, 15.5, 8, 14, 14), fill="#ffe699", outline="#b38f00")
+    elif kind == "new":
+        cv.create_polygon(*P(3, 1, 10, 1, 13.5, 4.5, 13.5, 15, 3, 15), fill="#ffffff", outline=GRAY)
+        cv.create_polygon(*P(10, 1, 10, 4.5, 13.5, 4.5), fill="#d9d9d9", outline=GRAY)
+    elif kind == "save_as":
+        _icon_save(cv, P, k, None)
+        _pencil(cv, P, k, 5.5, 5.5, 0.65)
+    else:  # exit
+        cv.create_rectangle(*P(1.5, 1.5, 9, 14.5), fill="#ffffff", outline=GRAY)
+        _arrow(cv, P, k, 5, 8, 15, 8, RED, 1.8)
+
+
+def _icon_freeze_part(cv, P, k, c, part):
+    _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 4, GRAY, "#ffffff")
+    band = (1.5, 1.5, 14.5, 4.75) if part == "row" else (1.5, 1.5, 4.75, 14.5)
+    cv.create_rectangle(*P(*band), fill="#bdd7ee", outline=GRAY)
+    edge = (1.5, 4.75, 14.5, 4.75) if part == "row" else (4.75, 1.5, 4.75, 14.5)
+    cv.create_line(*P(*edge), fill=BLUE, width=max(1, round(1.4 * k)))
+
+
+def _icon_validation_clear(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 3, 12.5, 8), fill="#ffffff", outline=GRAY)
+    cv.create_rectangle(*P(9, 3, 12.5, 8), fill="#e8e8e8", outline=GRAY)
+    cv.create_polygon(*P(9.75, 4.75, 11.75, 4.75, 10.75, 6.5), fill=DARK, outline="")
+    _eraser(cv, P, k, 5, 5, 0.7)
+
+
+def _icon_delete_x(cv, P, k, c):
+    cv.create_line(*P(3, 3, 13, 13), fill=RED, width=max(2, round(2.2 * k)))
+    cv.create_line(*P(13, 3, 3, 13), fill=RED, width=max(2, round(2.2 * k)))
+
+
+def _icon_chart_edit(cv, P, k, c):
+    _icon_chart(cv, P, k, c)
+    _pencil(cv, P, k, 6, 6, 0.6)
+
+
+def _icon_by_color(cv, P, k, c, sort):
+    """Sort by colour (coloured cells and an arrow) / filter by colour (funnel and colours)."""
+    if sort:
+        for i, color in enumerate(("#f8696b", "#ffd65c", "#5b9bd5")):
+            cv.create_rectangle(*P(7.5, 1.5 + 4.6 * i, 14.5, 5.3 + 4.6 * i), fill=color, outline="#7f7f7f")
+        _arrow(cv, P, k, 3.5, 2, 3.5, 14.5, DARK, 1.2)
+        return
+    cv.create_polygon(*P(1.5, 1.5, 12.5, 1.5, 8.5, 6.5, 8.5, 11, 5.5, 12.5, 5.5, 6.5), fill="#7f9fcf", outline=BLUE)
+    for i, color in enumerate(("#f8696b", "#ffd65c", "#70ad47")):
+        cv.create_oval(*P(9 + 2.2 * i - 1.6, 12.6, 9 + 2.2 * i + 1.6, 15.8), fill=color, outline="#7f7f7f")
+
+
+def _icon_pivot(cv, P, k, c):
+    _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+    cv.create_rectangle(*P(1.5, 1.5, 14.5, 5.83), fill="#bdd7ee", outline=GRAY)
+    cv.create_rectangle(*P(1.5, 1.5, 5.83, 14.5), fill="#c6e0b4", outline=GRAY)
+    cv.create_line(*P(8, 9.5, 8, 12.5, 11.5, 12.5), fill=BLUE, width=max(1, round(1.2 * k)), arrow="last",
+                   arrowshape=(round(2.5 * k), round(3 * k), round(1.4 * k)))
+
+
+def _icon_refresh(cv, P, k, c):
+    w = max(2, round(1.6 * k))
+    cv.create_arc(*P(2, 2, 14, 14), start=20, extent=150, style="arc", outline=GREEN, width=w)
+    cv.create_arc(*P(2, 2, 14, 14), start=200, extent=150, style="arc", outline=GREEN, width=w)
+    cv.create_polygon(*P(1, 7.5, 3.6, 11, 6, 7.5), fill=GREEN)
+    cv.create_polygon(*P(15, 8.5, 12.4, 5, 10, 8.5), fill=GREEN)
+
+
+def _icon_pivot_fields(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 1.5, 14.5, 14.5), fill="#ffffff", outline=GRAY)
+    for i, on in enumerate((True, False, True)):
+        y = 3.5 + 4 * i
+        cv.create_rectangle(*P(3, y, 6, y + 3), fill=BLUE if on else "#ffffff", outline=BLUE)
+        cv.create_line(*P(7.5, y + 1.5, 13, y + 1.5), fill=DARK, width=max(1, round(k)))
+
+
+def _page(cv, P, x0, y0, x1, y1, fill="#ffffff"):
+    """A sheet of paper with a folded corner."""
+    f = min(x1 - x0, y1 - y0) * 0.28
+    cv.create_polygon(*P(x0, y0, x1 - f, y0, x1, y0 + f, x1, y1, x0, y1), fill=fill, outline=GRAY)
+    cv.create_polygon(*P(x1 - f, y0, x1 - f, y0 + f, x1, y0 + f), fill="#d9d9d9", outline=GRAY)
+
+
+def _icon_margins(cv, P, k, c):
+    _page(cv, P, 2.5, 1, 13.5, 15)
+    cv.create_rectangle(*P(4.5, 3.5, 11.5, 12.5), outline=BLUE, dash=(2, 1))
+    _lines(cv, P, k, [(5.5, 6, 10.5), (5.5, 8, 10.5), (5.5, 10, 9)], GRAY)
+
+
+def _icon_page_orient(cv, P, k, c, kind=None):
+    """Orientation: a portrait and a landscape sheet, or just one of them."""
+    if kind == "portrait":
+        _page(cv, P, 3.5, 1, 12.5, 15)
+        _lines(cv, P, k, [(5.5, 5, 10.5), (5.5, 7, 10.5), (5.5, 9, 9)], GRAY)
+    elif kind == "landscape":
+        _page(cv, P, 1, 3.5, 15, 12.5)
+        _lines(cv, P, k, [(3, 7, 12), (3, 9, 10)], GRAY)
+    else:
+        _page(cv, P, 1.5, 1, 9.5, 12)
+        _page(cv, P, 4.5, 7, 15, 14.5, "#deebf7")
+        _lines(cv, P, k, [(6.5, 10, 12.5), (6.5, 12, 11)], GRAY)
+
+
+def _icon_paper_size(cv, P, k, c):
+    _page(cv, P, 4, 1, 14, 15)
+    cv.create_line(*P(2, 1.5, 2, 14.5), fill=BLUE, width=max(1, round(k)), arrow="both",
+                   arrowshape=(round(2.5 * k), round(3 * k), round(1.4 * k)))
+    _glyph(cv, P, k, 9, 9.5, "A4", 6, BLUE, "bold")
+
+
+def _icon_print_area(cv, P, k, c):
+    _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 4, GRAY, "#ffffff")
+    cv.create_rectangle(*P(1.5, 1.5, 11.25, 11.25), fill="#deebf7", outline=BLUE, width=max(1, round(1.4 * k)),
+                        dash=(3, 2))
+
+
+def _icon_page_break(cv, P, k, c):
+    _page(cv, P, 3, 1, 13, 7)
+    _page(cv, P, 3, 9.5, 13, 15)
+    cv.create_line(*P(0.5, 8.25, 15.5, 8.25), fill=BLUE, width=max(1, round(1.3 * k)), dash=(3, 2))
+
+
+def _icon_print_titles(cv, P, k, c):
+    for x, y in ((1, 1), (5, 4)):
+        _page(cv, P, x, y, x + 10, y + 11)
+        cv.create_rectangle(*P(x + 1.5, y + 1.5, x + 8.5, y + 3.5), fill="#bdd7ee", outline=BLUE)
+    _lines(cv, P, k, [(6.5, 10, 13.5), (6.5, 12, 12)], GRAY)
+
+
+def _icon_fit_page(cv, P, k, c):
+    _page(cv, P, 3, 2.5, 13, 13.5)
+    for x1, y1, x2, y2 in ((1, 1, 4.5, 4.5), (15, 1, 11.5, 4.5), (1, 15, 4.5, 11.5), (15, 15, 11.5, 11.5)):
+        _arrow(cv, P, k, x1, y1, x2, y2, BLUE, 1.2)
+
+
+def _icon_print(cv, P, k, c):
+    cv.create_rectangle(*P(4, 1.5, 12, 6), fill="#ffffff", outline=GRAY)
+    cv.create_rectangle(*P(1.5, 5.5, 14.5, 11.5), fill="#bfbfbf", outline=DARK)
+    cv.create_oval(*P(11.5, 7, 13, 8.5), fill=GREEN, outline="")
+    cv.create_rectangle(*P(4, 9.5, 12, 15), fill="#ffffff", outline=GRAY)
+    _lines(cv, P, k, [(5.5, 11.5, 10.5), (5.5, 13.3, 9.5)], GRAY)
+
+
+def _icon_print_preview(cv, P, k, c):
+    if c:  # one colour: page and magnifier outlines
+        width = max(1, round(1.2 * k))
+        cv.create_polygon(*P(2, 1.5, 8.5, 1.5, 11, 4, 11, 7), fill="", outline=c, width=width)
+        cv.create_line(*P(2, 1.5, 2, 14, 6.5, 14), fill=c, width=width)
+        cv.create_oval(*P(6.5, 7.5, 12, 13), outline=c, width=width)
+        cv.create_line(*P(11.5, 12.5, 15, 16), fill=c, width=max(2, round(1.8 * k)))
+        return
+    _page(cv, P, 1.5, 1, 11.5, 14)
+    _lines(cv, P, k, [(3.5, 4, 8.5), (3.5, 6, 8.5), (3.5, 8, 7)], GRAY)
+    cv.create_oval(*P(6.5, 7.5, 12.5, 13.5), outline=BLUE, width=max(1, round(1.4 * k)), fill="#ffffff")
+    cv.create_line(*P(12, 13, 15, 16), fill=DARK, width=max(2, round(2 * k)))
+
+
+def _icon_pdf(cv, P, k, c):
+    if c:
+        width = max(1, round(1.2 * k))
+        cv.create_polygon(*P(3, 1.5, 10, 1.5, 13, 4.5, 13, 14.5, 3, 14.5), fill="", outline=c, width=width)
+        _glyph(cv, P, k, 8, 9.5, "PDF", 5.5, c, "bold")
+        return
+    _page(cv, P, 2.5, 1, 13.5, 15)
+    cv.create_rectangle(*P(0.5, 7, 12, 13), fill=RED, outline="")
+    _glyph(cv, P, k, 6.25, 10, "PDF", 5.5, "#ffffff", "bold")
+
+
+def _icon_page_setup(cv, P, k, c):
+    _page(cv, P, 1.5, 1, 11.5, 15)
+    _lines(cv, P, k, [(3.5, 4.5, 8.5), (3.5, 6.5, 8.5)], GRAY)
+    for i, x in enumerate((7.5, 10.5, 13.5)):
+        cv.create_line(*P(x, 8, x, 15.5), fill=DARK, width=max(1, round(k)))
+        y = (10, 13.5, 11.5)[i]
+        cv.create_rectangle(*P(x - 1.2, y - 1, x + 1.2, y + 1), fill=BLUE, outline="")
+
+
+def _outline_box(cv, P, k, x, y, sign):
+    cv.create_rectangle(*P(x - 3, y - 3, x + 3, y + 3), fill="#ffffff", outline=GRAY)
+    cv.create_line(*P(x - 1.7, y, x + 1.9, y), fill=DARK, width=max(1, round(k)))
+    if sign == "+":
+        cv.create_line(*P(x, y - 1.7, x, y + 1.9), fill=DARK, width=max(1, round(k)))
+
+
+def _icon_group(cv, P, k, c, ungroup=False):
+    for i in range(4):
+        y = 2.5 + 3.5 * i
+        cv.create_rectangle(*P(7, y, 15, y + 2.5), fill="#ffffff" if i < 3 else "#e2efda", outline=GRAY)
+    if ungroup:
+        cv.create_line(*P(3, 2.5, 3, 10), fill=GRAY, width=max(1, round(k)), dash=(2, 2))
+        _arrow(cv, P, k, 6.5, 6, 0.5, 6, RED, 1.3)
+    else:
+        cv.create_line(*P(5, 3.5, 3, 3.5, 3, 11.5), fill=BLUE, width=max(1, round(1.3 * k)))
+        _outline_box(cv, P, k, 3, 13.5, "-")
+
+
+def _icon_subtotal(cv, P, k, c):
+    for i in range(4):
+        y = 1.5 + 3.5 * i
+        total = i == 2 or i == 3
+        cv.create_rectangle(*P(6, y, 15, y + 3), fill="#dde8f6" if total else "#ffffff", outline=GRAY)
+    _glyph(cv, P, k, 3, 5.5, "Σ", 9, BLUE, "bold")
+    _outline_box(cv, P, k, 3, 12.5, "-")
+
+
+def _icon_detail(cv, P, k, c, show):
+    _grid(cv, P, k, 5.5, 1.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+    cv.create_rectangle(*P(5.5, 10.17, 14.5, 14.5), fill="#e2efda", outline=GRAY)
+    _outline_box(cv, P, k, 2.5, 12.3, "+" if show else "-")
+
+
+def _tag(cv, P, k, x, y, s=1.0, fill="#ffd65c"):
+    """A name tag: a label with a punched hole."""
+    cv.create_polygon(*P(x, y + 2.5 * s, x + 2.5 * s, y, x + 9 * s, y, x + 9 * s, y + 5 * s, x + 2.5 * s, y + 5 * s),
+                      fill=fill, outline="#b38f00")
+    cv.create_oval(*P(x + 2 * s, y + 2 * s, x + 3.2 * s, y + 3.2 * s), fill="#ffffff", outline="#b38f00")
+
+
+def _icon_name(cv, P, k, c, kind):
+    if kind == "manager":
+        _grid(cv, P, k, 1.5, 4.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+        _tag(cv, P, k, 1, 0.5, 1.1)
+    elif kind == "define":
+        _tag(cv, P, k, 0.5, 4, 1.6)
+        _pencil(cv, P, k, 7, 6, 0.55)
+    elif kind == "use":
+        _glyph(cv, P, k, 4.5, 10.5, "fx", 8, BLUE, "bold", "italic", "Times New Roman")
+        _tag(cv, P, k, 6, 1.5, 1.0)
+    else:  # create from selection
+        _grid(cv, P, k, 1.5, 1.5, 14.5, 14.5, 3, GRAY, "#ffffff")
+        cv.create_rectangle(*P(1.5, 1.5, 14.5, 5.83), fill="#bdd7ee", outline=GRAY)
+        _tag(cv, P, k, 6, 8.5, 0.95)
+
+
+def _icon_picture(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 2.5, 14.5, 13.5), fill="#ffffff", outline=GRAY)
+    cv.create_rectangle(*P(3, 4, 13, 12), fill="#ddebf7", outline="")
+    cv.create_polygon(*P(3, 12, 6.5, 7, 9, 10, 10.5, 8.5, 13, 12), fill="#70ad47", outline="")
+    cv.create_oval(*P(9.5, 4.8, 11.9, 7.2), fill="#ffc000", outline="")
+
+
+def _icon_link(cv, P, k, c):
+    w = max(2, round(1.7 * k))
+    for x, y in ((2.5, 7.5), (7.5, 3.5)):
+        cv.create_polygon(*P(x + 1.5, y + 5, x, y + 3.5, x + 4, y - 0.5, x + 5.5, y + 1), fill="", outline=BLUE,
+                          width=w)
+    cv.create_line(*P(6, 10, 10, 6), fill=BLUE, width=w)
+
+
+def _icon_text_columns(cv, P, k, c):
+    cv.create_rectangle(*P(1.5, 2, 6.5, 14), fill="#ffffff", outline=GRAY)
+    _lines(cv, P, k, [(2.5, 5, 5.5), (2.5, 8, 5.5), (2.5, 11, 5.5)], DARK)
+    _arrow(cv, P, k, 7, 8, 10, 8, BLUE, 1.2)
+    for x in (10.5, 13):
+        cv.create_rectangle(*P(x, 2, x + 2.5, 14), fill="#ddebf7", outline=GRAY)
+
+
+def _padlock(cv, P, k, x, y, s=1.0, open_=False):
+    w = max(1, round(1.6 * k * s))
+    if open_:
+        cv.create_arc(*P(x + 3 * s, y - 4 * s, x + 9 * s, y + 4 * s), start=0, extent=180, style="arc",
+                      outline=GRAY, width=w)
+    else:
+        cv.create_arc(*P(x + 1.5 * s, y - 4 * s, x + 7.5 * s, y + 4 * s), start=0, extent=180, style="arc",
+                      outline=GRAY, width=w)
+    cv.create_rectangle(*P(x, y, x + 9 * s, y + 7 * s), fill="#ffc000", outline="#b38f00")
+    cv.create_oval(*P(x + 3.7 * s, y + 2.2 * s, x + 5.3 * s, y + 3.8 * s), fill=DARK, outline="")
+
+
+def _icon_protect(cv, P, k, c):
+    _sheet(cv, P, k, 1, 1, 12, 12)
+    _padlock(cv, P, k, 6.5, 8.5, 1.0)
+
+
+def _icon_lock_cell(cv, P, k, c):
+    _grid(cv, P, k, 1.5, 1.5, 12.5, 12.5, 2, GRAY, "#ffffff")
+    cv.create_rectangle(*P(1.5, 1.5, 7, 7), fill="#ddebf7", outline=BLUE)
+    _padlock(cv, P, k, 7, 9, 0.9)
+
+
+def _icon_import_text(cv, P, k, c):
+    _page(cv, P, 1, 1, 10, 14)
+    _glyph(cv, P, k, 5.5, 6, "CSV", 4.5, GREEN, "bold")
+    _lines(cv, P, k, [(2.5, 9.5, 8.5), (2.5, 11.5, 7.5)], GRAY)
+    _grid(cv, P, k, 9, 7, 15, 15, 2, GRAY, "#ffffff")
+    _arrow(cv, P, k, 6, 13, 11, 13, BLUE, 1.2)
+
+
 def _icon_launcher(cv, P, k, c):
     cv.create_line(*P(2, 2, 2, 12), fill=GRAY)
     cv.create_line(*P(2, 2, 12, 2), fill=GRAY)
@@ -417,7 +1062,63 @@ ICONS = {
     "zoom": _icon_zoom, "zoom100": lambda *a: _icon_zoom(*a, label="1:1"),
     "zoom_sel": lambda *a: _icon_zoom(*a, label="□"),
     "remove_dup": _icon_remove_dup, "help": _icon_help, "info": _icon_info, "launcher": _icon_launcher,
+    "freeze": _icon_freeze, "validation": _icon_validation, "note": _icon_note,
+    "note_delete": lambda *a: _icon_note(*a, delete=True),
+    "note_prev": lambda *a: _icon_note_step(*a, False), "note_next": lambda *a: _icon_note_step(*a, True),
+    "chart_column": _icon_chart, "chart_bar": lambda *a: _icon_chart(*a, kind="bar"),
+    "chart_line": lambda *a: _icon_chart(*a, kind="line"), "chart_pie": lambda *a: _icon_chart(*a, kind="pie"),
 }
+ICONS.update({f"border_{kind}": (lambda kind: lambda *a: _icon_border(*a, kind))(kind) for kind in _BORDER_EDGES})
+ICONS.update({f"line_{style}": (lambda style: lambda *a: _icon_line_style(*a, style))(style)
+              for style in ("thin", "medium", "thick", "double", "dashed", "dotted", "hair")})
+ICONS.update({f"paste_{kind}": (lambda kind: lambda *a: _icon_paste_as(*a, kind))(kind)
+              for kind in ("formulas", "values", "formats", "transpose", "special")})
+ICONS.update({f"merge_{kind}": (lambda kind: lambda *a: _icon_merge_kind(*a, kind))(kind)
+              for kind in ("across", "cells", "unmerge")})
+ICONS.update({f"angle_{name}": (lambda angle: lambda *a: _icon_text_angle(*a, angle))(angle)
+              for name, angle in (("ccw", 45), ("cw", -45), ("vertical", 255), ("up", 90), ("down", -90))})
+ICONS.update({f"cf_{kind}": (lambda kind: lambda *a: _icon_cf_kind(*a, kind))(kind)
+              for kind in ("highlight", "topbottom", "databar", "scale", "manage")})
+ICONS.update({f"cf_rule_{name}": (lambda text: lambda *a: _icon_cf_rule(*a, text))(text)
+              for name, text in (("gt", ">"), ("lt", "<"), ("between", "↔"), ("eq", "="), ("text", "ab"),
+                                 ("dup", "2×"))})
+ICONS.update({f"rank_{name}": (lambda text, up: lambda *a: _icon_rank(*a, text, up))(text, up)
+              for name, text, up in (("top", "10", True), ("top_pct", "%", True), ("bottom", "10", False),
+                                     ("bottom_pct", "%", False), ("above", "x̄", True), ("below", "x̄", False))})
+ICONS.update({f"stat_{kind}": (lambda kind: lambda *a: _icon_stat(*a, kind))(kind)
+              for kind in ("avg", "count", "max", "min")})
+ICONS.update({f"fill_{d}": (lambda d: lambda *a: _icon_fill_dir(*a, d))(d) for d in ("right", "up", "left")})
+ICONS.update({f"clear_{what}": (lambda what: lambda *a: _icon_clear_what(*a, what))(what)
+              for what in ("formats", "contents")})
+ICONS.update({f"{axis}_{kind}": (lambda axis, auto: lambda *a: _icon_size(*a, axis, auto))(axis, kind == "autofit")
+              for axis in ("row", "col") for kind in ("size", "autofit")})
+ICONS.update({f"{verb}_{axis}": (lambda axis, show: lambda *a: _icon_hide(*a, axis, show))(axis, verb == "unhide")
+              for axis in ("row", "col") for verb in ("hide", "unhide")})
+ICONS.update({f"sheet_{op}": (lambda op: lambda *a: _icon_sheet_op(*a, op))(op)
+              for op in ("copy", "rename", "delete", "tab_color", "left", "right", "hide", "unhide")})
+ICONS.update({f"file_{kind}": (lambda kind: lambda *a: _icon_file(*a, kind))(kind)
+              for kind in ("new", "open", "save_as", "exit")})
+ICONS.update({
+    "line_color": _icon_line_color, "underline_double": _icon_underline_double, "sort_custom": _icon_sort_custom,
+    "filter_reapply": lambda *a: _icon_filter_variant(*a, "reapply"),
+    "filter_value": lambda *a: _icon_filter_variant(*a, "value"), "fill_series": _icon_fill_series,
+    "replace": _icon_replace, "goto": _icon_goto, "freeze_row": lambda *a: _icon_freeze_part(*a, "row"),
+    "freeze_col": lambda *a: _icon_freeze_part(*a, "col"), "validation_clear": _icon_validation_clear,
+    "delete_x": _icon_delete_x, "chart_edit": _icon_chart_edit,
+    "sort_color": lambda *a: _icon_by_color(*a, True), "filter_color": lambda *a: _icon_by_color(*a, False),
+    "pivot": _icon_pivot, "refresh": _icon_refresh, "pivot_fields": _icon_pivot_fields,
+    "margins": _icon_margins, "page_orient": _icon_page_orient,
+    "portrait": lambda *a: _icon_page_orient(*a, "portrait"), "landscape": lambda *a: _icon_page_orient(*a, "landscape"),
+    "paper_size": _icon_paper_size, "print_area": _icon_print_area, "page_break": _icon_page_break,
+    "print_titles": _icon_print_titles, "fit_page": _icon_fit_page, "print": _icon_print,
+    "print_preview": _icon_print_preview, "pdf": _icon_pdf, "page_setup": _icon_page_setup,
+    "group": _icon_group, "ungroup": lambda *a: _icon_group(*a, ungroup=True), "subtotal": _icon_subtotal,
+    "show_detail": lambda *a: _icon_detail(*a, True), "hide_detail": lambda *a: _icon_detail(*a, False),
+})
+ICONS.update({"picture": _icon_picture, "link": _icon_link, "text_columns": _icon_text_columns,
+              "protect": _icon_protect, "lock_cell": _icon_lock_cell, "import_text": _icon_import_text})
+ICONS.update({f"name_{kind}": (lambda kind: lambda *a: _icon_name(*a, kind))(kind)
+              for kind in ("manager", "define", "use", "create")})
 
 
 def draw_icon(cv, name, x, y, size, color=None):
@@ -430,6 +1131,42 @@ def draw_icon(cv, name, x, y, size, color=None):
     def P(*coords):
         return [x + v * k if i % 2 == 0 else y + v * k for i, v in enumerate(coords)]
     func(cv, P, k, color)
+
+
+class MenuIcons:
+    """Icons for tk.Menu entries, cut from the sprite sheets made by tools/make_menu_icons.py.
+
+    get(name) gives a PhotoImage; a blank one for names without a picture (so labels line up), or None
+    when the sheets cannot be loaded at all (menus then simply have no pictures)."""
+
+    SIZES = (16, 20, 24, 32)
+    COLUMNS = 16
+
+    def __init__(self, root, scale, folder):
+        self.root = root
+        self.size = min(self.SIZES, key=lambda s: abs(s - 16 * scale))
+        self._cache = {}
+        try:
+            with open(os.path.join(folder, "menu_icons.txt"), encoding="utf-8") as f:
+                self.index = {name: i for i, name in enumerate(f.read().split("\n")) if name}
+            self.sheet = tk.PhotoImage(master=root, file=os.path.join(folder, f"menu_{self.size}.png"))
+        except (OSError, tk.TclError):
+            self.index, self.sheet = {}, None
+        self.gap = max(3, self.size // 4)  # transparent margin between picture and label
+        self.blank = tk.PhotoImage(master=root, width=self.size + self.gap, height=self.size)
+
+    def get(self, name):
+        if self.sheet is None:
+            return None
+        if name not in self.index:
+            return self.blank
+        image = self._cache.get(name)
+        if image is None:
+            s, i = self.size, self.index[name]
+            x, y = (i % self.COLUMNS) * s, (i // self.COLUMNS) * s
+            image = self._cache[name] = tk.PhotoImage(master=self.root, width=s + self.gap, height=s)
+            image.tk.call(image, "copy", self.sheet, "-from", x, y, x + s, y + s, "-to", 0, 0)
+        return image
 
 
 # ------------------------------------------------------------------ widgets
@@ -456,8 +1193,10 @@ class Tooltip:
         tk.Label(tip, text=self.text, bg="#ffffff", fg="#333333", bd=1, relief="solid", padx=7, pady=4,
                  justify="left", font=self.font).pack()
         tip.update_idletasks()
-        x = min(self.widget.winfo_rootx(), tip.winfo_screenwidth() - tip.winfo_reqwidth() - 4)
-        tip.geometry(f"+{x}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
+        x, y = keep_on_screen(self.widget, self.widget.winfo_rootx(), self.widget.winfo_rooty() +
+                              self.widget.winfo_height() + 4, tip.winfo_reqwidth(), tip.winfo_reqheight(),
+                              flip=self.widget.winfo_height() + 8)
+        tip.geometry(f"+{x}+{y}")
 
     def _hide(self, e=None):
         if self.job:
@@ -477,10 +1216,12 @@ class RibbonButton(tk.Canvas):
     """
 
     def __init__(self, master, ui, *, text="", icon=None, command=None, menu=None, large=False, split=False,
-                 tooltip=None, color=None, bg=None, fg=TEXT_FG, hover_bg=HOVER_BG, height=None):
+                 tooltip=None, color=None, bg=None, fg=TEXT_FG, hover_bg=HOVER_BG, pressed_bg=PRESSED_BG,
+                 disabled_color=None, height=None):
         self.ui, self.text, self.icon, self.command = ui, text, icon, command
         self.menu, self.large, self.split, self.color = menu, large, split and menu is not None, color
-        self.bg, self.fg, self.hover_bg = bg or ui.bg, fg, hover_bg
+        self.bg, self.fg, self.hover_bg, self.pressed_bg = bg or ui.bg, fg, hover_bg, pressed_bg
+        self.disabled_color = disabled_color
         self.checked = self.pressed = False
         self.hover = None
         self.enabled = True
@@ -494,8 +1235,7 @@ class RibbonButton(tk.Canvas):
         self.bind("<Leave>", lambda e: self._set_hover(None))
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
-        if tooltip:
-            Tooltip(self, tooltip, ui.small_font)
+        self.tip = Tooltip(self, tooltip, ui.small_font) if tooltip else None
         self.draw()
 
     def _width(self):
@@ -526,8 +1266,13 @@ class RibbonButton(tk.Canvas):
         self.draw()
 
     def set_enabled(self, value):
-        self.enabled = bool(value)
-        self.draw()
+        if bool(value) != self.enabled:
+            self.enabled = bool(value)
+            self.draw()
+
+    def set_tooltip(self, text):
+        if self.tip:
+            self.tip.text = text
 
     def _boxes(self):
         w, h = int(self["width"]), int(self["height"])
@@ -542,7 +1287,7 @@ class RibbonButton(tk.Canvas):
         if self.checked:
             self.create_rectangle(0, 0, w - 1, h - 1, fill=CHECKED_BG, outline=CHECKED_LINE)
         if self.hover and self.enabled:
-            hot = PRESSED_BG if self.pressed else self.hover_bg
+            hot = self.pressed_bg if self.pressed else self.hover_bg
             if self.split:
                 main, arrow = self._boxes()
                 active, other = (arrow, main) if self.hover == "arrow" else (main, arrow)
@@ -551,9 +1296,10 @@ class RibbonButton(tk.Canvas):
             else:
                 self.create_rectangle(0, 0, w - 1, h - 1, fill=hot, outline="")
         fg = self.fg if self.enabled else "#a0a0a0"
+        color = self.color if self.enabled or not self.disabled_color else self.disabled_color
         if self.large:
             iy = round(4 * s)
-            draw_icon(self, self.icon, (w - self.icon_px) // 2, iy, self.icon_px, self.color)
+            draw_icon(self, self.icon, (w - self.icon_px) // 2, iy, self.icon_px, color)
             lines = self.text.split("\n") if self.text else []
             line_h = self.ui.font.metrics("linespace")
             y = iy + self.icon_px + round(4 * s) + line_h // 2
@@ -571,7 +1317,7 @@ class RibbonButton(tk.Canvas):
         else:
             x = round(4 * s)
             if self.icon:
-                draw_icon(self, self.icon, x, (h - self.icon_px) // 2, self.icon_px, self.color)
+                draw_icon(self, self.icon, x, (h - self.icon_px) // 2, self.icon_px, color)
                 x += self.icon_px + round(5 * s)
             if self.text:
                 self.create_text(x, h // 2, text=self.text, anchor="w", font=self.ui.font, fill=fg)
@@ -581,6 +1327,8 @@ class RibbonButton(tk.Canvas):
     def _triangle(self, cx, cy):
         d = max(2, round(2.6 * self.ui.scale))
         color = "#ffffff" if self.bg != RIBBON_BG else DARK
+        if not self.enabled and self.disabled_color:
+            color = self.disabled_color
         self.create_polygon(cx - d, cy - d // 2, cx + d, cy - d // 2, cx, cy + d - d // 2, fill=color, outline="")
 
     def _part(self, x, y):
@@ -640,13 +1388,14 @@ class Popup(tk.Toplevel):
         self._pos = (x, y)
         self.bind("<Escape>", lambda e: self.close())
 
-    def show(self):
+    def show(self, right=False):
+        """Open below the given point; with right=True the point is the popup's top-right corner."""
         self.update_idletasks()
         x, y = self._pos
         w, h = self.winfo_reqwidth(), self.winfo_reqheight()
-        x = max(0, min(x, self.winfo_screenwidth() - w - 4))
-        if y + h > self.winfo_screenheight() - 40:
-            y = max(0, y - h - 30)
+        if right:
+            x -= w
+        x, y = keep_on_screen(self, x, y, w, h, flip=30)  # on the monitor it opens on, not the primary one
         self.geometry(f"+{x}+{y}")
         self.deiconify()
         self.lift()
@@ -826,17 +1575,16 @@ class RibbonGroup(tk.Frame):
 
 
 class Ribbon(tk.Frame):
-    """Green tab strip with a quick-access toolbar, plus the active tab's page of groups."""
+    """Green tab strip plus the active tab's page of groups. on_toggle(collapsed) is called when the
+    commands are hidden or shown again (double-click on a tab)."""
 
     def __init__(self, master, ui):
         super().__init__(master, bg=ui.bg)
         self.ui = ui
         self.bar = tk.Frame(self, bg=TAB_BAR_BG)
         self.bar.pack(side="top", fill="x")
-        self.qat = tk.Frame(self.bar, bg=TAB_BAR_BG)
-        self.qat.pack(side="left", padx=(ui.px(4), ui.px(10)))
         self.tab_strip = tk.Frame(self.bar, bg=TAB_BAR_BG)
-        self.tab_strip.pack(side="left", fill="y")
+        self.tab_strip.pack(side="left", fill="y", padx=(ui.px(4), 0))
         self.extra = tk.Frame(self.bar, bg=TAB_BAR_BG)
         self.extra.pack(side="left", fill="both", expand=True, padx=(ui.px(16), ui.px(8)))
         self.body = tk.Frame(self, bg=ui.bg, height=ui.content_h + ui.label_h + ui.px(4))
@@ -847,6 +1595,8 @@ class Ribbon(tk.Frame):
         self.pages, self.labels = {}, {}
         self.current = None
         self.collapsed = False
+        self.on_toggle = None
+        self.on_select = None  # called with the tab's name when one is shown
 
     def add_tab(self, name, command=None):
         """A tab with a page of groups; with `command` the tab only runs it (like 'File')."""
@@ -881,6 +1631,8 @@ class Ribbon(tk.Frame):
         for n, label in self.labels.items():
             active = n == name
             label.config(bg=self.ui.bg if active else TAB_BAR_BG, fg=TAB_BAR_BG if active else "#ffffff")
+        if self.on_select:
+            self.on_select(name)
 
     def toggle_collapse(self):
         self.collapsed = not self.collapsed
@@ -888,3 +1640,5 @@ class Ribbon(tk.Frame):
             self.body.pack_forget()
         else:
             self.body.pack(side="top", fill="x", before=self.line)
+        if self.on_toggle:
+            self.on_toggle(self.collapsed)

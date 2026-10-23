@@ -3,28 +3,72 @@
 Run:  python excel_app.py [file.xlsx | file.pyxl | file.csv]
 """
 
+import base64
+import bisect
 import csv
 import datetime as dt
+import functools
+import heapq
 import io
+import itertools
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import threading
+import time
+import webbrowser
 import tkinter as tk
 import tkinter.font as tkfont
 import unicodedata
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
+import charts
+import clipcells
 import dialogs
+import drawing
 import formula_engine as fe
+import images
+import pivot as pv
+import pdf_import
+import pdfread
+import printing
+import richclip
+import screens
+import session
+import shapes
+import ttf
+from formula_assist import FormulaAssist
 from formula_engine import MAX_COLS, MAX_ROWS, cell_name, col_name, range_name
 from function_info import CATEGORIES, FUNCTION_INFO
-from ribbon import (RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, Ribbon, RibbonButton, RibbonStyle, StyleTile,
-                    Tooltip, color_popup, gallery_popup, mix)
+from pivot_pane import PivotPane
+from print_preview import PrintPreview
+from ribbon import (RIBBON_BG, TAB_BAR_BG, TAB_HOVER_BG, MenuIcons, Popup, Ribbon, RibbonButton, RibbonStyle,
+                    StyleTile, Tooltip, color_popup, gallery_popup, mix)
+from titlebar import BAR_HEIGHT, CAPTION_PRESSED, GlyphButton, TitleBar
 
 APP_NAME = "PyExcel"
 
+QAT_COMMANDS = (  # what the Quick Access Toolbar can hold, in Excel's order: (key, name, icon, tooltip)
+    ("new", "Mới", "file_new", "Mới (Ctrl+N)"), ("open", "Mở", "file_open", "Mở (Ctrl+O)"),
+    ("save", "Lưu", "save", "Lưu (Ctrl+S)"),
+    ("print", "Xem trước khi In và In", "print_preview", "Xem trước khi In và In (Ctrl+P)"),
+    ("pdf", "Xuất PDF", "pdf", "Xuất PDF"), ("undo", "Hoàn tác", "undo", "Hoàn tác (Ctrl+Z)"),
+    ("redo", "Làm lại", "redo", "Làm lại (Ctrl+Y)"), ("sort_az", "Sắp xếp Tăng dần", "sort_az", "Sắp xếp Tăng dần"),
+    ("sort_za", "Sắp xếp Giảm dần", "sort_za", "Sắp xếp Giảm dần"))
+QAT_DISABLED = "#8fbaa1"  # a greyed-out toolbar icon on the green title bar
+HISTORY_SELECT = "#cde6f7"
+RIBBON_MODE_ITEMS = (  # Ribbon Display Options: (mode, name, explanation)
+    ("auto", "Tự động ẩn Ribbon", "Ẩn Ribbon. Bấm vào ⋯ trên thanh tiêu đề để hiện lại."),
+    ("tabs", "Hiện Tab", "Chỉ hiện các tab Ribbon. Bấm vào một tab để hiện các lệnh."),
+    ("full", "Hiện Tab và Lệnh", "Luôn hiện các tab và lệnh Ribbon."))
+
 ACCENT = "#107c41"
+SPILL_LINE = "#5b9bd5"  # the outline of a dynamic array
+AUTOSCROLL_MS = 25  # how often the sheet scrolls while a drag is held past its edge
 GRID = "#e1e1e1"
 HEADER_BG = "#f3f3f3"
 HEADER_FG = "#555555"
@@ -34,6 +78,16 @@ HEADER_FULL_BG = "#a6d4b4"
 HEADER_SEL_FG = "#0b5a2f"
 SELECTION_TINT = "#a9cdb5"
 SHEETBAR_BG = "#ececec"
+FREEZE_LINE = "#8a8a8a"
+BREAK_LINE = {False: "#8c8c8c", True: "#4f4f4f"}  # automatic / manual page breaks
+OUTLINE_BG, OUTLINE_FG = "#fbfbfb", "#7a7a7a"
+HYPERLINK_FG = "#0563c1"  # Excel's Hyperlink cell style: this colour, underlined
+PROTECTED_MSG = ("Ô hoặc đối tượng bạn muốn thay đổi nằm trên trang tính đang được bảo vệ.\n"
+                 "Để thay đổi, hãy bỏ bảo vệ: Xem lại → Bỏ bảo vệ Trang tính.")
+FILTERED_ROW_FG = "#2b579a"  # row numbers inside a filtered range, as in Excel
+NOTE_MARK = "#d13438"
+NOTE_BG = "#ffffe1"
+NOTE_LINE = "#9a9a7a"
 REF_COLORS = ("#2f6fd6", "#d13438", "#8e44ad", "#c55a11", "#00838f", "#c2185b")
 
 FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72]
@@ -104,6 +158,55 @@ STYLE_LOOKUP = {name: style for _, items in CELL_STYLES for name, style in items
 QUICK_STYLES = ["Chuẩn", "Trung tính", "Xấu", "Tốt", "Ô kiểm tra", "Ghi chú", "Ô liên kết", "Tính toán"]
 STYLE_KEYS = ("font", "size", "bold", "italic", "underline", "strike", "fg", "bg") + fe.BORDER_KEYS
 
+# picture shown beside a menu entry, by label (without a trailing "..."); see ribbon.ICONS
+MENU_ICONS = {
+    "Mới": "file_new", "Mở": "file_open", "Lưu": "save", "Lưu thành": "file_save_as", "Thoát": "file_exit",
+    "Mở gần đây": "file_open", "Lưu tự động bản khôi phục": "save",
+    "In": "print", "Xuất PDF": "pdf", "Thiết lập Trang": "page_setup",
+    "Nhóm": "group", "Bỏ nhóm": "ungroup", "Tổng phụ": "subtotal", "Xóa dàn bài": "clear",
+    "Trình Quản lý Tên": "name_manager", "Liên kết": "link", "Mở liên kết": "link", "Loại bỏ liên kết": "delete_x",
+    "Thay ảnh": "picture", "Bảo vệ Trang tính": "protect", "Khóa ô": "lock_cell",
+    "Cắt": "cut", "Sao chép": "copy", "Dán": "paste", "Tùy chọn dán": "paste", "Dán công thức": "paste_formulas",
+    "Dán giá trị": "paste_values", "Dán định dạng": "paste_formats", "Dán chuyển vị": "paste_transpose",
+    "Dán giá trị và định dạng số": "paste_values", "Dán không có viền": "paste", "Dán giữ độ rộng cột nguồn": "col_size",
+    "Dán đặc biệt": "paste_special", "Gạch chân": "underline", "Gạch chân kép": "underline_double",
+    "Hợp nhất & Căn giữa": "merge", "Hợp nhất ngang hàng": "merge_across", "Hợp nhất ô": "merge_cells",
+    "Bỏ hợp nhất ô": "merge_unmerge", "Định dạng kế toán khác": "format_cells", "Định dạng ô": "format_cells",
+    "Định dạng căn chỉnh ô": "format_cells", "Thêm viền": "format_cells",
+    "Chèn": "insert_cells", "Chèn ô": "insert_cells", "Chèn hàng trang tính": "insert_row",
+    "Chèn cột trang tính": "insert_col", "Chèn trang tính": "sheet", "Xóa": "delete_cells", "Xóa ô": "delete_cells",
+    "Xóa hàng trang tính": "delete_row", "Xóa cột trang tính": "delete_col", "Xóa trang tính": "sheet_delete",
+    "Chiều cao hàng": "row_size", "Tự động khớp chiều cao hàng": "row_autofit", "Độ rộng cột": "col_size",
+    "Tự động khớp độ rộng cột": "col_autofit", "Ẩn & Bỏ ẩn": "hide_row", "Ẩn hàng": "hide_row", "Ẩn cột": "hide_col",
+    "Bỏ ẩn hàng": "unhide_row", "Bỏ ẩn cột": "unhide_col", "Đổi tên trang tính": "sheet_rename",
+    "Đổi tên": "sheet_rename", "Sao chép trang tính": "sheet_copy", "Màu tab": "sheet_tab_color",
+    "Di chuyển sang trái": "sheet_left", "Di chuyển sang phải": "sheet_right",
+    "Tổng": "autosum", "Trung bình": "stat_avg", "Đếm số": "stat_count", "Lớn nhất": "stat_max",
+    "Nhỏ nhất": "stat_min", "Hàm khác": "function",
+    "Xuống": "fill_down", "Sang phải": "fill_right", "Lên": "fill_up", "Sang trái": "fill_left", "Chuỗi": "fill_series",
+    "Xóa tất cả": "clear", "Xóa định dạng": "clear_formats", "Xóa nội dung": "clear_contents",
+    "Tìm": "find", "Thay thế": "replace", "Đi tới": "goto",
+    "Sắp xếp": "sort_az", "Sắp xếp từ A đến Z": "sort_az", "Sắp xếp từ Z đến A": "sort_za",
+    "Sắp xếp tùy chỉnh": "sort_custom", "Lọc": "filter", "Bật/tắt bộ lọc": "filter", "Xóa bộ lọc": "filter_clear",
+    "Áp dụng lại bộ lọc": "filter_reapply", "Lọc theo giá trị của ô đã chọn": "filter_value",
+    "Lọc theo màu của ô đã chọn": "filter_color", "Lọc theo màu phông của ô đã chọn": "filter_color",
+    "Xoay ngược chiều kim đồng hồ": "angle_ccw", "Xoay theo chiều kim đồng hồ": "angle_cw",
+    "Văn bản dọc": "angle_vertical", "Xoay văn bản lên": "angle_up", "Xoay văn bản xuống": "angle_down",
+    "Quy tắc tô sáng ô": "cf_highlight", "Quy tắc trên/dưới": "cf_topbottom", "Thanh dữ liệu": "cf_databar",
+    "Thang màu": "cf_scale", "Xóa quy tắc": "clear", "Xóa quy tắc khỏi ô đã chọn": "clear",
+    "Xóa quy tắc khỏi toàn bộ trang tính": "clear", "Quản lý quy tắc": "cf_manage",
+    "Lớn hơn": "cf_rule_gt", "Nhỏ hơn": "cf_rule_lt", "Nằm giữa": "cf_rule_between", "Bằng": "cf_rule_eq",
+    "Văn bản có chứa": "cf_rule_text", "Giá trị trùng lặp": "cf_rule_dup", "10 mục đầu": "rank_top",
+    "10% đầu": "rank_top_pct", "10 mục cuối": "rank_bottom", "10% cuối": "rank_bottom_pct",
+    "Trên trung bình": "rank_above", "Dưới trung bình": "rank_below",
+    "Cố định ngăn": "freeze", "Cố định hàng trên cùng": "freeze_row", "Cố định cột đầu tiên": "freeze_col",
+    "Xác thực dữ liệu": "validation", "Xóa xác thực dữ liệu": "validation_clear",
+    "Chèn/Sửa ghi chú": "note", "Xóa ghi chú": "note_delete",
+    "Đổi kiểu biểu đồ": "chart_column", "Biểu đồ cột": "chart_column", "Biểu đồ thanh": "chart_bar",
+    "Biểu đồ đường": "chart_line", "Biểu đồ tròn": "chart_pie", "Dữ liệu và tiêu đề biểu đồ": "chart_edit",
+    "Xóa biểu đồ": "delete_x", "PivotTable": "pivot", "Làm mới tất cả": "refresh",
+}
+
 SHIFT, CONTROL, ALT = 0x0001, 0x0004, 0x20000
 MODIFIER_KEYS = {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Caps_Lock", "Win_L", "Win_R"}
 POINT_AFTER = ("=", "+", "-", "*", "/", "^", "(", ",", ";", ":", "<", ">", "&")
@@ -122,19 +225,114 @@ THANH RIBBON
   • Nút có mũi tên ▾ mở thêm lựa chọn; mũi tên nhỏ ↘ ở góc nhóm mở hộp thoại Định dạng ô (Ctrl+1).
   • Ô "Cho tôi biết bạn muốn làm gì" trên thanh xanh: gõ tên lệnh (ví dụ "viền", "lọc") rồi Enter.
   • Nhấp đúp vào tên tab để thu gọn/mở rộng ribbon.
+  • Xem → Cố định ngăn: giữ các hàng phía trên và cột bên trái ô đang chọn luôn hiển thị khi cuộn.
+  • Dữ liệu → Xác thực dữ liệu: giới hạn giá trị được nhập (số, ngày, độ dài) hoặc tạo danh sách thả xuống
+    (nguồn  Có,Không  hoặc  =$A$1:$A$10). Nhấp mũi tên cạnh ô hoặc Alt+↓ để chọn.
+  • Xem lại → Ghi chú mới (Shift+F2): ô có ghi chú có tam giác đỏ ở góc, rê chuột vào để xem.
+  • PivotTable: quét chọn bảng có hàng tiêu đề rồi bấm Chèn → PivotTable. Trong ngăn Các trường PivotTable,
+    tích trường hoặc kéo trường vào Bộ lọc / Cột / Hàng / Giá trị; nhấp vào trường trong một vùng để sắp xếp,
+    lọc mục, nhóm ngày hay chọn Tổng/Đếm/Trung bình... Sửa dữ liệu nguồn xong bấm Làm mới; nhấp đúp vào
+    một số để xem các dòng dữ liệu tạo nên số đó.
+  • Lọc dữ liệu: quét chọn bảng (kể cả hàng tiêu đề) rồi bấm Dữ liệu → Lọc (Ctrl+Shift+L). Nút ▾ ở tiêu đề
+    có: sắp xếp (cả theo màu), lọc theo màu, Bộ lọc số / văn bản / ngày (lớn hơn, nằm giữa, có chứa, 10 mục
+    đầu, trên trung bình, tháng này...), Bộ lọc tùy chỉnh (2 điều kiện Và/Hoặc, dùng * và ?) và danh sách
+    giá trị có ô tìm kiếm. Thanh trạng thái cho biết số bản ghi tìm thấy. Lăn chuột, Page Up/Down và thanh
+    cuộn bỏ qua các hàng bị lọc ẩn như Excel.
+  • Trang chủ → Tìm và Chọn → Đi tới Đặc biệt: chọn ô trống, hằng số, công thức, ô có ghi chú... (ví dụ chọn
+    các ô trống rồi gõ giá trị và nhấn Ctrl+Enter để điền vào tất cả). Chuột phải vào tab để Ẩn / Bỏ ẩn trang tính.
+  • Xem lại → Bảo vệ Trang tính: không cho sửa các ô bị khóa (mặc định mọi ô đều khóa). Trước khi bảo vệ, chọn
+    các ô cần cho nhập rồi bấm Khóa ô (hoặc Định dạng ô → Bảo vệ, bỏ chọn Khóa); "Ẩn công thức" giấu công thức
+    trên thanh công thức. Có thể đặt mật khẩu (kiểu Excel, chỉ chống sửa nhầm).
+  • Dữ liệu → Văn bản thành Cột: tách một cột (ví dụ "Họ tên, SĐT, Địa chỉ") thành nhiều cột theo dấu phẩy,
+    dấu chấm phẩy, dấu cách... hoặc theo độ rộng cố định; có thể giữ số 0 ở đầu số điện thoại.
+  • Tên vùng: chọn vùng, gõ tên (ví dụ ĐơnGiá) vào ô Tên bên trái thanh công thức rồi Enter; sau đó dùng
+    =SUM(ĐơnGiá). Công thức → Trình Quản lý Tên (Ctrl+F3) để sửa/xóa, Tạo từ Vùng chọn (Ctrl+Shift+F3) để đặt
+    tên theo hàng tiêu đề. Chọn tên trong danh sách của ô Tên để nhảy tới vùng đó.
+  • Chèn → Liên kết (Ctrl+K): ô dẫn tới trang web, tệp, một ô/tên trong sổ làm việc hoặc email. Nhấp vào ô để mở
+    liên kết; nhấp và giữ để chọn ô. Hàm =HYPERLINK("https://...", "Tên") cũng tạo liên kết.
+  • Chèn → Ảnh: ảnh PNG, GIF, JPEG đặt nổi trên trang tính; kéo để di chuyển, kéo góc để đổi cỡ (giữ tỉ lệ),
+    chuột phải để thay ảnh / đặt lại kích thước / xóa. Ảnh được in và lưu cùng tệp. Cài Pillow (pip install
+    pillow) để ảnh co giãn mịn hơn và xem được ảnh JPEG trên màn hình. Chụp màn hình (Win+Shift+S) hoặc sao
+    chép ảnh trên web rồi Ctrl+V cũng dán được ảnh vào trang tính.
+  • Chèn → Hình dạng: hình chữ nhật, bầu dục, mũi tên, lưu đồ, chú thích, sao...; chọn hình rồi kéo trên trang
+    tính (giữ Shift để vuông/tròn), hoặc nhấp một lần để có cỡ mặc định. Chèn → Hộp văn bản để viết chữ tự do.
+  • Dữ liệu → Nhóm (Alt+Shift+→): gom các hàng/cột đang chọn; nút −/+ ở lề trái (hoặc trên) thu gọn / mở
+    rộng nhóm, các nút 1 2 3 ở góc hiện theo mức. Bỏ nhóm (Alt+Shift+←), Xóa dàn bài, Hiện/Ẩn chi tiết.
+  • Dữ liệu → Tổng phụ: với bảng đã sắp xếp theo một cột (ví dụ Khu vực), thêm hàng "Bắc Tổng", "Nam Tổng"...
+    dùng hàm SUBTOTAL (tổng, đếm, trung bình...) và hàng Tổng Cuối, kèm dàn bài để xem gọn theo mức.
+  • Chèn → Biểu đồ (Cột, Thanh, Đường, Tròn): chọn vùng dữ liệu kèm tiêu đề rồi bấm. Kéo để di chuyển, kéo
+    các nút ở viền để đổi kích thước, nhấp đúp để sửa dữ liệu/tiêu đề, Delete để xóa.
 
 NHẬP DỮ LIỆU
   • Chọn ô rồi gõ; Enter/Tab để xác nhận, Esc để hủy. F2 hoặc nhấp đúp để sửa.
   • Công thức bắt đầu bằng "=":  =SUM(A1:A10)*2   =IF(B2>=5,"Đạt","Chưa đạt")   =Sheet2!A1+1
   • Khi đang gõ công thức, nhấp hoặc kéo chuột lên ô để chèn địa chỉ.
+  • Gõ vài chữ đầu của tên hàm (=vl...) sẽ hiện danh sách hàm kèm mô tả: ↑/↓ để chọn, Tab hoặc nhấp đúp để
+    chèn, Esc để đóng. Trong dấu ngoặc của hàm có chú thích các đối số, đối số đang nhập được in đậm.
+  • F4 khi đang gõ công thức: đổi địa chỉ cạnh con trỏ lần lượt A1 → $A$1 → A$1 → $A1 → A1.
   • Gõ ' ở đầu để giữ nguyên dạng chữ ('007). Ngày nhập dạng 21/10/2026; phần trăm như 15%.
 
+HÌNH VẼ VÀ SƠ ĐỒ (tab Sơ đồ)
+  • Tab Sơ đồ dành riêng cho vẽ sơ đồ logic / lưu đồ: bấm một hình (Bắt đầu/Kết thúc, Xử lý, Quyết định,
+    Nhập/Xuất...) hoặc cổng logic (AND, OR, NOT, NAND, NOR, XOR...) rồi kéo hoặc nhấp trên trang tính.
+  • Đường nối: chọn Gấp khúc / Thẳng / Cong rồi kéo từ một hình sang hình khác — khi rê gần hình sẽ hiện các
+    chấm xanh (điểm nối), thả vào đó là đường dính vào hình: kéo hình đi thì đường tự đi theo và tự vòng
+    tránh hình. Công cụ đường nối giữ nguyên để vẽ liền nhiều đường; Esc hoặc chuột phải để thôi.
+  • Thêm nối tiếp (↓ → ↑ ←): chọn một hình rồi bấm, có ngay hình giống nó bên cạnh, nối sẵn bằng mũi tên,
+    và gõ chữ luôn — vẽ lưu đồ rất nhanh.
+  • Chọn hình: nhấp vào hình; Shift/Ctrl+nhấp để chọn thêm; bật "Chọn đối tượng" rồi kéo để chọn nhiều hình.
+    Kéo để di chuyển (đường hồng hiện ra khi thẳng hàng với hình khác; giữ Shift để đi thẳng ngang/dọc;
+    Ctrl+kéo để sao chép), kéo chấm tròn để đổi cỡ, kéo chấm trên cùng để xoay (Shift: từng 15°), chấm vàng
+    của hình chú thích để chỉnh đuôi. Phím mũi tên: dịch 5 điểm ảnh (Ctrl: 1), Shift+mũi tên: đổi cỡ,
+    Alt+←/→: xoay 15°, Delete: xóa, Tab: sang hình khác, Esc: bỏ chọn.
+  • Gõ chữ trong hình: chọn hình rồi gõ luôn (hoặc Enter / F2 / nhấp đúp để sửa); Esc hoặc nhấp ra ngoài để
+    xong. Nút B, I, U, cỡ chữ, màu chữ, màu tô, căn lề ở tab Trang chủ cũng áp dụng cho hình đang chọn.
+  • Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D (nhân bản) với hình đang chọn; chuột phải để đổi hình, đổi kiểu đường
+    nối, đưa lên trên / xuống dưới.
+  • Kiểu hình: Kiểu nhanh, Màu tô, Đường viền (màu, độ dày, nét đứt), Màu chữ, Mũi tên; Sắp xếp: đưa lên
+    trước / ra sau, căn trái/giữa/phải, phân phối đều, xoay, lật. Bắt dính lưới: hình bám vào cạnh ô.
+  • Trang sơ đồ mới: thêm một trang tính riêng để vẽ, bật sẵn Chọn đối tượng và Bắt dính lưới.
+  • Hình được lưu trong .xlsx đúng kiểu của Excel (mở bằng Excel vẫn sửa được, đường nối vẫn dính hình) và
+    được in / xuất PDF. Đường gấp khúc / cong được lưu bằng chính loại đường nối của Excel, vẽ đúng đường đi
+    như trong PyExcel. Cổng logic không có sẵn trong Excel nên được lưu dạng hình tự do có điểm nối, kèm văn
+    bản thay thế "PyExcel:..." — mở lại bằng PyExcel (kể cả sau khi đã sửa và lưu bằng Excel) vẫn là cổng
+    logic và đường nối như cũ, sửa tiếp được.
+
+TIỆN ÍCH (tab Tiện ích)
+  • Nhập PDF: chuyển tệp PDF thành trang tính — chữ vào đúng ô theo vị trí trên trang, bảng có đường kẻ thành
+    ô có viền (ô gộp theo khung), số / ngày / phần trăm thành số thật để tính được, phông, cỡ, đậm, nghiêng,
+    màu chữ và màu nền ô được giữ; các hình vẽ còn lại (lưu đồ, mũi tên...) thành hình vẽ, chữ trong hình
+    thành hộp văn bản; ảnh trong PDF thành ảnh trên trang tính.
+  • Chọn trang (ví dụ 1-3, 5), mỗi trang một trang tính hay gộp tất cả vào một trang tính, có lấy viền / hình
+    vẽ / ảnh / chuyển số hay không. Tệp lớn được nhập ở nền, thanh trạng thái báo tiến độ; Esc để dừng (giữ
+    các trang đã xong). Ctrl+Z bỏ cả lần nhập.
+  • PDF là ảnh chụp / bản quét thì không có chữ để lấy (chưa có nhận dạng chữ OCR) — chỉ nhập được ảnh của
+    trang. PDF có mật khẩu mở chưa hỗ trợ (PDF chỉ cấm sửa/in vẫn nhập được).
+  • Xuất PDF và Trang sơ đồ mới cũng có ở đây.
+
+MẢNG ĐỘNG (như Excel 365)
+  • Công thức cho ra nhiều giá trị sẽ tự "tràn" sang các ô bên dưới / bên phải: =SORT(FILTER(A2:C99,B2:B99="Bắc"))
+    =UNIQUE(A2:A99)   =SEQUENCE(10)   =TEXTSPLIT("a,b,c",",")   =A2:A10*B2:B10. Chỉ ô đầu chứa công thức;
+    các ô tràn hiện công thức màu xám trên thanh công thức, chọn vào sẽ thấy viền xanh quanh cả mảng.
+  • Nếu vùng tràn bị chặn (có dữ liệu hoặc ô hợp nhất) ô đầu báo #SPILL!; xóa chỗ chặn là mảng tràn lại.
+    Mảng rỗng (FILTER không tìm thấy gì...) báo #CALC!.
+  • A2# là cả mảng mà ô A2 tràn ra: =SUM(A2#), =ROWS(A2#), =XLOOKUP(x,A2#,...). Hằng mảng: {1,2,3;4,5,6}.
+  • LAMBDA / LET: =LET(giá,B2,sl,C2,giá*sl)   =MAP(A2:A9,LAMBDA(x,x*2))   =REDUCE(0,A2:A9,LAMBDA(t,x,t+x))
+    =BYROW(A2:C9,LAMBDA(h,SUM(h)))   =SCAN(...)   =MAKEARRAY(3,3,LAMBDA(r,c,r*c)). Tab Công thức có nhóm
+    Mảng động và LAMBDA để chèn hàm.
+  • Lưu .xlsx: các công thức này được ghi đúng kiểu mảng động của Excel 365 (_xlfn...), mở bằng Excel vẫn tràn.
+    Chưa hỗ trợ tham chiếu cả cột/hàng (A:A, 1:1) và toán tử @ (dùng hàm SINGLE).
+
 CHUỘT
-  • Kéo để chọn vùng; Shift+nhấp mở rộng vùng; nhấp tiêu đề để chọn cả cột/hàng.
+  • Kéo để chọn vùng; Shift+nhấp mở rộng vùng; nhấp tiêu đề để chọn cả cột/hàng. Kéo ra ngoài mép trên/dưới
+    để cuộn theo: chuột càng xa mép thì cuộn càng nhanh; sang trái/phải cuộn đều từng cột.
   • Kéo mép tiêu đề cột/hàng để đổi kích thước; nhấp đúp mép để tự khớp.
   • Kéo ô vuông nhỏ ở góc vùng chọn để sao chép hoặc điền chuỗi (1, 2 → 3, 4...; "Mục 1" → "Mục 2").
   • Chổi "Sao chép định dạng": nhấp một lần để dán định dạng một lần, nhấp đúp để dán nhiều lần.
   • Ctrl + lăn chuột để phóng to/thu nhỏ.
+  • Cửa sổ (Windows): kéo thanh tiêu đề lên mép trên màn hình để phóng to, sang mép trái/phải để chia đôi
+    màn hình; nhấp đúp thanh tiêu đề để phóng to/khôi phục; Windows 11: rê chuột lên nút Phóng to để chọn
+    bố cục chia màn hình (Snap Layouts). Win+mũi tên và chuột phải trên thanh tiêu đề (menu hệ thống) cũng dùng được.
 
 PHÍM TẮT
   Ctrl+C / X / V      Sao chép / Cắt / Dán         Ctrl+Z / Y        Hoàn tác / Làm lại
@@ -147,13 +345,127 @@ PHÍM TẮT
   Ctrl+Shift+&        Viền ngoài                   Ctrl+Shift+_      Bỏ viền
   Ctrl+mũi tên        Nhảy tới mép dữ liệu         Ctrl+Home / End   Về A1 / ô cuối
   Ctrl+N / O / S, F12 Mới / Mở / Lưu / Lưu thành   F9                Tính lại
+  Ctrl+P              In / Xem trước khi in
+  Ctrl+PgUp / PgDn    Trang tính trước / sau       Alt+Enter         Xuống dòng trong ô
+  Ctrl+K              Chèn liên kết                Ctrl+F3           Trình Quản lý Tên
+  Ctrl+nhấp chuột     Chọn thêm vùng rời (định dạng, xóa, Ctrl+Enter cho tất cả các vùng)
 
 TỆP
   .xlsx mở được bằng Microsoft Excel (giữ công thức, định dạng, ô hợp nhất, định dạng có điều kiện,
   bộ lọc); .pyxl là định dạng riêng (JSON); .csv chỉ lưu giá trị của trang tính đang mở.
+  Tệp → Mở gần đây: 10 tệp mở gần nhất. PyExcel tự lưu bản khôi phục mỗi 5 phút khi có thay đổi chưa lưu
+  (Tệp → Lưu tự động bản khôi phục để đổi số phút); nếu máy tắt đột ngột, lần mở sau sẽ hỏi khôi phục.
+  Mỗi trang tính rộng như Excel: 1.048.576 hàng × 16.384 cột (A → XFD).
+
+THANH TIÊU ĐỀ VÀ RIBBON
+  • Thanh công cụ Truy nhập Nhanh ở góc trên bên trái: Lưu, Hoàn tác, Làm lại. Mũi tên ▾ cạnh Hoàn tác /
+    Làm lại mở danh sách các thao tác để hoàn tác nhiều bước một lần; nút ▾ cuối cùng để thêm hoặc bớt lệnh
+    (Mới, Mở, Xem trước khi In, Xuất PDF, Sắp xếp).
+  • Nút Tùy chọn Hiển thị Ribbon (bên trái nút thu nhỏ): Tự động ẩn Ribbon (bấm ⋯ để hiện), Hiện Tab,
+    Hiện Tab và Lệnh. Nhấp đúp vào một tab cũng ẩn/hiện các lệnh.
+  • Trên Windows: kéo thanh tiêu đề để di chuyển cửa sổ (thả ở mép trên màn hình để phóng to, ở mép trái /
+    phải để chiếm nửa màn hình), nhấp đúp để phóng to / khôi phục, kéo các cạnh cửa sổ để đổi kích thước.
+    Muốn dùng thanh tiêu đề của Windows: Tùy chọn Hiển thị Ribbon → Dùng thanh tiêu đề của Windows.
+  • Nhiều màn hình (Windows): PyExcel vẽ theo tỉ lệ (Scale) của màn hình đang đứng, kéo sang màn hình khác
+    là tự vẽ lại (chuyển mờ dần cho mượt) cho nét. Tắt ở Tùy chọn Hiển thị Ribbon → Vẽ theo tỉ lệ của từng
+    màn hình (cần mở lại).
+
+TỆP CSV / VĂN BẢN
+  • Mở tệp .csv tự nhận bảng mã như Excel: UTF-8 (có hoặc không có BOM), UTF-16 ("Văn bản Unicode"),
+    còn lại là bảng mã ANSI của Windows (Shift-JIS trên Windows tiếng Nhật...) - Windows-1258 khi tệp là
+    tiếng Việt. Dấu thanh viết tách rời (kiểu "Unicode tổ hợp" / Windows-1258) được ghép lại.
+  • Tự nhận dấu phân cách (phẩy, chấm phẩy, Tab, |); tệp dùng dấu chấm phẩy với số kiểu 1.234,5 được đọc
+    thành số. Thanh trạng thái cho biết bảng mã và dấu phân cách đã dùng.
+  • Nếu chữ vẫn sai: Dữ liệu → Từ Văn bản/CSV để tự chọn bảng mã (kể cả TCVN3 / ABC và VNI của các
+    phông .Vn..., VNI-...), dấu phân cách và kiểu số, có xem trước; dữ liệu vào một trang tính mới.
+
+IN VÀ XUẤT PDF
+  • Tệp → In... (Ctrl+P): xem trước từng trang; chọn in trang tính hiện hành, cả sổ làm việc hoặc vùng chọn,
+    đổi hướng giấy, khổ giấy, lề, co giãn (vừa 1 trang / vừa chiều rộng) rồi bấm In hoặc Xuất PDF.
+  • Nút In tạo tệp PDF rồi gửi tới máy in mặc định qua chương trình đọc PDF của máy; nếu máy chưa có
+    chương trình in PDF trực tiếp, tệp PDF sẽ được mở để bạn bấm In trong đó.
+  • Tab Bố cục Trang: Lề, Hướng, Khổ giấy, Vùng in (in riêng vùng chọn), Ngắt trang (chèn phía trên / bên
+    trái ô đang chọn), In tiêu đề (hàng lặp lại ở đầu mỗi trang, ví dụ $1:$2), Co giãn, In đường lưới.
+  • Thiết lập Trang có thêm Đầu trang/Chân trang với mã &P số trang, &N tổng số trang, &D ngày, &T giờ,
+    &A tên trang tính, &F tên tệp (ví dụ "Trang &P / &N"). Đường nét đứt trên lưới cho biết chỗ ngắt trang.
+  • PDF dùng phông chữ TrueType có trên máy (nhúng phần cần dùng) nên giữ đúng tiếng Việt; biểu đồ, viền,
+    màu nền, thanh dữ liệu đều được in. Các thiết lập trang được lưu cùng tệp .xlsx / .pyxl.
+
+SAO CHÉP VÀ DÁN VỚI PHẦN MỀM KHÁC
+  • Ctrl+C đưa vùng chọn lên bộ nhớ tạm như Excel (Windows): chữ, bảng (HTML có cả định dạng số, RTF) và hình
+    vẽ (EMF, bitmap). Dán được vào Excel, Word, AutoCAD...; trong AutoCAD dùng Ctrl+V, hoặc lệnh PASTESPEC.
+  • Chép ô trong Excel rồi Ctrl+V trong PyExcel: giữ định dạng như khi dán trong Excel — phông, cỡ chữ, đậm,
+    nghiêng, gạch chân, màu chữ, màu tô, viền, căn lề, xuống dòng, xoay chữ, định dạng số, ô gộp, công thức
+    (tham chiếu tự đổi theo chỗ dán), ghi chú và liên kết. Bảng chép từ Google Sheets, LibreOffice hay trang
+    web cũng giữ định dạng. Công thức trỏ ra ngoài vùng đã chép (sang ô khác, trang tính khác, tệp khác) hoặc
+    dùng tên vùng PyExcel không có thì được dán thành giá trị Excel đang hiện. Dán vào chỗ trống (cột, hàng
+    còn cỡ mặc định) thì cột và hàng lấy luôn độ rộng, chiều cao như bên Excel.
+  • Sau khi dán, nút (Ctrl) cạnh góc vùng vừa dán (hoặc nhấn rồi thả riêng phím Ctrl) mở Tùy chọn dán như
+    Excel: giữ định dạng nguồn, chỉ công thức, không có viền, giữ độ rộng cột nguồn, chuyển vị, chỉ giá trị,
+    giá trị và định dạng số, chỉ định dạng. Các lựa chọn này cũng có ở nút Dán ▾ và Dán đặc biệt.
 """
 
 KEEP = object()
+
+FORMAT_NAMES = {"bold": "In đậm", "italic": "In nghiêng", "underline": "Gạch chân", "strike": "Gạch ngang",
+                "font": "Phông chữ", "size": "Cỡ phông", "fg": "Màu phông", "bg": "Màu tô", "num": "Định dạng số",
+                "align": "Căn lề", "valign": "Căn lề", "wrap": "Ngắt dòng", "indent": "Thụt lề",
+                "rotate": "Hướng chữ", "unlocked": "Khóa ô", **{k: "Viền" for k in fe.BORDER_KEYS}}
+
+
+def format_name(keys):
+    """What a change of these format keys is called in the Undo list: "In đậm", "Màu tô"... or "Định dạng ô"."""
+    names = {FORMAT_NAMES.get(k, "Định dạng ô") for k in keys}
+    return names.pop() if len(names) == 1 else "Định dạng ô"
+
+
+def undo_name(name):
+    """Name the undo step a command makes, as Excel's Undo list shows it ("Chèn hàng"); `name` may be a
+    function of the command's arguments. When a command runs another, the outer one names the step."""
+    def decorate(func):
+        @functools.wraps(func)
+        def command(self, *args, **kw):
+            if self._undo_name is not None:
+                return func(self, *args, **kw)
+            self._undo_name = name(self, *args, **kw) if callable(name) else name
+            try:
+                return func(self, *args, **kw)
+            finally:
+                self._undo_name = None
+        return command
+    return decorate
+
+
+def content_named(func):
+    """For a command whose undo step is named after what it changed (Nhập "abc" vào A1), even when another
+    command runs it - finishing a cell edit before a ribbon command, say."""
+    @functools.wraps(func)
+    def command(self, *args, **kw):
+        outer, self._undo_name = self._undo_name, None
+        try:
+            return func(self, *args, **kw)
+        finally:
+            self._undo_name = outer
+    return command
+
+
+class _Tagged:
+    """A canvas whose new items all get `tag`, so that layer can be replaced on its own."""
+
+    def __init__(self, canvas, tag):
+        self.canvas, self.tag = canvas, tag
+
+    def __getattr__(self, name):
+        attr = getattr(self.canvas, name)
+        if name.startswith("create_"):
+            return lambda *args, **kw: attr(*args, tags=self.tag, **kw)
+        return attr
+
+
+class UndoStep(tuple):
+    """An undo (or redo) stack entry - ("cells", changes, selection) or ("snap", before, after, selection) -
+    and the name the Undo list shows for it."""
+    name = ""
 
 
 def normalize_text(text):
@@ -185,7 +497,62 @@ class ChangeSet:
         return [(key, *item) for key, item in self.items.items() if item[0] != item[1] or item[2] != item[3]]
 
 
-class SpreadsheetApp:
+class _CopiedBlock(clipcells.Block):
+    """The cells PyExcel itself copied (SpreadsheetApp.clip) as a Block: as typed, formulas moving with
+    where they are pasted (not when cut: moved formulas keep pointing where they did)."""
+
+    def __init__(self, clip):
+        rows = clip["cells"]
+        super().__init__(len(rows), len(rows[0]))
+        self.source, self.moving = "PyExcel", clip["cut"]
+        r0, c0 = clip["rect"][:2]
+        self.typed, self.origin = {}, {}
+        for i, row in enumerate(rows):
+            for j, (raw, fmt) in enumerate(row):
+                self.origin[(i, j)] = (r0 + i, c0 + j)
+                if raw is not None:
+                    self.typed[(i, j)] = raw
+                if fmt:
+                    self.formats[(i, j)] = fmt
+                if clip["values"][i][j] is not None:
+                    self.values[(i, j)] = clip["values"][i][j]
+        self.merges = list(clip.get("merges", ()))
+        self.col_widths = dict(enumerate(clip.get("widths", ())))
+
+    def raw(self, i, j, row, col, names=()):
+        raw = self.typed.get((i, j))
+        if raw and not self.moving:
+            src_r, src_c = self.origin[(i, j)]
+            return fe.shift_formula(raw, row - src_r, col - src_c)
+        return raw
+
+    def empty(self, i, j):
+        return (i, j) not in self.typed
+
+
+PASTE_OPTIONS = (  # the Paste Options button's menu: (heading or None, label, paste() arguments)
+    ("Dán", "Dán (giữ định dạng nguồn)", {}), (None, "Công thức", {"mode": "formulas"}),
+    (None, "Không có viền", {"mode": "no_borders"}), (None, "Giữ độ rộng cột nguồn", {"widths": True}),
+    (None, "Chuyển vị", {"transpose": True}),
+    ("Dán giá trị", "Giá trị", {"mode": "values"}), (None, "Giá trị và định dạng số", {"mode": "values_num"}),
+    ("Tùy chọn dán khác", "Định dạng", {"mode": "formats"}),
+)
+
+
+def _icon_pdf_import(cv, P, k, c):
+    """A PDF page going into a sheet."""
+    cv.create_polygon(*P(1, 1, 7, 1, 9, 3, 9, 11, 1, 11), fill="#ffffff", outline="#7f7f7f")
+    cv.create_rectangle(*P(0, 6, 7, 9.5), fill="#c00000", outline="")
+    cv.create_text(*P(3.5, 7.8), text="PDF", fill="#ffffff", font=("Segoe UI", -max(5, round(3.2 * k)), "bold"))
+    cv.create_rectangle(*P(8, 7, 15, 15), fill="#ffffff", outline="#217346")
+    for v in (9.7, 11.3, 13.0):
+        cv.create_line(*P(8, v + 0.3, 15, v + 0.3), fill="#217346")
+    cv.create_line(*P(11.5, 7, 11.5, 15), fill="#217346")
+    cv.create_line(*P(5, 12, 5, 14.5, 7.5, 14.5), fill="#217346", width=max(1, round(1.2 * k)), arrow="last",
+                   arrowshape=(3 * k, 3 * k, 1.2 * k))
+
+
+class SpreadsheetApp(drawing.DrawingTools):
     def __init__(self, root, path=None):
         self.root = root
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
@@ -196,8 +563,20 @@ class SpreadsheetApp:
         self.dirty = False
         self.top = self.left = 0       # first visible row / column
         self.cur = self.ext = (0, 0)   # active cell and the moving corner of the selection
+        self.areas = []                # more selected blocks (Ctrl+click, Go To Special), besides cur/ext
         self.views = {}                # sheet -> (top, left, cur, ext)
-        self.undo_stack, self.redo_stack = [], []
+        self.undo_stack, self.redo_stack = [], []  # UndoStep entries
+        self._undo_name = None         # name of the undo step the running command makes (see undo_name)
+        self.qat_buttons = {}          # key -> Quick Access Toolbar button
+        self.ribbon_mode = "full"      # "full", "tabs" (tabs only) or "auto" (auto-hide)
+        self._quitting = False
+        self.per_monitor_dpi = False   # drawn at each monitor's own scale (main() turns it on, Windows only)
+        self.edit_serial = 0           # counts changes, for caches of derived data
+        self._stats_key = self._stats_job = self._autosave_thread = None
+        self.settings = session.Settings()
+        self.recovery = session.Recovery(self.settings.folder)
+        self._font_library, self._layout_cache = None, (None, None)
+        self.breaks_shown = set()      # sheets showing page-break lines (after a print preview)
         self.clip = None
         self.editor = None
         self.edit_var = tk.StringVar(root)
@@ -209,26 +588,50 @@ class SpreadsheetApp:
         self.painter = None            # formats picked up by the Format Painter
         self.show_grid = self.show_headings = True
         self.show_formulas = False
+        self.show_notes = False        # every note shown, not just the one under the pointer
+        self.hover_note = None         # (sheet, row, col) of the note shown under the pointer
+        self._list_button = None       # canvas box of the active cell's validation-list arrow
+        self.paste_info = None         # the last paste, for its Paste Options button (see _paste_options_shown)
+        self._paste_button = None      # canvas box of that button
+        self._lone_ctrl = False        # Ctrl pressed alone (letting go of it opens the Paste Options)
+        self.chart_sel = None          # index of the selected chart, picture or shape on this sheet
+        self._init_drawing()
+        self.show_pivot_fields = True  # the PivotTable Fields pane appears in a pivot report
+        self._pane_key = None          # (sheet, pivot id, layout) the pane shows
+        self._chart_boxes = []         # [(index, canvas box)] of the charts drawn
         self.last_fill, self.last_fg = "#ffff00", "#ff0000"
         self.border_style, self.border_color, self.last_border = "thin", "#000000", "bottom"
         self.vis_rows, self.vis_cols = [], []
+        self._scroll_rows = 0
         self._filter_buttons = []
+        self._outline_buttons = []
         self._autoscroll_job = None
         self._last_mouse = (0, 0)
         self._cursor = ""
         self._v_total = self._h_total = 1
         self._ribbon_level = 0
+        self._refresh_job, self._pending = None, (False, False)  # see request_refresh
+        self._frame = None             # what the last full redraw drew (see redraw_selection)
+        self._runs_key = self._runs = None  # hidden rows as runs (see shown_rows)
+        self._drawn_refs = None        # references of the formula being typed, as last outlined
         self._ribbon_widths = {}
         self._zoom_busy = False
         self.find_win = None
-        self.fonts, self._widths, self._tints, self._images = {}, {}, {}, []
+        self.fonts, self._char_widths, self._tints, self._images = {}, {}, {}, []
+        self._line_spaces = {}
         self.commands = []  # (label, callable) for the "tell me" search
+        self.command_icons = {}  # label -> icon of the ribbon button it came from
 
         families = set(tkfont.families(root))
         self.font_families = sorted(f for f in families if not f.startswith("@"))
         self.default_family = "Calibri" if "Calibri" in families else "Arial"
         self.ui_family = "Segoe UI" if "Segoe UI" in families else "Arial"
         self._init_metrics()
+        self.menu_icons = MenuIcons(root, self.scale, os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons"))
+        self.pictures = images.PictureCache(root)
+        self._link_click = self._link_tip = self._link_tip_job = self._link_hover = None
+        root.tk.eval("proc pyexcel_create_items {canvas items} {"
+                     " foreach {kind coords options} $items {$canvas create $kind {*}$coords {*}$options} }")
         self._build_styles()
         self._build_ribbon()
         self._build_formula_bar()
@@ -240,10 +643,19 @@ class SpreadsheetApp:
         self.edit_var.trace_add("write", self._on_edit_text)
         self.fx_var.trace_add("write", self._on_fx_text)
         root.protocol("WM_DELETE_WINDOW", self.quit)
+        self._monitor_job, self._rescaled_at = None, 0
+        root.bind("<Configure>", self._on_window_configure, add="+")
+        self._set_ribbon_mode(self.settings.ribbon, save=False)
+        if self.titlebar.custom:
+            root.bind("<Alt-F4>", lambda e: self.quit())
+            root.bind("<<WindowShown>>", lambda e: self.canvas.focus_force())
         if path:
             self.open_path(path)
         self.refresh_all()
         self.canvas.focus_set()
+        self.recovery.beat(path=self.path)
+        root.after(1200, self._offer_recovery)
+        root.after(60_000, self._autosave_tick)
 
     @property
     def sh(self):
@@ -251,18 +663,163 @@ class SpreadsheetApp:
 
     # ------------------------------------------------------------------ metrics and fonts
 
+    # ------------------------------------------------------------------ monitors with another scale
+
+    def _on_window_configure(self, e):
+        if e.widget is self.root and self.per_monitor_dpi:  # the window moved or changed size
+            if self._monitor_job is not None:
+                self.root.after_cancel(self._monitor_job)
+            self._monitor_job = self.root.after(300, self._check_monitor_scale)
+
+    def _check_monitor_scale(self):
+        """After the window settled on a monitor whose scale differs from the one PyExcel is drawn for,
+        draw it again at that scale (Windows no longer stretches PyExcel's picture, see follow_monitor_dpi)."""
+        self._monitor_job = None
+        if self.titlebar.busy() or self.drag:
+            self._monitor_job = self.root.after(300, self._check_monitor_scale)
+            return
+        scale = screens.monitor_scale(self.root)
+        if scale and abs(scale - self.scale) > 0.01 and time.time() - self._rescaled_at > 2:
+            self._rescaled_at = time.time()  # (a window resized on a monitor's edge must not flip back and forth)
+            self.rescale(scale)
+
+    def rescale(self, scale):
+        """Build the window's contents again at another scale, keeping the window's physical size: text,
+        icons, ribbon, bars and the sheet. The workbook, selection, undo and settings carry on. A picture of
+        the window as it was covers it meanwhile and then fades into the new one (Windows)."""
+        self.commit_edit()
+        cover = self._cover_window()
+        try:
+            self._rebuild_at(scale)
+        finally:
+            if cover is not None:
+                self.root.update()
+                self._fade_cover(cover, time.perf_counter())
+
+    def _cover_window(self, image=None):
+        """A borderless window on top of PyExcel's showing what PyExcel showed (or `image`, PPM data): the
+        rebuilding behind it is not seen. None where the screen can't be read."""
+        root = self.root
+        x, y, w, h = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
+        image = image or screens.grab_screen(x, y, w, h)
+        if not image:
+            return None
+        try:
+            cover = tk.Toplevel(root)
+            cover.overrideredirect(True)
+            cover.attributes("-topmost", True)
+            cover.geometry(f"{w}x{h}+{x}+{y}")
+            cover.picture = tk.PhotoImage(master=cover, data=image, format="ppm")
+            tk.Label(cover, image=cover.picture, bd=0, highlightthickness=0).pack(fill="both", expand=True)
+            cover.update()
+        except tk.TclError:
+            return None
+        return cover
+
+    def _fade_cover(self, cover, start, length=0.22):
+        """Fade the cover out (easing out) and remove it."""
+        t = (time.perf_counter() - start) / length
+        try:
+            if t >= 1:
+                cover.destroy()
+                return
+            cover.attributes("-alpha", (1 - t) ** 2)
+        except tk.TclError:
+            return
+        self.root.after(15, self._fade_cover, cover, start, length)
+
+    def _rebuild_at(self, scale):
+        old, root = self.scale, self.root
+        tab, mode = self.ribbon.current, self.ribbon_mode
+        shown = {"grid": self.grid_var.get(), "headings": self.headings_var.get(), "fxbar": self.fxbar_var.get()}
+        maximized = self.titlebar.maximized if self.titlebar.custom else root.state() == "zoomed"
+        self._hide_ribbon_peek()
+        for job in ("_refresh_job", "_stats_job", "_autoscroll_job"):
+            if getattr(self, job) is not None:
+                root.after_cancel(getattr(self, job))
+                setattr(self, job, None)
+        for widget in root.winfo_children():
+            if not isinstance(widget, tk.Toplevel) and widget is not self.titlebar:
+                widget.destroy()
+        titlebar = self.titlebar
+        self.scale = scale
+        root.tk.call("tk", "scaling", scale * 96 / 72)
+        self._init_metrics()
+        self.menu_icons = MenuIcons(root, scale, os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons"))
+        self.commands, self.command_icons, self._ribbon_widths, self._ribbon_level = [], {}, {}, 0
+        self._frame = self._pane_key = self._list_button = self._drawn_refs = None
+        self._build_styles()
+        self._build_ribbon()  # a new title bar too, taking over the old one's state
+        titlebar.destroy()
+        self._build_formula_bar()
+        self._build_status_bar()
+        self._build_sheet_bar()
+        self._build_grid()
+        self._build_context_menus()
+        self._bind_keys()
+        self.fx_var.trace_add("write", self._on_fx_text)
+        self._set_ribbon_mode(mode, save=False)
+        if tab in self.ribbon.pages:
+            self.ribbon.select(tab)
+        self.grid_var.set(shown["grid"])
+        self.headings_var.set(shown["headings"])
+        self.fxbar_var.set(shown["fxbar"])
+        if not shown["fxbar"]:
+            self.toggle_formula_bar()
+        self._zoom_busy = True
+        self.zoom_var.set(self.zoom * 100)
+        self._zoom_busy = False
+        self.zoom_label.config(text=f"{round(self.zoom * 100)}%")
+        if maximized:
+            if self.titlebar.custom and not self.titlebar.native:  # (Windows keeps a maximised window so itself)
+                x, y, w, h = screens.work_area(root)
+                root.geometry(f"{w}x{h}+{x}+{y}")
+        else:  # the same size on the new monitor as on the old one
+            w, h = root.winfo_width(), root.winfo_height()
+            root.geometry(f"{round(w * scale / old)}x{round(h * scale / old)}")
+        self.refresh_all()
+        self.canvas.focus_set()
+
     def _init_metrics(self):
         """Pixel sizes for the current DPI and zoom."""
         self.px = self.scale * self.zoom
         self.fonts.clear()
-        self._widths.clear()
+        self._char_widths.clear()
+        self._line_spaces.clear()
         size = -max(6, round(12 * self.px))
         self.header_font = tkfont.Font(root=self.root, family=self.ui_family, size=size)
         self.header_bold = tkfont.Font(root=self.root, family=self.ui_family, size=size, weight="bold")
-        self.header_h = round(fe.DEFAULT_ROW_HEIGHT * self.px) if self.show_headings else 0
-        self.header_w = self.header_font.measure("100000") + round(8 * self.px) if self.show_headings else 0
+        self._head_h0 = round(fe.DEFAULT_ROW_HEIGHT * self.px) if self.show_headings else 0
+        # row numbers take 3/5 of the room six digits need; the column widens when the rows in view have
+        # longer numbers (as in Excel)
+        self._digit_w = self.header_font.measure("0")
+        self._head_w0 = round((self.header_font.measure("100000") + round(8 * self.px)) * 3 / 5) \
+            if self.show_headings else 0
         self.pad = max(1, round(3 * self.px))
         self.default_row_px = max(1, round(fe.DEFAULT_ROW_HEIGHT * self.px))
+        self._outline_metrics()
+
+    def _outline_metrics(self):
+        """Room for the outline symbols left of the row headings and above the column headings."""
+        sh = self.wb.sheets.get(self.sheet)
+        rows = max(sh.row_levels.values(), default=0) if sh else 0
+        cols = max(sh.col_levels.values(), default=0) if sh else 0
+        self.outline_step = round(16 * self.scale)
+        self.outline_w = (rows + 1) * self.outline_step + 2 if rows else 0
+        self.outline_h = (cols + 1) * self.outline_step + 2 if cols else 0
+        self.header_w = max(self._row_heading_w(), self.outline_step if cols else 0) + self.outline_w
+        self.header_h = max(self._head_h0, self.outline_step if rows else 0) + self.outline_h
+
+    def _row_heading_w(self):
+        """Width of the row numbers: wide enough for the longest number among the rows in view."""
+        if not self.show_headings:
+            return 0
+        try:
+            height = self.canvas.winfo_height()
+            last = self.rows_from(self.top, max(1, height // max(1, self.default_row_px)) + 1)
+        except (AttributeError, KeyError, tk.TclError):  # (while the window is being built or rebuilt)
+            last = 0
+        return max(self._head_w0, len(str(last + 1)) * self._digit_w + round(8 * self.px))
 
     def font_for(self, fmt):
         fmt = fmt or {}
@@ -277,28 +834,39 @@ class SpreadsheetApp:
                 underline=key[4], overstrike=key[5])
         return font
 
-    def text_width(self, font, text):
-        key = (font.name, text)
-        width = self._widths.get(key)
-        if width is None:
-            if len(self._widths) > 20000:
-                self._widths.clear()
-            width = self._widths[key] = font.measure(text)
-        return width
+    def line_space(self, font):
+        """A font's line height (asked of Tk once per font)."""
+        space = self._line_spaces.get(font.name)
+        if space is None:
+            space = self._line_spaces[font.name] = font.metrics("linespace")
+        return space
 
-    def clip_text(self, text, font, width):
+    def text_width(self, font, text):
+        """Pixel width of `text`: the sum of its characters' widths, each asked of Tk once per font (Tk is
+        slow to measure, above all characters it takes from a fallback font, such as Japanese, and new
+        texts come into view with every scroll)."""
+        chars = self._char_widths.get(font.name)
+        if chars is None:
+            chars = self._char_widths[font.name] = {}
+        try:
+            return sum(map(chars.__getitem__, text))
+        except KeyError:
+            for ch in set(text).difference(chars):
+                chars[ch] = font.measure(ch)
+            return sum(map(chars.__getitem__, text))
+
+    def clip_text(self, text, font, width, tail=False):
+        """The start (with tail, the end: right-aligned text) of `text` that fits `width` pixels."""
         if width <= 0:
             return ""
         if self.text_width(font, text) <= width:
             return text
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if font.measure(text[:mid]) <= width:
-                lo = mid
-            else:
-                hi = mid - 1
-        return text[:lo]
+        chars, total = self._char_widths[font.name], 0
+        for i, ch in enumerate(reversed(text) if tail else text):
+            total += chars[ch]
+            if total > width:
+                return text[len(text) - i:] if tail else text[:i]
+        return text
 
     def wrap_lines(self, text, font, width):
         """Word-wrap text to a pixel width (long words are broken)."""
@@ -347,22 +915,30 @@ class SpreadsheetApp:
         style = ttk.Style(self.root)
         style.configure("Ribbon.TCheckbutton", background=RIBBON_BG)
 
+    def _menu_image(self, label, icon=None):
+        """image/compound options showing the entry's picture (by MENU_ICONS unless `icon` is given)."""
+        image = self.menu_icons.get(icon or MENU_ICONS.get(label.rstrip(". ")))
+        return {"image": image, "compound": "left"} if image is not None else {}
+
     def _make_menu(self, items, parent=None):
-        """tk.Menu from [(label, command[, accelerator]) | (label, [sub items]) | (label, None) | None]."""
+        """tk.Menu from [(label, command[, accelerator[, icon]]) | (label, [sub items]) | (label, None) | None].
+
+        Entries get the picture MENU_ICONS gives their label, or the icon named in the item."""
         menu = tk.Menu(parent or self.root, tearoff=0)
         for item in items:
             if item is None:
                 menu.add_separator()
                 continue
             label, target = item[0], item[1]
+            image = self._menu_image(label, item[3] if len(item) > 3 else None)
             if isinstance(target, list):
-                menu.add_cascade(label=label, menu=self._make_menu(target, menu))
+                menu.add_cascade(label=label, menu=self._make_menu(target, menu), **image)
             elif isinstance(target, tuple):  # ("palette", on_pick, none_label): colour submenu
-                menu.add_cascade(label=label, menu=self._palette_menu(menu, target[1], target[2]))
+                menu.add_cascade(label=label, menu=self._palette_menu(menu, target[1], target[2]), **image)
             elif target is None:
                 menu.add_command(label=label, state="disabled")
             else:
-                menu.add_command(label=label, command=target, accelerator=item[2] if len(item) > 2 else "")
+                menu.add_command(label=label, command=target, accelerator=item[2] if len(item) > 2 else "", **image)
                 self.commands.append((label.rstrip(". "), target))
         return menu
 
@@ -399,33 +975,232 @@ class SpreadsheetApp:
         name = label or kw.get("text", "").replace("\n", " ") or (kw.get("tooltip") or "").split(" (")[0]
         if kw.get("command") and name:
             self.commands.append((name.split("\n")[0], kw["command"]))
+            self.command_icons.setdefault(name.split("\n")[0], kw.get("icon"))
         if large:
             return group.large(**kw)
         return group.small(parent, side=side, **kw)
 
     def _build_ribbon(self):
         ui = self.ui = RibbonStyle(self.root, self.scale)
+        old = getattr(self, "titlebar", None)
+        tb = self.titlebar = TitleBar(self.root, ui, old.custom if old else self.settings.custom_title_bar, self.quit,
+                                      old.window_state() if old and old.custom else None)
+        self._build_qat()
+        self.ribbon_more = GlyphButton(tb.tools, ui, "more", lambda b: self._peek_ribbon(), "Hiện Ribbon",
+                                       width=ui.px(30))
+        self.ribbon_options = GlyphButton(tb.tools, ui, "ribbon", self._ribbon_options, "Tùy chọn Hiển thị Ribbon",
+                                          width=ui.px(30))
+        self.ribbon_options.pack(side="left")
         rb = self.ribbon = Ribbon(self.root, ui)
         rb.pack(side="top", fill="x")
-        for icon, command, tip in (("save", self.save_file, "Lưu (Ctrl+S)"), ("undo", self.undo, "Hoàn tác (Ctrl+Z)"),
-                                   ("redo", self.redo, "Làm lại (Ctrl+Y)")):
-            RibbonButton(rb.qat, ui, icon=icon, command=command, tooltip=tip, color="#ffffff", bg=TAB_BAR_BG,
-                         hover_bg=TAB_HOVER_BG).pack(side="left")
+        rb.on_toggle = self._ribbon_toggled
+        rb.bar.bind("<Configure>", lambda e: tb.set_band(0 if self.ribbon_mode == "auto" else e.height), add="+")
         self.file_menu = self._make_menu([
-            ("Mới", self.new_file, "Ctrl+N"), ("Mở...", self.open_file, "Ctrl+O"), None,
+            ("Mới", self.new_file, "Ctrl+N"), ("Mở...", self.open_file, "Ctrl+O"), ("Mở gần đây", []), None,
             ("Lưu", self.save_file, "Ctrl+S"), ("Lưu thành...", self.save_as, "F12"), None,
+            ("In...", self.print_preview, "Ctrl+P"), ("Xuất PDF...", self.export_pdf),
+            ("Thiết lập Trang...", self.page_setup_dialog), None,
+            ("Lưu tự động bản khôi phục...", self.autosave_options), None,
             ("Thoát", self.quit)])
+        self.recent_menu = tk.Menu(self.file_menu, tearoff=0, postcommand=self._fill_recent_menu)
+        self.file_menu.entryconfigure(self.file_menu.index("Mở gần đây"), menu=self.recent_menu)
         rb.add_tab("Tệp", command=lambda label: self.file_menu.tk_popup(
             label.winfo_rootx(), label.winfo_rooty() + label.winfo_height()))
         self._build_home(rb.add_tab("Trang chủ"))
         self._build_insert_tab(rb.add_tab("Chèn"))
+        self._build_diagram_tab(rb.add_tab("Sơ đồ"))
+        self._build_page_layout_tab(rb.add_tab("Bố cục Trang"))
         self._build_formulas_tab(rb.add_tab("Công thức"))
         self._build_data_tab(rb.add_tab("Dữ liệu"))
+        self._build_review_tab(rb.add_tab("Xem lại"))
         self._build_view_tab(rb.add_tab("Xem"))
+        self._build_tools_tab(rb.add_tab("Tiện ích"))
         self._build_help_tab(rb.add_tab("Trợ giúp"))
         rb.select("Trang chủ")
         self._build_tell_me(rb.extra)
         rb.body.bind("<Configure>", self._fit_ribbon, add="+")
+        rb.on_select = lambda name: self.root.after_idle(self._fit_ribbon)
+
+    # ------------------------------------------------------------------ title bar: toolbar and ribbon options
+
+    def _build_qat(self):
+        """The Quick Access Toolbar on the title bar: the commands chosen in its menu, then that menu's button."""
+        for widget in self.titlebar.qat.winfo_children():
+            widget.destroy()
+        commands = {"new": self.new_file, "open": self.open_file, "save": self.save_file, "print": self.print_preview,
+                    "pdf": self.export_pdf, "undo": self.undo, "redo": self.redo, "sort_az": self.sort_selection,
+                    "sort_za": lambda: self.sort_selection(True)}
+        lists = {"undo": self._undo_list, "redo": self._redo_list}
+        chosen = set(self.settings.qat)
+        self.qat_buttons = {}
+        for key, _, icon, tip in QAT_COMMANDS:
+            if key in chosen:
+                button = self.qat_buttons[key] = RibbonButton(
+                    self.titlebar.qat, self.ui, icon=icon, command=commands[key], menu=lists.get(key),
+                    split=key in lists, tooltip=tip, color="#ffffff", disabled_color=QAT_DISABLED, bg=TAB_BAR_BG,
+                    hover_bg=TAB_HOVER_BG, pressed_bg=CAPTION_PRESSED, height=self.ui.px(BAR_HEIGHT))
+                button.pack(side="left")
+        GlyphButton(self.titlebar.qat, self.ui, "customize", self._qat_menu,
+                    "Tùy chỉnh Thanh công cụ Truy nhập Nhanh", width=self.ui.px(18)).pack(side="left")
+        self.titlebar.buttons_changed()
+        self._update_undo_buttons()
+
+    def _qat_menu(self, button):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Tùy chỉnh Thanh công cụ Truy nhập Nhanh", state="disabled")
+        chosen = set(self.settings.qat)
+        menu.vars = []  # the menu keeps its check marks' variables alive
+        for key, name, _, _ in QAT_COMMANDS:
+            var = tk.BooleanVar(menu, value=key in chosen)
+            menu.vars.append(var)
+            menu.add_checkbutton(label=name, variable=var, command=lambda k=key: self._toggle_qat(k))
+        menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        menu.grab_release()
+
+    def _toggle_qat(self, key):
+        chosen = set(self.settings.qat) ^ {key}
+        self.settings.qat = [k for k, *_ in QAT_COMMANDS if k in chosen]
+        self._build_qat()
+
+    def _update_undo_buttons(self):
+        """The toolbar's Undo / Redo: greyed out when there is nothing to undo / redo, else saying what."""
+        for key, stack, verb, keys in (("undo", self.undo_stack, "Hoàn tác", "Ctrl+Z"),
+                                       ("redo", self.redo_stack, "Làm lại", "Ctrl+Y")):
+            button = self.qat_buttons.get(key)
+            if button:
+                button.set_enabled(bool(stack))
+                button.set_tooltip(f"{verb} {stack[-1].name} ({keys})" if stack else f"Không thể {verb}")
+
+    def _undo_list(self, button):
+        self._history_popup(button, self.undo_stack, "Hoàn tác", self.undo)
+
+    def _redo_list(self, button):
+        self._history_popup(button, self.redo_stack, "Làm lại", self.redo)
+
+    def _history_popup(self, button, stack, verb, run):
+        """Excel's list under the Undo / Redo arrow: latest change first; pointing at one marks it and all
+        above it, and a click undoes (or redoes) them together."""
+        self.commit_edit()
+        if not stack:
+            return
+        names = [step.name for step in reversed(stack)]
+        pop = Popup(self.root, button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        rows = min(len(names), 16)
+        frame = tk.Frame(pop.inner, bg="#ffffff")
+        frame.pack(fill="both", expand=True)
+        box = tk.Listbox(frame, height=rows, width=max(26, min(50, max(map(len, names)) + 2)), font=self.ui.font,
+                         activestyle="none", relief="flat", bd=0, highlightthickness=0, selectmode="multiple",
+                         selectbackground=HISTORY_SELECT, selectforeground="#000000", exportselection=False)
+        box.insert("end", *names)
+        box.pack(side="left", fill="both", expand=True, padx=(self.ui.px(2), 0), pady=self.ui.px(2))
+        if len(names) > rows:
+            bar = ttk.Scrollbar(frame, orient="vertical", command=box.yview)
+            bar.pack(side="right", fill="y")
+            box.config(yscrollcommand=bar.set)
+        footer = tk.Label(pop.inner, bg="#f3f3f3", fg="#444444", font=self.ui.small_font, pady=self.ui.px(3))
+        footer.pack(fill="x")
+        count = [1]
+
+        def mark(n):
+            count[0] = n = max(1, min(n, len(names)))
+            box.selection_clear(0, "end")
+            box.selection_set(0, n - 1)
+            box.see(n - 1)
+            footer.config(text=f"{verb} {n} thao tác")
+
+        def pick(e=None):
+            pop.close()
+            run(count[0])
+        box.bind("<Motion>", lambda e: mark(box.nearest(e.y) + 1))
+        box.bind("<ButtonRelease-1>", lambda e: (mark(box.nearest(e.y) + 1), pick()))
+        pop.bind("<Down>", lambda e: mark(count[0] + 1))
+        pop.bind("<Up>", lambda e: mark(count[0] - 1))
+        pop.bind("<Return>", pick)
+        mark(1)
+        pop.show()
+
+    def _ribbon_options(self, button):
+        """Ribbon Display Options: auto-hide the ribbon, tabs only, or tabs and commands."""
+        pop = Popup(self.root, button.winfo_rootx() + button.winfo_width(), button.winfo_rooty() + button.winfo_height())
+        bold = tkfont.Font(font=self.ui.font)
+        bold.configure(weight="bold")
+        pop.bold = bold  # keep the font while the popup is open
+
+        def item(title, text, checked, command):
+            row = tk.Frame(pop.inner, bg="#ffffff", cursor="hand2")
+            row.pack(fill="x")
+            mark = tk.Label(row, text="✓" if checked else "", width=2, font=self.ui.font, bg="#ffffff", fg=ACCENT)
+            mark.pack(side="left", padx=(self.ui.px(6), 0))
+            body = tk.Frame(row, bg="#ffffff")
+            body.pack(side="left", fill="x", padx=(self.ui.px(2), self.ui.px(14)), pady=self.ui.px(5))
+            tk.Label(body, text=title, font=bold, bg="#ffffff", fg="#262626").pack(anchor="w")
+            tk.Label(body, text=text, font=self.ui.small_font, bg="#ffffff", fg="#666666").pack(anchor="w")
+            parts = [row, mark, body] + body.winfo_children()
+
+            def paint(color):
+                for widget in parts:
+                    widget.config(bg=color)
+            for widget in parts:
+                widget.bind("<Enter>", lambda e: paint("#e5e5e5"))
+                widget.bind("<Leave>", lambda e: paint("#ffffff"))
+                widget.bind("<ButtonRelease-1>", lambda e: (pop.close(), command()))
+        for mode, title, text in RIBBON_MODE_ITEMS:
+            item(title, text, mode == self.ribbon_mode, lambda m=mode: self._set_ribbon_mode(m))
+        if sys.platform == "win32":
+            tk.Frame(pop.inner, bg="#d4d4d4", height=1).pack(fill="x", pady=self.ui.px(2))
+            custom = self.settings.custom_title_bar
+
+            def switch():
+                self.settings.custom_title_bar = not custom
+                messagebox.showinfo(APP_NAME, "Thay đổi có hiệu lực khi mở lại PyExcel.", parent=self.root)
+            item("Dùng thanh tiêu đề của Windows",
+                 "Thay cho thanh tiêu đề kiểu Excel của PyExcel (có hiệu lực khi mở lại).", not custom, switch)
+            per_monitor = self.settings.per_monitor_dpi
+
+            def switch_dpi():
+                self.settings.per_monitor_dpi = not per_monitor
+                messagebox.showinfo(APP_NAME, "Thay đổi có hiệu lực khi mở lại PyExcel.", parent=self.root)
+            item("Vẽ theo tỉ lệ của từng màn hình",
+                 "Sắc nét và mượt trên màn hình phụ có tỉ lệ (Scale) khác (có hiệu lực khi mở lại).", per_monitor,
+                 switch_dpi)
+        pop.show(right=True)
+
+    def _set_ribbon_mode(self, mode, save=True):
+        rb = self.ribbon
+        self._hide_ribbon_peek()
+        self.ribbon_mode = mode
+        if mode == "auto":
+            if rb.collapsed:  # shown on demand with its commands
+                rb.toggle_collapse()
+            rb.pack_forget()
+            self.ribbon_more.pack(side="left", before=self.ribbon_options)
+            self.titlebar.set_band(0)
+        else:
+            self.ribbon_more.pack_forget()
+            rb.pack(side="top", fill="x", before=self.formula_bar)
+            if rb.collapsed != (mode == "tabs"):
+                rb.toggle_collapse()
+            self.titlebar.set_band(rb.bar.winfo_height())
+        if save:
+            self.settings.ribbon = mode
+
+    def _ribbon_toggled(self, collapsed):
+        """A double-click on a tab hid or showed the commands."""
+        if self.ribbon_mode != "auto":
+            self.ribbon_mode = "tabs" if collapsed else "full"
+            self.settings.ribbon = self.ribbon_mode
+
+    def _peek_ribbon(self):
+        """Auto-hide: show the ribbon over the sheet until the sheet is clicked (or ⋯ again)."""
+        if self.ribbon.winfo_manager() == "place":
+            self._hide_ribbon_peek()
+        elif self.ribbon_mode == "auto":
+            self.ribbon.place(in_=self.root, x=0, y=self.titlebar.winfo_height(), relwidth=1)
+            self.ribbon.lift()
+
+    def _hide_ribbon_peek(self):
+        if self.ribbon.winfo_manager() == "place":
+            self.ribbon.place_forget()
 
     def _build_tell_me(self, parent):
         hint = "Cho tôi biết bạn muốn làm gì..."
@@ -464,7 +1239,8 @@ class SpreadsheetApp:
             return
         menu = tk.Menu(self.root, tearoff=0)
         for label, command in matches[:15]:
-            menu.add_command(label=label, command=lambda c=command: (self.canvas.focus_set(), c()))
+            menu.add_command(label=label, command=lambda c=command: (self.canvas.focus_set(), c()),
+                             **self._menu_image(label, self.command_icons.get(label)))
         menu.tk_popup(entry.winfo_rootx(), entry.winfo_rooty() + entry.winfo_height())
         menu.grab_release()
 
@@ -474,7 +1250,11 @@ class SpreadsheetApp:
         g = rb.group(page, "Bộ nhớ tạm")
         paste_menu = self._make_menu([
             ("Dán", self.paste, "Ctrl+V"), ("Dán công thức", lambda: self.paste(mode="formulas")),
-            ("Dán giá trị", lambda: self.paste(mode="values")), ("Dán định dạng", lambda: self.paste(mode="formats")),
+            ("Dán giá trị", lambda: self.paste(mode="values")),
+            ("Dán giá trị và định dạng số", lambda: self.paste(mode="values_num")),
+            ("Dán định dạng", lambda: self.paste(mode="formats")),
+            ("Dán không có viền", lambda: self.paste(mode="no_borders")),
+            ("Dán giữ độ rộng cột nguồn", lambda: self.paste(widths=True)),
             ("Dán chuyển vị", lambda: self.paste(transpose=True)), None, ("Dán đặc biệt...", self.paste_special)])
         self._btn(g, large=True, icon="paste", text="Dán", command=self.paste, menu=paste_menu, split=True,
                   tooltip="Dán (Ctrl+V)")
@@ -512,7 +1292,7 @@ class SpreadsheetApp:
                                        command=lambda: self.toggle_style("underline"), menu=underline_menu,
                                        split=True, tooltip="Gạch chân (Ctrl+U)")
         g.gap(row1)
-        self.btn_border = self._btn(g, row1, icon="borders", label="Viền",
+        self.btn_border = self._btn(g, row1, icon=f"border_{self.last_border}", label="Viền",
                                     command=lambda: self.apply_border(self.last_border),
                                     menu=self._border_menu(), split=True, tooltip="Viền")
         g.gap(row1)
@@ -599,9 +1379,12 @@ class SpreadsheetApp:
             ("Tự động khớp chiều cao hàng", self.autofit_selected_rows), ("Độ rộng cột...", self.ask_column_width),
             ("Tự động khớp độ rộng cột", self.autofit_selected_columns), None,
             ("HIỂN THỊ", None), ("Ẩn & Bỏ ẩn", [("Ẩn hàng", self.hide_rows, "Ctrl+9"), ("Ẩn cột", self.hide_cols, "Ctrl+0"),
-                                                ("Bỏ ẩn hàng", self.unhide_rows), ("Bỏ ẩn cột", self.unhide_cols)]),
+                                                ("Ẩn trang tính", self.hide_sheet, "", "sheet_hide"), None,
+                                                ("Bỏ ẩn hàng", self.unhide_rows), ("Bỏ ẩn cột", self.unhide_cols),
+                                                ("Bỏ ẩn trang tính...", self.unhide_sheet, "", "sheet_unhide")]),
             None, ("SẮP XẾP TRANG TÍNH", None), ("Đổi tên trang tính", lambda: self.rename_sheet(self.sheet)),
             ("Sao chép trang tính", self.copy_sheet), ("Màu tab", tab_colors), None,
+            ("BẢO VỆ", None), ("Bảo vệ Trang tính...", self.toggle_protection), ("Khóa ô", self.toggle_lock_cells),
             ("Định dạng ô...", lambda: self.format_cells_dialog(), "Ctrl+1")])
         self._btn(g, large=True, icon="insert_cells", text="Chèn", command=self.insert_smart, menu=insert_menu,
                   split=True, tooltip="Chèn ô, hàng, cột hoặc trang tính")
@@ -629,7 +1412,8 @@ class SpreadsheetApp:
                   tooltip="Sắp xếp và Lọc")
         self._btn(g, large=True, icon="find", text="Tìm và\nChọn", menu=self._make_menu([
             ("Tìm...", self.open_find, "Ctrl+F"), ("Thay thế...", lambda: self.open_find(True), "Ctrl+H"),
-            ("Đi tới...", self.focus_name_box, "Ctrl+G")]), tooltip="Tìm và Chọn")
+            ("Đi tới...", self.focus_name_box, "Ctrl+G"), ("Đi tới Đặc biệt...", self.go_to_special, "", "goto")]),
+                  tooltip="Tìm và Chọn")
         # labels dropped, level by level, when the window is too narrow for the whole tab
         level2 = [self.btn_wrap, self.btn_merge, self.btn_autosum, self.btn_fill_menu, self.btn_clear_menu]
         level3 = [w for w in self.btn_painter.master.winfo_children() if isinstance(w, RibbonButton)]
@@ -656,8 +1440,26 @@ class SpreadsheetApp:
 
     def _build_insert_tab(self, page):
         rb = self.ribbon
+        self._register_shape_icons()
         g = rb.group(page, "Bảng")
+        self._btn(g, large=True, icon="pivot", text="PivotTable\n", label="PivotTable", command=self.insert_pivot,
+                  tooltip="Chèn PivotTable\nTóm tắt dữ liệu: tổng, đếm, trung bình... theo hàng và cột")
         self._btn(g, large=True, icon="format_table", text="Bảng", menu=self._table_gallery, tooltip="Tạo bảng có định dạng")
+        g = rb.group(page, "Minh họa")
+        self._btn(g, large=True, icon="picture", text="Ảnh\n", command=self.insert_picture,
+                  tooltip="Chèn ảnh\nẢnh PNG, GIF, JPEG từ máy tính, đặt nổi trên các ô. Cũng có thể dán ảnh chụp "
+                          "màn hình bằng Ctrl+V")
+        self._btn(g, large=True, icon="shapes", text="Hình\ndạng", label="Hình dạng",
+                  menu=lambda b: self.shape_gallery(b, self.insert_shape),
+                  tooltip="Chèn hình dạng\nHình chữ nhật, hình tròn, mũi tên, đường nối, lưu đồ, chú thích...\n"
+                          "Chọn hình rồi kéo trên trang tính (giữ Shift để giữ tỉ lệ)")
+        self._btn(g, large=True, icon="shape_flowChartDecision", text="Sơ đồ\n", label="Vẽ sơ đồ",
+                  command=lambda: self.ribbon.select("Sơ đồ"),
+                  tooltip="Vẽ sơ đồ logic, lưu đồ\nMở tab Sơ đồ: hình lưu đồ, cổng logic, đường nối tự dính vào hình")
+        g = rb.group(page, "Văn bản")
+        self._btn(g, large=True, icon="shape_textBox", text="Hộp văn\nbản", label="Hộp văn bản",
+                  command=lambda: self.insert_shape("textBox"),
+                  tooltip="Hộp văn bản\nKéo trên trang tính để vẽ hộp rồi gõ chữ")
         g = rb.group(page, "Ô và trang tính")
         col = g.column()
         self._btn(g, col, side="top", icon="insert_row", text="Chèn hàng", command=self.insert_rows)
@@ -666,6 +1468,14 @@ class SpreadsheetApp:
         col = g.column()
         self._btn(g, col, side="top", icon="sheet", text="Chèn trang tính", command=self.add_sheet)
         self._btn(g, col, side="top", icon="copy", text="Sao chép trang tính", command=self.copy_sheet)
+        g = rb.group(page, "Biểu đồ")
+        for kind, text in (("column", "Cột"), ("bar", "Thanh"), ("line", "Đường"), ("pie", "Tròn")):
+            self._btn(g, large=True, icon="chart_" + kind, text=f"{text}\n", label=f"Biểu đồ {text.lower()}",
+                      command=lambda k=kind: self.insert_chart(k),
+                      tooltip=f"Chèn biểu đồ {text.lower()}\nVẽ từ vùng dữ liệu đang chọn")
+        g = rb.group(page, "Liên kết")
+        self._btn(g, large=True, icon="link", text="Liên\nkết", command=self.insert_hyperlink,
+                  tooltip="Chèn liên kết (Ctrl+K)\nTới trang web, tệp, một ô trong sổ làm việc hoặc email")
         g = rb.group(page, "Hàm")
         self._btn(g, large=True, icon="function", text="Chèn\nhàm", command=self.insert_function_dialog,
                   tooltip="Chèn hàm (Shift+F3)")
@@ -685,13 +1495,24 @@ class SpreadsheetApp:
                                         ("Nhỏ nhất", lambda: self.autosum("MIN"))]), split=True)
         labels = {"Toán học & Lượng giác": "Toán học &\nLượng giác", "Thống kê": "Thống\nkê", "Logic": "Logic\n",
                   "Văn bản": "Văn\nbản", "Ngày & Giờ": "Ngày &\nGiờ", "Tra cứu & Tham chiếu": "Tra cứu &\nTham chiếu",
-                  "Thông tin": "Thông\ntin"}
+                  "Thông tin": "Thông\ntin", "Mảng động": "Mảng\nđộng", "LAMBDA": "LAMBDA\n"}
         for cat in CATEGORIES:
             names = sorted(n for n, info in FUNCTION_INFO.items() if info[0] == cat)
             menu = tk.Menu(self.root, tearoff=0)
             for n in names:
                 menu.add_command(label=n, command=lambda n=n: self.insert_function(n))
             self._btn(g, large=True, icon="book", text=labels[cat], menu=menu, tooltip=cat)
+        g = rb.group(page, "Tên đã Xác định")
+        self._btn(g, large=True, icon="name_manager", text="Trình Quản\nlý Tên", command=self.name_manager,
+                  tooltip="Trình Quản lý Tên (Ctrl+F3)\nTạo, sửa, xóa các tên dùng trong công thức")
+        col = g.column()
+        self._btn(g, col, side="top", icon="name_define", text="Xác định Tên", command=self.define_name_dialog,
+                  tooltip="Đặt tên cho vùng đang chọn")
+        use_menu = tk.Menu(self.root, tearoff=0)
+        use_menu.configure(postcommand=lambda: self._names_menu(use_menu))
+        self._btn(g, col, side="top", icon="name_use", text="Dùng trong Công thức", menu=use_menu)
+        self._btn(g, col, side="top", icon="name_create", text="Tạo từ Vùng chọn",
+                  command=self.create_names_from_selection, tooltip="Tạo tên từ tiêu đề (Ctrl+Shift+F3)")
         g = rb.group(page, "Kiểm tra công thức")
         self.btn_show_formulas = self._btn(g, large=True, icon="show_formulas", text="Hiện\ncông thức",
                                            command=self.toggle_show_formulas, tooltip="Hiện công thức (Ctrl+`)")
@@ -712,8 +1533,113 @@ class SpreadsheetApp:
         col = g.column()
         self._btn(g, col, side="top", icon="filter_clear", text="Xóa bộ lọc", command=self.clear_filter)
         self._btn(g, col, side="top", icon="calc", text="Áp dụng lại", command=self.reapply_filter)
+        g = rb.group(page, "PivotTable")
+        self._btn(g, large=True, icon="refresh", text="Làm mới\ntất cả", command=self.refresh_all_pivots,
+                  tooltip="Làm mới tất cả PivotTable theo dữ liệu nguồn hiện tại")
+        self.btn_pivot_fields = self._btn(g, large=True, icon="pivot_fields", text="Danh sách\ntrường",
+                                          command=self.toggle_pivot_fields,
+                                          tooltip="Hiện/ẩn ngăn Các trường PivotTable")
+        g = rb.group(page, "Dàn bài")
+        self._btn(g, large=True, icon="group", text="Nhóm\n", command=lambda: self.group_selection(1),
+                  tooltip="Nhóm (Alt+Shift+→)\nGom các hàng hoặc cột để thu gọn / mở rộng bằng nút −/+")
+        self._btn(g, large=True, icon="ungroup", text="Bỏ\nnhóm", command=lambda: self.group_selection(-1),
+                  menu=self._make_menu([("Bỏ nhóm...", lambda: self.group_selection(-1), "Alt+Shift+←", "ungroup"),
+                                        ("Xóa dàn bài", self.clear_outline, "", "clear")]), split=True,
+                  tooltip="Bỏ nhóm (Alt+Shift+←)")
+        self._btn(g, large=True, icon="subtotal", text="Tổng\nphụ", command=self.subtotal_dialog,
+                  tooltip="Tổng phụ\nTính tổng (đếm, trung bình...) cho từng nhóm giá trị giống nhau")
+        col = g.column()
+        self._btn(g, col, side="top", icon="show_detail", text="Hiện chi tiết", command=lambda: self.outline_detail(True))
+        self._btn(g, col, side="top", icon="hide_detail", text="Ẩn chi tiết", command=lambda: self.outline_detail(False))
+        g = rb.group(page, "Lấy dữ liệu")
+        self._btn(g, large=True, icon="import_text", text="Từ Văn\nbản/CSV", command=self.import_text,
+                  tooltip="Từ Văn bản/CSV\nNhập tệp .csv/.txt, tự chọn bảng mã (UTF-8, Windows-1258, TCVN3, VNI...)\n"
+                          "và dấu phân cách, có xem trước")
         g = rb.group(page, "Công cụ dữ liệu")
+        self._btn(g, large=True, icon="text_columns", text="Văn bản\nthành Cột", command=self.text_to_columns,
+                  tooltip="Văn bản thành Cột\nTách nội dung một cột thành nhiều cột theo dấu phẩy, dấu cách...")
         self._btn(g, large=True, icon="remove_dup", text="Loại bỏ\ntrùng lặp", command=self.remove_duplicates)
+        self._btn(g, large=True, icon="validation", text="Xác thực\ndữ liệu", command=self.data_validation_dialog,
+                  menu=self._make_menu([("Xác thực dữ liệu...", self.data_validation_dialog),
+                                        ("Xóa xác thực dữ liệu", self.clear_validation)]), split=True,
+                  tooltip="Xác thực dữ liệu\nGiới hạn những gì được nhập vào ô, ví dụ danh sách thả xuống")
+
+    def _build_review_tab(self, page):
+        rb = self.ribbon
+        g = rb.group(page, "Ghi chú")
+        self._btn(g, large=True, icon="note", text="Ghi chú\nmới", command=self.edit_note,
+                  tooltip="Thêm hoặc sửa ghi chú của ô (Shift+F2)")
+        col = g.column()
+        self._btn(g, col, side="top", icon="note_delete", text="Xóa ghi chú", command=self.delete_notes)
+        self._btn(g, col, side="top", icon="note_prev", text="Ghi chú trước", command=lambda: self.goto_note(-1))
+        self._btn(g, col, side="top", icon="note_next", text="Ghi chú tiếp", command=lambda: self.goto_note(1))
+        self.btn_show_notes = self._btn(g, large=True, icon="note", text="Hiện tất cả\nghi chú",
+                                        command=self.toggle_show_notes, tooltip="Hiện/ẩn mọi ghi chú trên trang tính")
+        g = rb.group(page, "Bảo vệ")
+        self.btn_protect = self._btn(g, large=True, icon="protect", text="Bảo vệ\nTrang tính", label="Bảo vệ Trang tính",
+                                     command=self.toggle_protection,
+                                     tooltip="Bảo vệ Trang tính\nKhông cho sửa các ô bị khóa (có thể đặt mật khẩu).\n"
+                                             "Bỏ khóa ô trước bằng Định dạng ô → Bảo vệ.")
+        self._btn(g, large=True, icon="lock_cell", text="Khóa\nô", command=self.toggle_lock_cells,
+                  tooltip="Khóa ô\nBật/tắt khóa các ô đang chọn (có tác dụng khi trang tính được bảo vệ)")
+
+    def _build_page_layout_tab(self, page):
+        rb = self.ribbon
+
+        def cm(inches):
+            return f"{inches * 2.54:.2f}".replace(".", ",")
+        margins = [(name, lambda m=m: self.update_page_setup({"margins": m}),
+                    f"Trên {cm(m[0])}  Dưới {cm(m[1])}  Trái {cm(m[2])}  Phải {cm(m[3])} cm", "margins")
+                   for name, m in (("Thường", printing.MARGINS["normal"]), ("Rộng", printing.MARGINS["wide"]),
+                                   ("Hẹp", printing.MARGINS["narrow"]))]
+        g = rb.group(page, "Thiết lập Trang", launcher=self.page_setup_dialog, launcher_tip="Thiết lập Trang")
+        self._btn(g, large=True, icon="margins", text="Lề\n", menu=self._make_menu(
+            margins + [None, ("Lề tùy chỉnh...", lambda: self.page_setup_dialog("margins"), "", "page_setup")]),
+            tooltip="Lề\nChọn khoảng cách từ mép giấy tới nội dung")
+        self._btn(g, large=True, icon="page_orient", text="Hướng\n", menu=self._make_menu([
+            ("Dọc", lambda: self.update_page_setup({"orientation": "portrait"}), "", "portrait"),
+            ("Ngang", lambda: self.update_page_setup({"orientation": "landscape"}), "", "landscape")]),
+            tooltip="Hướng\nTrang dọc hay trang ngang")
+        self._btn(g, large=True, icon="paper_size", text="Khổ\ngiấy", menu=self._make_menu(
+            [(label, lambda k=key: self.update_page_setup({"paper": k}), "", "paper_size")
+             for key, label in dialogs.PAPER_LABELS.items()] +
+            [None, ("Khổ giấy khác...", lambda: self.page_setup_dialog("page"), "", "page_setup")]),
+            tooltip="Khổ giấy\nChọn cỡ giấy in")
+        self._btn(g, large=True, icon="print_area", text="Vùng\nin", menu=self._make_menu([
+            ("Đặt vùng in", self.set_print_area, "", "print_area"),
+            ("Xóa vùng in", self.clear_print_area, "", "clear")]),
+            tooltip="Vùng in\nChỉ in vùng đang chọn của trang tính")
+        self._btn(g, large=True, icon="page_break", text="Ngắt\ntrang", menu=self._make_menu([
+            ("Chèn ngắt trang", self.insert_page_break, "", "page_break"),
+            ("Loại bỏ ngắt trang", self.remove_page_break, "", "delete_x"),
+            ("Đặt lại tất cả ngắt trang", self.reset_page_breaks, "", "refresh")]),
+            tooltip="Ngắt trang\nBắt đầu trang mới phía trên / bên trái ô đang chọn")
+        self._btn(g, large=True, icon="print_titles", text="In tiêu\nđề", command=lambda: self.page_setup_dialog("sheet"),
+                  tooltip="In tiêu đề\nChọn các hàng lặp lại ở đầu mỗi trang in")
+        g = rb.group(page, "Co giãn cho vừa", launcher=lambda: self.page_setup_dialog("page"),
+                     launcher_tip="Tùy chọn co giãn")
+        scales = [(f"{n}%", lambda n=n: self.update_page_setup({"fit": None, "scale": n}))
+                  for n in (50, 75, 85, 100, 125, 150)]
+        self._btn(g, large=True, icon="fit_page", text="Co\ngiãn", menu=self._make_menu([
+            ("Không co giãn", lambda: self.update_page_setup({"fit": None, "scale": 100}), "", "zoom100"),
+            ("Vừa tất cả các cột trên một trang", lambda: self.update_page_setup({"fit": "width"}), "", "fit_page"),
+            ("Vừa trang tính trên một trang", lambda: self.update_page_setup({"fit": "page"}), "", "fit_page"),
+            None, ("Tỷ lệ", scales), ("Tùy chọn co giãn...", lambda: self.page_setup_dialog("page"), "", "page_setup")]),
+            tooltip="Co giãn\nThu nhỏ bản in để vừa số trang mong muốn")
+        g = rb.group(page, "Tùy chọn Trang tính")
+        col = g.column()
+        self.print_grid_var = tk.BooleanVar(self.root, value=False)
+        ttk.Checkbutton(col, text="In đường lưới", variable=self.print_grid_var, command=self.toggle_print_gridlines,
+                        style="Ribbon.TCheckbutton").pack(side="top", anchor="w", pady=1)
+        self.commands.append(("In đường lưới", lambda: (self.print_grid_var.set(not self.print_grid_var.get()),
+                                                       self.toggle_print_gridlines())))
+        g = rb.group(page, "In")
+        self._btn(g, large=True, icon="print_preview", text="Xem trước\nkhi in", command=self.print_preview,
+                  tooltip="Xem trước khi in và In (Ctrl+P)")
+        self._btn(g, large=True, icon="print", text="In\n", command=self.print_now,
+                  tooltip="In nhanh\nGửi trang tính tới máy in mặc định")
+        self._btn(g, large=True, icon="pdf", text="Xuất\nPDF", command=self.export_pdf,
+                  tooltip="Xuất PDF\nLưu trang tính thành tệp PDF")
 
     def _build_view_tab(self, page):
         rb = self.ribbon
@@ -732,6 +1658,32 @@ class SpreadsheetApp:
         self._btn(g, large=True, icon="zoom", text="Thu\nphóng", command=self.zoom_dialog)
         self._btn(g, large=True, icon="zoom100", text="100%\n", command=lambda: self.set_zoom(1.0))
         self._btn(g, large=True, icon="zoom_sel", text="Phóng theo\nvùng chọn", command=self.zoom_to_selection)
+        g = rb.group(page, "Cửa sổ")
+        freeze_menu = self._make_menu([
+            ("Cố định ngăn", lambda: self.freeze_panes(None if self.sh.freeze else "cell")),
+            ("Cố định hàng trên cùng", lambda: self.freeze_panes("row")),
+            ("Cố định cột đầu tiên", lambda: self.freeze_panes("col"))])
+        # like Excel, the first item turns into "Unfreeze Panes" while panes are frozen
+        freeze_menu.configure(postcommand=lambda: freeze_menu.entryconfigure(
+            0, label="Bỏ cố định ngăn" if self.sh.freeze else "Cố định ngăn"))
+        self.commands.append(("Bỏ cố định ngăn", lambda: self.freeze_panes(None)))
+        self._btn(g, large=True, icon="freeze", text="Cố định\nngăn", menu=freeze_menu,
+                  tooltip="Cố định ngăn\nGiữ hàng và cột tiêu đề luôn hiển thị khi cuộn")
+
+    def _build_tools_tab(self, page):
+        """Tiện ích: PyExcel's own tools, beyond what Excel has - first of all reading PDFs into sheets."""
+        import ribbon
+        ribbon.ICONS.setdefault("pdf_import", _icon_pdf_import)
+        rb = self.ribbon
+        g = rb.group(page, "PDF")
+        self._btn(g, large=True, icon="pdf_import", text="Nhập\nPDF", label="Nhập PDF", command=self.import_pdf,
+                  tooltip="Nhập PDF\nĐưa các trang PDF vào trang tính: chữ vào ô đúng chỗ, đường kẻ bảng thành viền, "
+                          "hình vẽ và ảnh giữ lại. PDF là ảnh quét thì không lấy được chữ")
+        self._btn(g, large=True, icon="pdf", text="Xuất\nPDF", label="Xuất PDF", command=self.export_pdf,
+                  tooltip="Xuất PDF\nLưu trang tính thành tệp PDF")
+        g = rb.group(page, "Sơ đồ")
+        self._btn(g, large=True, icon="diagram_sheet", text="Trang sơ\nđồ mới", label="Trang sơ đồ mới",
+                  command=self.new_diagram_sheet, tooltip="Trang sơ đồ mới\nMột trang tính riêng để vẽ sơ đồ logic")
 
     def _build_help_tab(self, page):
         g = self.ribbon.group(page, "Trợ giúp")
@@ -745,19 +1697,23 @@ class SpreadsheetApp:
                 menu.add_separator()
                 continue
             label, kind = item
-            menu.add_command(label=label, command=lambda k=kind: self.apply_border(k))
+            menu.add_command(label=label, command=lambda k=kind: self.apply_border(k),
+                             **self._menu_image(label, f"border_{kind}"))
             self.commands.append((label, lambda k=kind: self.apply_border(k)))
         menu.add_separator()
         menu.add_cascade(label="Màu đường kẻ", menu=self._palette_menu(
-            menu, lambda c: setattr(self, "border_color", c or "#000000"), "Tự động"))
+            menu, lambda c: setattr(self, "border_color", c or "#000000"), "Tự động"),
+            **self._menu_image("", "line_color"))
         styles = tk.Menu(menu, tearoff=0)
         self.border_style_var = tk.StringVar(self.root, value="thin")
         for key, name in dialogs.BORDER_NAMES:
             styles.add_radiobutton(label=name, value=key, variable=self.border_style_var,
-                                   command=lambda: setattr(self, "border_style", self.border_style_var.get()))
-        menu.add_cascade(label="Kiểu đường kẻ", menu=styles)
+                                   command=lambda: setattr(self, "border_style", self.border_style_var.get()),
+                                   **self._menu_image("", f"line_{key}"))
+        menu.add_cascade(label="Kiểu đường kẻ", menu=styles, **self._menu_image("", "line_medium"))
         menu.add_separator()
-        menu.add_command(label="Thêm viền...", command=lambda: self.format_cells_dialog("border"))
+        menu.add_command(label="Thêm viền...", command=lambda: self.format_cells_dialog("border"),
+                         **self._menu_image("Thêm viền"))
         return menu
 
     def _orientation_menu(self):
@@ -774,10 +1730,10 @@ class SpreadsheetApp:
                ("10 mục cuối...", lambda: self.cf_rule("bottom")),
                ("10% cuối...", lambda: self.cf_rule("bottom", percent=True)), None,
                ("Trên trung bình...", lambda: self.cf_rule("above")), ("Dưới trung bình...", lambda: self.cf_rule("below"))]
-        bars = [(f"Thanh dữ liệu {name.lower()}", lambda c=color: self.cf_add({"type": "databar", "color": c}))
-                for name, color in DATA_BARS]
-        scales = [(f"Thang màu {name}", lambda cs=colors: self.cf_add({"type": "scale", "colors": list(cs)}))
-                  for name, colors in COLOR_SCALES]
+        bars = [(f"Thanh dữ liệu {name.lower()}", lambda c=color: self.cf_add({"type": "databar", "color": c}), "",
+                 f"cf_databar@{color}") for name, color in DATA_BARS]
+        scales = [(f"Thang màu {name}", lambda cs=colors: self.cf_add({"type": "scale", "colors": list(cs)}), "",
+                   f"cf_scale@{','.join(colors)}") for name, colors in COLOR_SCALES]
         return self._make_menu([
             ("Quy tắc tô sáng ô", highlight), ("Quy tắc trên/dưới", top), ("Thanh dữ liệu", bars),
             ("Thang màu", scales), None,
@@ -794,6 +1750,9 @@ class SpreadsheetApp:
 
     def _fit_ribbon(self, event=None):
         """Collapse parts of the Home tab when the window is too narrow (like Excel)."""
+        if self.ribbon.current == "Sơ đồ":
+            self._fit_diagram_tab()
+            return
         page = self.ribbon.pages.get("Trang chủ")
         if page is None or self.ribbon.current != "Trang chủ":
             return
@@ -826,12 +1785,16 @@ class SpreadsheetApp:
         bar.pack(side="top", fill="x")
         inner = tk.Frame(bar, bg="#ffffff")
         inner.pack(fill="x", padx=6, pady=4)
-        self.name_box = ttk.Entry(inner, width=12, justify="left", font=self.ui.font)
+        self.name_box = ttk.Combobox(inner, width=12, justify="left", font=self.ui.font,
+                                     postcommand=lambda: self.name_box.configure(
+                                         values=[d["name"] for d in self.wb.sorted_names()]))
         self.name_box.pack(side="left")
         self.name_box.bind("<Return>", self._on_name_box)
+        self.name_box.bind("<<ComboboxSelected>>", self._on_name_box)
         self.name_box.bind("<Escape>", lambda e: self._leave_name_box())
         self.name_box.bind("<FocusIn>", lambda e: self.name_box.select_range(0, "end"))
-        Tooltip(self.name_box, "Hộp tên: gõ địa chỉ (ví dụ B5, A1:C9, Sheet2!A1) rồi Enter", self.ui.small_font)
+        Tooltip(self.name_box, "Hộp tên: gõ địa chỉ (B5, A1:C9, Sheet2!A1) hoặc tên vùng rồi Enter.\n"
+                               "Gõ một tên mới để đặt tên cho vùng đang chọn.", self.ui.small_font)
         tk.Label(inner, text="⋮", bg="#ffffff", fg="#a0a0a0", font=self.ui.font).pack(side="left", padx=(6, 2))
         self.btn_x = tk.Label(inner, text="✕", bg="#ffffff", fg="#c0c0c0", font=self.ui.font, padx=5, cursor="hand2")
         self.btn_ok = tk.Label(inner, text="✓", bg="#ffffff", fg="#c0c0c0", font=self.ui.font, padx=5, cursor="hand2")
@@ -854,7 +1817,9 @@ class SpreadsheetApp:
         self.fx.bind("<Tab>", lambda e: self._editor_commit(e, (0, 1)))
         self.fx.bind("<Control-Return>", lambda e: self._key_action(lambda: self.commit_edit(fill=True)))
         self.fx.bind("<Escape>", lambda e: self._key_action(self.cancel_edit))
+        self.fx.bind("<Alt-Return>", lambda e: self._key_action(lambda: self.fx.insert("insert", "\n")))
         self.fx.bind("<Key>", self._reset_point, add="+")
+        self._formula_assist(self.fx)
         tk.Frame(self.root, bg=HEADER_LINE, height=1).pack(side="top", fill="x")
 
     def _build_status_bar(self):
@@ -891,53 +1856,76 @@ class SpreadsheetApp:
         self.hbar.pack(side="left", fill="x", expand=True, padx=(16, 0))
 
     def _build_grid(self):
-        frame = ttk.Frame(self.root)
+        frame = self.grid_frame = ttk.Frame(self.root)
         frame.pack(side="top", fill="both", expand=True)
         self.canvas = tk.Canvas(frame, bg="white", highlightthickness=0, bd=0, takefocus=1)
         self.vbar = ttk.Scrollbar(frame, orient="vertical", command=self.on_vscroll)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.vbar.grid(row=0, column=1, sticky="ns")
+        self.pivot_pane = PivotPane(frame, self.ui, self.menu_icons, self._pivot_pane_change, self._pivot_pane_action)
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         cv = self.canvas
-        cv.bind("<Configure>", lambda e: self.refresh_view())
+        cv.bind("<Configure>", lambda e: self.request_refresh(ui=False))
         cv.bind("<Button-1>", self.on_press)
         cv.bind("<B1-Motion>", self.on_drag)
         cv.bind("<ButtonRelease-1>", self.on_release)
         cv.bind("<Double-Button-1>", self.on_double)
         cv.bind("<Button-3>", self.on_context)
         cv.bind("<Motion>", self.on_motion)
+        cv.bind("<Leave>", lambda e: (self._set_hover_note(None), self._hide_link_tip()))
         self.root.bind_all("<MouseWheel>", self.on_wheel)
         self.root.bind_all("<Shift-MouseWheel>", lambda e: self.on_wheel(e, horizontal=True))
 
     def _build_context_menus(self):
         paste_options = [("Dán", self.paste), ("Dán giá trị", lambda: self.paste(mode="values")),
+                         ("Dán giá trị và định dạng số", lambda: self.paste(mode="values_num")),
                          ("Dán công thức", lambda: self.paste(mode="formulas")),
                          ("Dán định dạng", lambda: self.paste(mode="formats")),
+                         ("Dán không có viền", lambda: self.paste(mode="no_borders")),
+                         ("Dán giữ độ rộng cột nguồn", lambda: self.paste(widths=True)),
                          ("Dán chuyển vị", lambda: self.paste(transpose=True))]
         self.cell_menu = self._make_menu([
             ("Cắt", self.cut, "Ctrl+X"), ("Sao chép", self.copy, "Ctrl+C"), ("Tùy chọn dán", paste_options),
             ("Dán đặc biệt...", self.paste_special), None,
             ("Chèn...", self.insert_cells_dialog, "Ctrl++"), ("Xóa...", self.delete_cells_dialog, "Ctrl+-"),
             ("Xóa nội dung", self.clear_contents, "Delete"), None,
-            ("Lọc", [("Lọc theo giá trị của ô đã chọn", self.filter_by_value), ("Bật/tắt bộ lọc", self.toggle_filter)]),
+            ("Chèn/Sửa ghi chú...", self.edit_note, "Shift+F2"), ("Xóa ghi chú", self.delete_notes), None,
+            ("Liên kết...", self.insert_hyperlink, "Ctrl+K"), ("Mở liên kết", self.open_hyperlink),
+            ("Loại bỏ liên kết", self.remove_hyperlinks), None,
+            ("Lọc", [("Lọc theo giá trị của ô đã chọn", self.filter_by_value),
+                     ("Lọc theo màu của ô đã chọn", lambda: self.filter_by_color("bg")),
+                     ("Lọc theo màu phông của ô đã chọn", lambda: self.filter_by_color("fg")), None,
+                     ("Bật/tắt bộ lọc", self.toggle_filter)]),
             ("Sắp xếp", [("Sắp xếp từ A đến Z", lambda: self.sort_selection(False)),
                          ("Sắp xếp từ Z đến A", lambda: self.sort_selection(True)),
                          ("Sắp xếp tùy chỉnh...", self.custom_sort)]), None,
             ("Định dạng ô...", lambda: self.format_cells_dialog(), "Ctrl+1")])
+        self.chart_menu = self._make_menu([
+            ("Đổi kiểu biểu đồ", [(f"Biểu đồ {label.lower()}", lambda k=kind: self.set_chart_type(k))
+                                  for kind, label in dialogs.CHART_KINDS]),
+            ("Dữ liệu và tiêu đề biểu đồ...", self.edit_chart), None, ("Xóa biểu đồ", self.delete_chart)])
+        self.picture_menu = self._make_menu([
+            ("Đặt lại kích thước ảnh", self.reset_picture_size, "", "picture"), ("Thay ảnh...", self.change_picture),
+            None, ("Xóa ảnh", self.delete_chart, "Delete", "delete_x")])
         common = [("Cắt", self.cut), ("Sao chép", self.copy), ("Dán", self.paste), None]
         self.row_menu = self._make_menu(common + [
-            ("Chèn", self.insert_rows), ("Xóa", self.delete_rows), ("Xóa nội dung", self.clear_contents), None,
+            ("Chèn", self.insert_rows, "", "insert_row"), ("Xóa", self.delete_rows, "", "delete_row"),
+            ("Xóa nội dung", self.clear_contents), None,
             ("Định dạng ô...", lambda: self.format_cells_dialog()), ("Chiều cao hàng...", self.ask_row_height),
-            ("Ẩn", self.hide_rows), ("Bỏ ẩn", self.unhide_rows)])
+            ("Ẩn", self.hide_rows, "", "hide_row"), ("Bỏ ẩn", self.unhide_rows, "", "unhide_row")])
         self.col_menu = self._make_menu(common + [
-            ("Chèn", self.insert_cols), ("Xóa", self.delete_cols), ("Xóa nội dung", self.clear_contents), None,
+            ("Chèn", self.insert_cols, "", "insert_col"), ("Xóa", self.delete_cols, "", "delete_col"),
+            ("Xóa nội dung", self.clear_contents), None,
             ("Định dạng ô...", lambda: self.format_cells_dialog()), ("Độ rộng cột...", self.ask_column_width),
-            ("Ẩn", self.hide_cols), ("Bỏ ẩn", self.unhide_cols)])
+            ("Ẩn", self.hide_cols, "", "hide_col"), ("Bỏ ẩn", self.unhide_cols, "", "unhide_col")])
 
     def _bind_keys(self):
         cv = self.canvas
         cv.bind("<Key>", self.on_key)
+        for side in ("L", "R"):  # Ctrl pressed and let go alone opens the Paste Options, as in Excel
+            cv.bind(f"<KeyPress-Control_{side}>", lambda e: setattr(self, "_lone_ctrl", True))
+            cv.bind(f"<KeyRelease-Control_{side}>", self._ctrl_released)
         canvas_keys = {
             "c": self.copy, "x": self.cut, "v": self.paste, "z": self.undo, "y": self.redo, "a": self.select_all,
             "b": lambda: self.toggle_style("bold"), "i": lambda: self.toggle_style("italic"),
@@ -954,21 +1942,32 @@ class SpreadsheetApp:
                  "<Control-KP_Subtract>": self.delete_cells_dialog,
                  "<Control-ampersand>": lambda: self.apply_border("outside"),
                  "<Control-underscore>": lambda: self.apply_border("none"), "<F9>": self.recalculate,
-                 "<Shift-F3>": self.insert_function_dialog}
+                 "<Shift-F3>": self.insert_function_dialog, "<Shift-F2>": self.edit_note,
+                 "<Alt-Down>": self.open_validation_list,
+                 "<Alt-Shift-Right>": lambda: self.group_selection(1), "<Alt-Shift-Left>": lambda: self.group_selection(-1)}
         for seq, func in extra.items():
             cv.bind(seq, lambda e, f=func: self._key_action(f))
         global_keys = {"n": self.new_file, "o": self.open_file, "s": self.save_file, "f": self.open_find,
-                       "h": lambda: self.open_find(True), "g": self.focus_name_box}
+                       "h": lambda: self.open_find(True), "g": self.focus_name_box, "p": self.print_preview,
+                       "k": self.insert_hyperlink}
         for key, func in global_keys.items():
             for k in (key, key.upper()):
                 self.root.bind_all(f"<Control-{k}>", lambda e, f=func: self._key_action(f))
         self.root.bind_all("<Control-Key-1>", lambda e: self._key_action(self.format_cells_dialog))
         self.root.bind_all("<F12>", lambda e: self._key_action(self.save_as))
+        self.root.bind_all("<Control-F2>", lambda e: self._key_action(self.print_preview))
+        self.root.bind_all("<Control-F3>", lambda e: self._key_action(self.name_manager))
+        self.root.bind_all("<Control-Shift-F3>", lambda e: self._key_action(self.create_names_from_selection))
         self.root.bind_all("<F1>", lambda e: self._key_action(self.show_help))
         self.root.bind_all("<Shift-F11>", lambda e: self._key_action(self.add_sheet))
 
-    @staticmethod
-    def _key_action(func):
+    def _ctrl_released(self, e):
+        if self._lone_ctrl and self._paste_button:
+            self._lone_ctrl = False
+            self.paste_options()
+
+    def _key_action(self, func):
+        self._lone_ctrl = False
         func()
         return "break"
 
@@ -986,7 +1985,81 @@ class SpreadsheetApp:
             return 0
         return round(sh.row_heights.get(r, fe.DEFAULT_ROW_HEIGHT) * self.px)
 
+    def _hidden_runs(self):
+        """The sheet's hidden rows (hidden or filtered out) as runs: (starts, ends) with ends exclusive,
+        worked out again only after a change."""
+        sh = self.sh
+        filtered = sh.filter["hidden"] if sh.filter else ()
+        key = (id(sh), self.edit_serial, id(sh.hidden_rows), len(sh.hidden_rows), id(filtered), len(filtered))
+        if self._runs_key != key:
+            starts, ends = [], []
+            for r in sorted(set(sh.hidden_rows).union(filtered)):
+                if ends and ends[-1] == r:
+                    ends[-1] = r + 1
+                else:
+                    starts.append(r)
+                    ends.append(r + 1)
+            self._runs_key, self._runs = key, (starts, ends)
+        return self._runs
+
+    def shown_rows(self, start, stop=MAX_ROWS):
+        """The rows from `start` up to `stop` that are not hidden. A filter can hide thousands of rows in
+        a row; each such run is stepped over at once."""
+        starts, ends = self._hidden_runs()
+        i = bisect.bisect_right(starts, start) - 1  # the last run starting at or before `start`
+        r = ends[i] if i >= 0 and start < ends[i] else start
+        i += 1
+        while r < stop:
+            if i < len(starts) and r == starts[i]:
+                r, i = ends[i], i + 1
+                continue
+            yield r
+            r += 1
+
+    def shown_rows_back(self, start, stop=-1):
+        """The rows from `start` down to `stop` (not included) that are not hidden, as shown_rows."""
+        starts, ends = self._hidden_runs()
+        i = bisect.bisect_right(starts, start) - 1
+        r = start
+        while r > stop:
+            if i >= 0 and starts[i] <= r < ends[i]:
+                r, i = starts[i] - 1, i - 1
+                continue
+            yield r
+            r -= 1
+
+    def rows_from(self, r, n):
+        """The row n rows below r (above for n < 0), counting only rows that are shown: scrolling and
+        paging move over the rows a filter hides as if they were not there."""
+        rows = self.shown_rows(r + 1) if n >= 0 else self.shown_rows_back(r - 1)
+        for r in itertools.islice(rows, abs(n)):
+            pass
+        return r
+
+    def frozen(self):
+        """(r0, r1, c0, c1): rows r0..r1-1 and columns c0..c1-1 are frozen (empty spans when not)."""
+        return self.sh.freeze or (0, 0, 0, 0)
+
+    def pane_origin(self):
+        """Canvas (x, y) where the scrolling part of the grid starts, right of / below the frozen panes."""
+        r0, r1, c0, c1 = self.frozen()
+        return (self.header_w + sum(self.col_w(k) for k in range(c0, c1)),
+                self.header_h + sum(self.row_h(k) for k in range(r0, r1)))
+
+    def _clamp_view(self):
+        """Keep the scrolled area out of the frozen rows and columns."""
+        _, r1, _, c1 = self.frozen()
+        self.top, self.left = max(self.top, r1), max(self.left, c1)
+
     def col_x(self, c):
+        """Canvas x of the left edge of column c. With frozen columns, edges of columns hidden behind
+        them are clamped, so a range's box covers just its visible part."""
+        c0, c1 = self.frozen()[2:]
+        if c1 > c0:
+            if c <= c1:
+                return self.header_w + sum(self.col_w(k) for k in range(c0, c)) - (4 if c < c0 else 0)
+            x0 = self.pane_origin()[0]
+            return x0 if c <= self.left else x0 + sum(self.col_w(k) for k in range(self.left, c))
         x = self.header_w
         if c >= self.left:
             for k in range(self.left, c):
@@ -997,16 +2070,24 @@ class SpreadsheetApp:
         return x
 
     def row_y(self, r):
-        """Canvas y of the top of row r (rows far off screen are estimated)."""
+        """Canvas y of the top of row r (rows far off screen are estimated; with frozen rows, edges
+        hidden behind them are clamped as in col_x)."""
+        r0, r1 = self.frozen()[:2]
         y = self.header_h
+        if r1 > r0:
+            if r <= r1:
+                return y + sum(self.row_h(k) for k in range(r0, r)) - (4 if r < r0 else 0)
+            y = self.pane_origin()[1]
+            if r <= self.top:
+                return y
         far = self.canvas.winfo_height() + 4000
         if r >= self.top:
-            for k in range(self.top, r):
+            for k in self.shown_rows(self.top, r):
                 y += self.row_h(k)
                 if y > far:
                     return y + (r - k - 1) * self.default_row_px
             return y
-        for k in range(self.top - 1, r - 1, -1):
+        for k in self.shown_rows_back(self.top - 1, r - 1):
             y -= self.row_h(k)
             if y < -far:
                 return y - (k - r) * self.default_row_px
@@ -1022,23 +2103,34 @@ class SpreadsheetApp:
         return max(x0, self.header_w - 4), max(y0, self.header_h - 4), min(x1, W + 4), min(y1, H + 4)
 
     def _visible_rows(self):
-        return max(1, len(self.vis_rows) - 1)
+        """Rows a page of scrolling moves (the scrolled part of the window, less one)."""
+        return max(1, self._scroll_rows - 1)
 
     def row_at(self, y):
+        r0, r1 = self.frozen()[:2]
         if y < self.header_h:
-            return max(0, self.top - 1)
-        edge, r = self.header_h, self.top
-        while r < MAX_ROWS - 1:
+            return r0 if r1 > r0 else max(0, self.top - 1)
+        edge = self.header_h
+        for r in range(r0, r1):
             edge += self.row_h(r)
             if y < edge:
                 return r
-            r += 1
+        for r in self.shown_rows(self.top, MAX_ROWS - 1):
+            edge += self.row_h(r)
+            if y < edge:
+                return r
         return MAX_ROWS - 1
 
     def col_at(self, x):
+        c0, c1 = self.frozen()[2:]
         if x < self.header_w:
-            return max(0, self.left - 1)
-        edge, c = self.header_w, self.left
+            return c0 if c1 > c0 else max(0, self.left - 1)
+        edge = self.header_w
+        for c in range(c0, c1):
+            edge += self.col_w(c)
+            if x < edge:
+                return c
+        c = self.left
         while c < MAX_COLS - 1:
             edge += self.col_w(c)
             if x < edge:
@@ -1059,11 +2151,11 @@ class SpreadsheetApp:
     def _border_hit(self, x, y):
         """('col', c) / ('row', r) when the pointer is on a header border used for resizing."""
         tolerance = 3 * self.scale
-        if y < self.header_h and x >= self.header_w:
+        if self.outline_h <= y < self.header_h and x >= self.header_w:
             for c, _, x1 in self.vis_cols:
                 if abs(x - x1) <= tolerance:
                     return "col", c
-        if x < self.header_w and y >= self.header_h:
+        if self.outline_w <= x < self.header_w and y >= self.header_h:
             for r, _, y1 in self.vis_rows:
                 if abs(y - y1) <= tolerance:
                     return "row", r
@@ -1110,21 +2202,28 @@ class SpreadsheetApp:
 
     def ensure_visible(self, r, c):
         H, W = self.canvas.winfo_height(), self.canvas.winfo_width()
-        if r < self.top:
+        self._clamp_view()
+        x0, y0 = self.pane_origin()
+        _, r1, _, c1 = self.frozen()
+        if r < r1:  # frozen rows are always on screen
+            pass
+        elif r < self.top:
             self.top = r
         elif self.row_y(r + 1) > H:
-            avail, acc, t = H - self.header_h, 0, r
-            while t >= 0:
+            avail, acc, top = H - y0, 0, r
+            for t in self.shown_rows_back(r, r1 - 1):
                 acc += self.row_h(t)
                 if acc > avail:
                     break
-                t -= 1
-            self.top = min(r, t + 1)
-        if c < self.left:
+                top = t
+            self.top = top
+        if c < c1:
+            pass
+        elif c < self.left:
             self.left = c
         elif self.col_x(c + 1) > W:
-            avail, acc, t = W - self.header_w, 0, c
-            while t >= 0:
+            avail, acc, t = W - x0, 0, c
+            while t >= c1:
                 acc += self.col_w(t)
                 if acc > avail:
                     break
@@ -1136,29 +2235,42 @@ class SpreadsheetApp:
     def redraw(self):
         cv = self.canvas
         cv.delete("all")
+        self._frame = None
         W, H = cv.winfo_width(), cv.winfo_height()
         if W < 20 or H < 20:
             return
+        # hidden markers of where the layers redraw_selection replaces go in the stacking order
+        cv.create_line(0, 0, 0, 0, state="hidden", tags="z_selbg")
         sh = self.sh
         cells, formats = sh.cells, sh.formats
+        spilled = self.wb.spill_map(self.sheet)  # cells dynamic arrays fill (they hold nothing themselves)
+        self._outline_metrics()
         hw, hh, pad = self.header_w, self.header_h, self.pad
-        cols, x, c = [], hw, self.left
-        while x < W and c < MAX_COLS:
-            w = self.col_w(c)
-            if w:
-                cols.append((c, x, x + w))
-            x, c = x + w, c + 1
-        rows, y, r = [], hh, self.top
-        while y < H and r < MAX_ROWS:
-            h = self.row_h(r)
-            if h:
-                rows.append((r, y, y + h))
-            y, r = y + h, r + 1
+        self._clamp_view()
+        fr0, fr1, fc0, fc1 = self.frozen()
+
+        def strip(lines, size, origin, end):
+            """[(index, start, end)] of the lines that fit between origin and end."""
+            out, pos = [], origin
+            for i in lines:
+                if pos >= end:
+                    break
+                n = size(i)
+                if n:
+                    out.append((i, pos, pos + n))
+                pos += n
+            return out
+
+        cols = strip(itertools.chain(range(fc0, fc1), range(self.left, MAX_COLS)), self.col_w, hw, W)
+        rows = strip(itertools.chain(range(fr0, fr1), self.shown_rows(self.top)), self.row_h, hh, H)
         self.vis_cols, self.vis_rows = cols, rows
+        self._scroll_rows = sum(1 for r, _, _ in rows if r >= self.top)
         self._filter_buttons = []
+        self._outline_buttons = []
         r1, c1, r2, c2 = self.sel_rect()
         if not cols or not rows:
             self._draw_headers(cv, W, H, (r1, c1, r2, c2))
+            self._draw_outline(cv, W, H, {}, {})
             return
         col_pos = {c: (x0, x1) for c, x0, x1 in cols}
         row_pos = {r: (y0, y1) for r, y0, y1 in rows}
@@ -1166,6 +2278,7 @@ class SpreadsheetApp:
         vr1, vr2, vc1, vc2 = rows[0][0], rows[-1][0], cols[0][0], cols[-1][0]
         active = self._cell_box(*self.cur)
         multi = (r1, c1, r2, c2) != active
+        areas = [a for a in self.areas if a[0] <= vr2 and a[2] >= vr1 and a[1] <= vc2 and a[3] >= vc1]
 
         cf = {}
         if sh.cond_formats:
@@ -1181,6 +2294,8 @@ class SpreadsheetApp:
             bg = (style or {}).get("bg") or (fmt.get("bg") if fmt else None) or "#ffffff"
             inside = active[0] <= r <= active[2] and active[1] <= c <= active[3]
             if multi and r1 <= r <= r2 and c1 <= c <= c2 and not inside:
+                return self.tint(bg)
+            if areas and not inside and any(a[0] <= r <= a[2] and a[1] <= c <= a[3] for a in areas):
                 return self.tint(bg)
             return bg
 
@@ -1198,18 +2313,16 @@ class SpreadsheetApp:
                         covered.add((r, c))
 
         # backgrounds: selection tint, filled cells, the active cell left clear, data bars
-        if multi:
-            box = self._clip_box(self._rect_bbox(r1, c1, r2, c2), W, H)
-            if box:
-                cv.create_rectangle(*box, fill=self.tint("#ffffff"), outline="")
+        self._draw_selection_tint(cv, W, H, (r1, c1, r2, c2), multi, areas)
         filled = {k for k in visible(formats) if formats[k].get("bg")} | {k for k, s in cf.items() if s.get("bg")}
+        tinted = set(filled)  # cells whose colour the selection changes
         for r, c in filled:
             cv.create_rectangle(col_pos[c][0], row_pos[r][0], col_pos[c][1], row_pos[r][1], fill=fill_of(r, c),
                                 outline="")
         if multi:
             box = self._clip_box(self._rect_bbox(*active), W, H)
             if box:
-                cv.create_rectangle(*box, fill=fill_of(*self.cur), outline="")
+                cv.create_rectangle(*box, fill=fill_of(*self.cur), outline="", tags=("sel", "selbg"))
         for (r, c), style in cf.items():
             bar = style.get("databar")
             if bar and (r, c) not in covered:
@@ -1219,16 +2332,17 @@ class SpreadsheetApp:
                     cv.create_rectangle(x0 + 2, y0 + 2, x0 + 2 + width, y1 - 3, fill=mix(bar[1], "#ffffff", 0.45),
                                         outline=bar[1])
         if self.show_grid:
-            for c, x0, x1 in cols:
-                cv.create_line(x1 - 1, hh, x1 - 1, bottom, fill=GRID)
-            for r, y0, y1 in rows:
-                cv.create_line(hw, y1 - 1, right, y1 - 1, fill=GRID)
+            grid = ("-fill", GRID)
+            self._create_items(cv, [x for c, x0, x1 in cols for x in ("line", (x1 - 1, hh, x1 - 1, bottom), grid)] +
+                               [x for r, y0, y1 in rows for x in ("line", (hw, y1 - 1, right, y1 - 1), grid)])
         for m in merges:  # merged blocks hide their inner grid lines
             box = self._clip_box(self._rect_bbox(*m), W, H)
             if box:
                 cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, fill=fill_of(m[0], m[1]), outline="")
 
-        # cell borders
+        # cell borders, made in one go; an edge two cells both draw (bottom of one, top of the next) is made
+        # once, where it was drawn last, which looks just the same
+        lines = []
         for r, c in visible(formats):
             fmt = formats[(r, c)]
             if not any(k in fmt for k in fe.BORDER_KEYS):
@@ -1242,7 +2356,13 @@ class SpreadsheetApp:
                 if m and ((key == "bt" and r != m[0]) or (key == "bb" and r != m[2]) or
                           (key == "bl" and c != m[1]) or (key == "br" and c != m[3])):
                     continue
-                self._draw_border(cv, key, spec, x0, y0, x1, y1)
+                lines += self._border_lines(key, spec, x0, y0, x1, y1)
+        seen, last = set(), []
+        for line in reversed(lines):
+            if line not in seen:
+                seen.add(line)
+                last.append(line)
+        self._create_items(cv, [x for coords, options in reversed(last) for x in ("line", coords, options)])
 
         # filter dropdown buttons (sized first so header text can leave room for them)
         f = sh.filter
@@ -1280,10 +2400,12 @@ class SpreadsheetApp:
                 text, align, is_num = self.fit_number(value, numfmt, font, avail), "right", True
             else:
                 text, align = str(value), "left"
+            if fe._COMBINING.search(text):  # "Unicode tổ hợp" (separate tone marks): Tk draws the marks apart
+                text = unicodedata.normalize("NFC", text)
             align = fmt.get("align") or align
             valign = fmt.get("valign") or "bottom"
             fg = eff.get("fg") or "#000000"
-            ls = font.metrics("linespace")
+            ls = self.line_space(font)
             rotate = fmt.get("rotate") or 0
             if rotate and rotate != 255:
                 text = text.replace("\n", " ")
@@ -1301,45 +2423,88 @@ class SpreadsheetApp:
             else:
                 text = text.replace("\r", " ").replace("\n", " ")
                 if not is_num:
-                    if spill and align == "left" and isinstance(value, str):
-                        needed, end, nc = self.text_width(font, text), x1, c + 1
-                        while (needed > end - x0 - 2 * pad - indent and nc in col_pos and (r, nc) not in cells
-                               and (r, nc) not in covered and not sh.merge_at(r, nc)
-                               and not (f and r == f["range"][0] and nc in filter_cols)):
+                    if spill and isinstance(value, str):
+                        # text runs on over empty cells like Excel: rightwards when left-aligned, leftwards when
+                        # right-aligned, both ways when centred
+                        def free(nc):
+                            return (nc in col_pos and (r, nc) not in cells and (r, nc) not in spilled
+                                    and (r, nc) not in covered and not sh.merge_at(r, nc)
+                                    and not (f and r == f["range"][0] and nc in filter_cols))
+
+                        def join(left):  # the gridline between column `left` and the next one goes
                             if self.show_grid:
-                                boundary = col_pos[nc][0] - 1
-                                cv.create_line(boundary, y0, boundary, y1 - 1, fill=fill_of(r, nc - 1))
-                            end, nc = col_pos[nc][1], nc + 1
-                        avail = end - x0 - 2 * pad - indent
-                    text = self.clip_text(text, font, avail)
+                                boundary = col_pos[left + 1][0] - 1
+                                cv.create_line(boundary, y0, boundary, y1 - 1, fill=fill_of(r, left))
+                                tinted.add((r, left))
+
+                        needed, start, end, lc, nc = self.text_width(font, text), x0, x1, c - 1, c + 1
+                        if align == "centerContinuous":  # Center Across Selection: over the empty cells after
+                            while free(nc) and (formats.get((r, nc)) or {}).get("align") == "centerContinuous":
+                                join(nc - 1)                # it that have it too
+                                end, nc = col_pos[nc][1], nc + 1
+                            x1, align = end, "center"
+                        mid = (x0 + x1) / 2
+                        while True:
+                            room = (2 * min(mid - start, end - mid) if align == "center" else end - start) - 2 * pad
+                            if needed <= room - indent:
+                                break
+                            grow_r, grow_l = align in ("left", "center") and free(nc), align in ("right", "center") and free(lc)
+                            if not (grow_r or grow_l) or (align == "center" and not (grow_r and grow_l)):
+                                break
+                            if grow_r:
+                                join(nc - 1)
+                                end, nc = col_pos[nc][1], nc + 1
+                            if grow_l:
+                                join(lc)
+                                start, lc = col_pos[lc][0], lc - 1
+                        avail = (2 * min(mid - start, end - mid) if align == "center" else end - start) - 2 * pad - indent
+                    text = self.clip_text(text, font, avail, tail=align == "right")
                 lines = [text]
             block = len(lines) * ls
             ty = {"top": y0 + 1 + block / 2, "center": (y0 + y1) / 2, "bottom": y1 - 2 - block / 2}[valign]
-            if align == "center":
+            if align in ("center", "centerContinuous"):
                 tx, anchor = (x0 + x1) / 2, "center"
             elif align == "right":
                 tx, anchor = x1 - pad - 1 - indent, "e"
             else:
                 tx, anchor = x0 + pad + indent, "w"
+            if fmt.get("underline") != "double":
+                texts.extend(("text", (tx, ty), ("-text", "\n".join(lines), "-anchor", anchor, "-justify", align,
+                                                 "-font", font.name, "-fill", fg)))
+                return
             item = cv.create_text(tx, ty, text="\n".join(lines), anchor=anchor, justify=align, font=font, fill=fg)
-            if fmt.get("underline") == "double":
-                bx0, _, bx1, by1 = cv.bbox(item)
-                base = by1 - font.metrics("descent")
-                for dy in (1, 3):
-                    cv.create_line(bx0, base + dy, bx1, base + dy, fill=fg)
+            bx0, _, bx1, by1 = cv.bbox(item)  # double underline: two lines under the text
+            base = by1 - font.metrics("descent")
+            for dy in (1, 3):
+                cv.create_line(bx0, base + dy, bx1, base + dy, fill=fg)
 
-        targets = [k for k in visible(cells) if k not in covered]
+        texts = []  # most cells' text items, created together after the loop
+        targets = [k for k in itertools.chain(visible(cells), visible(spilled)) if k not in covered]
         seen = set(targets)
         targets += [(m[0], m[1]) for m in merges if (m[0], m[1]) in cells and (m[0], m[1]) not in seen]
         for r, c in targets:
             m = sh.merge_at(r, c)
             if m:
                 box = self._rect_bbox(*m)
+                if box[2] <= box[0] or box[3] <= box[1]:  # scrolled behind the frozen panes
+                    continue
                 style = cf.get((r, c)) if (r, c) in cf else self.wb.cond_format(self.sheet, r, c)
             else:
                 box = (col_pos[c][0], row_pos[r][0], col_pos[c][1], row_pos[r][1])
                 style = cf.get((r, c))
             draw_text(r, c, box, style, spill=not m)
+        self._create_items(cv, texts)
+
+        mark = max(4, round(5 * self.px))
+        for r, c in visible(sh.notes):
+            m = sh.merge_at(r, c)
+            if (r, c) in covered or (m and (r, c) != (m[0], m[1])):
+                continue
+            if m:
+                _, y0, x1, _ = self._rect_bbox(*m)
+            else:
+                x1, y0 = col_pos[c][1], row_pos[r][0]
+            cv.create_polygon(x1 - 1 - mark, y0, x1 - 1, y0, x1 - 1, y0 + mark, fill=NOTE_MARK, outline="")
 
         if btn_size:
             fy0, fy1 = row_pos[f["range"][0]]
@@ -1362,9 +2527,11 @@ class SpreadsheetApp:
                 self._filter_buttons.append((bx0, by0, bx1, by1, c))
 
         line = max(2, round(2 * self.px))
+        self._drawn_refs = None
         if self.is_editing() and self.edit_cell[0] == self.sheet:
             text = self.edit_var.get() if self.editor is not None else self.fx_var.get()
-            for i, (ref_sheet, a1, b1, a2, b2) in enumerate(fe.formula_references(text)):
+            self._drawn_refs = fe.formula_references(text)
+            for i, (ref_sheet, a1, b1, a2, b2) in enumerate(self._drawn_refs):
                 if ref_sheet is not None and self.wb.resolve_sheet(ref_sheet) != self.sheet:
                     continue
                 if not (0 <= a1 and 0 <= b1 and a2 < MAX_ROWS and b2 < MAX_COLS):
@@ -1378,71 +2545,436 @@ class SpreadsheetApp:
             if box:
                 cv.create_rectangle(box[0] + 1, box[1] + 1, box[2] - 2, box[3] - 2, outline=ACCENT, dash=(5, 3),
                                     width=line)
+        cv.create_line(0, 0, 0, 0, state="hidden", tags="z_selfg")
+        sel_box = self._draw_selection_outline(cv, W, H, (r1, c1, r2, c2), areas)
+        self._draw_charts(cv, W, H)
+        if sh.page_setup or self.sheet in self.breaks_shown:
+            self._draw_page_breaks(cv, col_pos, row_pos, right, bottom)
+        px, py = self.pane_origin()
+        if fr1 > fr0:
+            cv.create_line(hw, py - 1, right, py - 1, fill=FREEZE_LINE)
+        if fc1 > fc0:
+            cv.create_line(px - 1, hh, px - 1, bottom, fill=FREEZE_LINE)
+        self._draw_headers(cv, W, H, (r1, c1, r2, c2), sel_box)
+        self._draw_outline(cv, W, H, row_pos, col_pos)
+        cv.create_line(0, 0, 0, 0, state="hidden", tags="z_extra")
+        self._draw_cell_extras(_Tagged(cv, "extra"), W, H, col_pos, row_pos)
+        self._place_editor()
+        self._frame = {"key": self._frame_key(), "sel": (r1, c1, r2, c2), "multi": multi, "areas": bool(areas),
+                       "tinted": tinted, "merges": merges, "col_pos": col_pos, "row_pos": row_pos}
+
+    @staticmethod
+    def _create_items(cv, items):
+        """Create canvas items given as kind, (coordinates), (options), kind, ... in one call to Tcl: a
+        sheet's hundreds of texts and lines are made several times faster than one Python call each."""
+        if items:
+            cv.tk.call("pyexcel_create_items", cv._w, tuple(items))
+
+    def _frame_key(self):
+        """What a drawn frame shows besides the selection: redraw_selection only reuses a frame drawn for
+        the same key."""
+        cv = self.canvas
+        return (id(self.wb), id(self.sh), self.sheet, self.top, self.left, cv.winfo_width(), cv.winfo_height(),
+                self.px, self.edit_serial, self.is_editing(), self.show_grid, self.show_headings, self.show_formulas,
+                self.show_notes, self.hover_note, self.chart_sel, tuple(sorted(self.more_sel)),
+                self.clip and self.clip["rect"],
+                self.header_w, self.header_h)
+
+    def _draw_selection_tint(self, cv, W, H, rect, multi, areas, clear=False):
+        """The shading of a selection of several cells (and of Ctrl+click blocks); with clear=True also the
+        active cell left white inside it."""
+        tint = self.tint("#ffffff")
+        for block in ([rect] if multi else []) + list(areas):
+            box = self._clip_box(self._rect_bbox(*block), W, H)
+            if box:
+                cv.create_rectangle(*box, fill=tint, outline="", tags=("sel", "selbg"))
+        if multi and clear:
+            box = self._clip_box(self._rect_bbox(*self._cell_box(*self.cur)), W, H)
+            if box:
+                cv.create_rectangle(*box, fill="#ffffff", outline="", tags=("sel", "selbg"))
+
+    def _draw_selection_outline(self, cv, W, H, rect, areas):
+        """The selection's green outline with its fill handle, the outlines of Ctrl+click blocks and the
+        dashed box of a fill-handle drag. Returns the selection's canvas box."""
+        r1, c1, r2, c2 = rect
+        tags = ("sel", "selfg")
+        line = max(2, round(2 * self.px))
+        for area in areas:
+            box = self._clip_box(self._rect_bbox(*area), W, H)
+            if box:
+                cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT, tags=tags)
+        spill = self.wb.spill_range(self.sheet, *self.cur)
+        if spill and spill[:2] == spill[2:]:
+            spill = None  # an array of one value looks like any other cell
+        box = self._clip_box(self._rect_bbox(*spill), W, H) if spill else None
+        if box:  # Excel outlines the whole dynamic array the active cell is in
+            cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=SPILL_LINE, tags=tags)
         sel_box = self._rect_bbox(r1, c1, r2, c2)
         box = self._clip_box(sel_box, W, H)
         if box:
-            cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT, width=line)
+            cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline=ACCENT, width=line, tags=tags)
             hx, hy = sel_box[2] - 1, sel_box[3] - 1
-            if hw < hx < W and hh < hy < H and not self.is_editing():
+            _, fr1, _, fc1 = self.frozen()
+            corner_shown = not (fr1 <= r2 < self.top or fc1 <= c2 < self.left)
+            hw, hh = self.header_w, self.header_h
+            if hw < hx < W and hh < hy < H and corner_shown and not self.is_editing():
                 s = max(3, round(3 * self.px))
-                cv.create_rectangle(hx - s, hy - s, hx + s, hy + s, fill=ACCENT, outline="white")
+                cv.create_rectangle(hx - s, hy - s, hx + s, hy + s, fill=ACCENT, outline="white", tags=tags)
         if self.drag and self.drag.get("mode") == "fill" and self.drag.get("target"):
             box = self._clip_box(self._rect_bbox(*self.drag["target"]), W, H)
             if box:
-                cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline="#555555", dash=(4, 3))
-        self._draw_headers(cv, W, H, (r1, c1, r2, c2), sel_box)
-        self._place_editor()
+                cv.create_rectangle(box[0], box[1], box[2] - 1, box[3] - 1, outline="#555555", dash=(4, 3),
+                                    tags=tags)
+        return sel_box
 
-    def _draw_border(self, cv, key, spec, x0, y0, x1, y1):
+    def redraw_selection(self):
+        """Redraw only what shows the selection - its shading and outline, the highlighted headings and
+        the active cell's list arrow or input message - when the cells are drawn as they were: moving
+        around with the keys or the mouse then costs Tk a few small repaints instead of every cell."""
+        frame, cv = self._frame, self.canvas
+        rect = self.sel_rect()
+        multi = rect != self._cell_box(*self.cur)
+
+        def tints_drawn_cells(block):
+            r1, c1, r2, c2 = block
+            return any(r1 <= r <= r2 and c1 <= c <= c2 for r, c in frame["tinted"]) or \
+                any(m[0] <= r2 and m[2] >= r1 and m[1] <= c2 and m[3] >= c1 for m in frame["merges"])
+        if (frame is None or frame["key"] != self._frame_key() or self.areas or frame["areas"]
+                or (frame["multi"] and tints_drawn_cells(frame["sel"])) or (multi and tints_drawn_cells(rect))):
+            self.redraw()
+            return
+        W, H = cv.winfo_width(), cv.winfo_height()
+        cv.delete("sel", "extra")
+        self._draw_selection_tint(cv, W, H, rect, multi, (), clear=True)
+        cv.tag_raise("selbg", "z_selbg")
+        sel_box = self._draw_selection_outline(cv, W, H, rect, ())
+        cv.tag_raise("selfg", "z_selfg")
+        self._update_headers(rect, sel_box, W, H)
+        self._draw_cell_extras(_Tagged(cv, "extra"), W, H, frame["col_pos"], frame["row_pos"])
+        cv.tag_raise("extra", "z_extra")
+        frame["sel"], frame["multi"] = rect, multi
+
+    def _sheet_x(self, c):
+        """Canvas x of column c's left edge, also when scrolled out of view (col_x clamps those)."""
+        c0, c1 = self.frozen()[2:]
+        if c0 <= c < c1:
+            return self.col_x(c)
+        x = self.pane_origin()[0]
+        if c >= self.left:
+            return x + sum(self.col_w(k) for k in range(self.left, c))
+        return x - sum(self.col_w(k) for k in range(c, self.left))
+
+    def _sheet_y(self, r):
+        """Canvas y of row r's top edge, like _sheet_x (rows far off screen are estimated)."""
+        r0, r1 = self.frozen()[:2]
+        if r0 <= r < r1:
+            return self.row_y(r)
+        y, far = self.pane_origin()[1], self.canvas.winfo_height() + 4000
+        step, rows = (1, range(self.top, r)) if r >= self.top else (-1, range(self.top - 1, r - 1, -1))
+        for n, k in enumerate(rows):
+            y += step * self.row_h(k)
+            if abs(y) > far:
+                return y + step * (len(rows) - n - 1) * self.default_row_px
+        return y
+
+    def _chart_box(self, chart):
+        r, c, dx, dy = chart["anchor"]
+        x, y = self._sheet_x(c) + dx * self.px, self._sheet_y(r) + dy * self.px
+        return x, y, x + chart["size"][0] * self.px, y + chart["size"][1] * self.px
+
+    def _draw_charts(self, cv, W, H):
+        """The floating objects: charts, pictures and shapes, in their stacking order, then what shows the
+        selected ones."""
+        self._chart_boxes = []
+        n = len(self.sh.charts)
+        if self.chart_sel is not None and self.chart_sel >= n:
+            self.chart_sel = None
+        self.more_sel = {i for i in self.more_sel if i < n}
+        self._prepare_shapes()
+        for i, chart in enumerate(self.sh.charts):
+            box = self._boxes[i]
+            if chart["type"] == fe.SHAPE:
+                self._draw_shape(cv, i, chart, box, W, H)
+                continue
+            if box[2] < self.header_w or box[0] > W or box[3] < self.header_h or box[1] > H:
+                continue
+            if chart["type"] == fe.PICTURE:
+                self._draw_picture(cv, chart, box)
+            else:
+                labels, series = self.wb.chart_data(self.sheet, chart)
+                charts.draw_chart(cv, box, chart["type"], chart.get("title"), labels, series,
+                                  self.font_for({"size": 14}), self.font_for({"size": 9}), self.px)
+            self._chart_boxes.append((i, box))
+        self._draw_drawing_overlay(cv, W, H)
+
+    def _draw_picture(self, cv, picture, box):
+        x0, y0, x1, y1 = box
+        photo = self.pictures.photo(picture["id"], picture["image"], picture.get("format", "png"), x1 - x0, y1 - y0)
+        if photo is not None:
+            # without Pillow pictures scale in whole steps: centre what Tk made on the box
+            cv.create_image((x0 + x1) / 2, (y0 + y1) / 2, image=photo, anchor="center")
+        else:
+            cv.create_rectangle(x0, y0, x1, y1, fill="#f2f2f2", outline="#a6a6a6")
+            hint = ("Ảnh JPEG: cài Pillow để xem trên màn hình\n(pip install pillow)"
+                    if picture.get("format") == "jpeg" else "Không hiển thị được ảnh")
+            cv.create_text((x0 + x1) / 2, (y0 + y1) / 2, width=max(40, x1 - x0 - 10), fill="#595959",
+                           font=self.ui.small_font, justify="center", text=hint)
+
+    @staticmethod
+    def _chart_handles(box):
+        """Resize handles of a chart box: {edges moved ("l", "rb", ...): (x, y)}."""
+        x0, y0, x1, y1 = box
+        xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+        return {"lt": (x0, y0), "t": (xm, y0), "rt": (x1, y0), "r": (x1, ym), "rb": (x1, y1), "b": (xm, y1),
+                "lb": (x0, y1), "l": (x0, ym)}
+
+    def _chart_at(self, x, y):
+        """(index, box, handle or None) of the topmost chart under a canvas point, or None."""
+        tolerance = max(4, 6 * self.px)
+        for i, box in reversed(self._chart_boxes):
+            if i == self.chart_sel:
+                for edges, (hx, hy) in self._chart_handles(box).items():
+                    if abs(x - hx) <= tolerance and abs(y - hy) <= tolerance:
+                        return i, box, edges
+            if self._inside(box, x, y):
+                return i, box, None
+        return None
+
+    def _place_chart(self, index, box):
+        """Re-anchor chart `index` so that it covers canvas box (x0, y0, x1, y1)."""
+        x0, y0, x1, y1 = box
+        r, c = self.row_at(y0), self.col_at(x0)
+        self.sh.charts[index] = dict(self.sh.charts[index], anchor=(
+            r, c, max(0, round((x0 - self._sheet_x(c)) / self.px)), max(0, round((y0 - self._sheet_y(r)) / self.px))),
+            size=(round((x1 - x0) / self.px), round((y1 - y0) / self.px)))
+
+    def _drag_chart(self, x, y):
+        d = self.drag
+        dx, dy = x - d["start"][0], y - d["start"][1]
+        x0, y0, x1, y1 = d["box"]
+        least = 60 * self.px
+        if d["edges"] is None:
+            x0, x1 = x0 + dx, x1 + dx
+            y0, y1 = y0 + dy, y1 + dy
+            push = max(0, self.header_w - x0), max(0, self.header_h - y0)  # keep it off the headers
+            x0, x1, y0, y1 = x0 + push[0], x1 + push[0], y0 + push[1], y1 + push[1]
+        else:
+            edges = d["edges"]
+            if "l" in edges:
+                x0 = max(self.header_w, min(x0 + dx, x1 - least))
+            if "r" in edges:
+                x1 = max(x1 + dx, x0 + least)
+            if "t" in edges:
+                y0 = max(self.header_h, min(y0 + dy, y1 - least))
+            if "b" in edges:
+                y1 = max(y1 + dy, y0 + least)
+            if len(edges) == 2 and self.sh.charts[d["index"]]["type"] == fe.PICTURE:  # corners keep the shape
+                bx0, by0, bx1, by1 = d["box"]
+                height = (x1 - x0) * (by1 - by0) / max(1, bx1 - bx0)
+                y0, y1 = (y1 - height, y1) if "t" in edges else (y0, y0 + height)
+        self._place_chart(d["index"], (x0, y0, x1, y1))
+        self.redraw()
+
+    def _draw_cell_extras(self, cv, W, H, col_pos, row_pos):
+        """The validation-list arrow and input message of the active cell, note callouts and the Paste
+        Options button."""
+        self._draw_paste_button(cv, W, H)
+        self._list_button = None
+        r, c = self.cur
+        box = self._rect_bbox(*self._cell_box(r, c))
+        shown = self._clip_box(box, W, H) is not None and box[2] > box[0] and box[3] > box[1]
+        rule = self.wb.validation_at(self.sheet, r, c)
+        if rule and shown and rule.get("type") == "list" and rule.get("dropdown", True) and not self.is_editing():
+            size = min(box[3] - box[1], round(18 * self.px))
+            bx0, by1 = box[2] + 1, box[3]
+            self._list_button = (bx0, by1 - size, bx0 + size, by1)
+            cv.create_rectangle(*self._list_button, fill="#f0f0f0", outline="#a6a6a6")
+            mx, my, d = bx0 + size / 2, by1 - size / 2, size * 0.2
+            cv.create_polygon(mx - d, my - d / 2, mx + d, my - d / 2, mx, my + d * 0.8, fill="#444444", outline="")
+        if rule and shown and (rule.get("prompt") or rule.get("prompt_title")):
+            self._callout(cv, W, H, box[0] + 8, box[3] + 6, rule.get("prompt_title"), rule.get("prompt"), None)
+        notes = self.sh.notes
+        if self.show_notes:
+            keys = [k for k in notes if k[0] in row_pos and k[1] in col_pos]
+        elif self.hover_note and self.hover_note[0] == self.sheet and self.hover_note[1:] in notes:
+            keys = [self.hover_note[1:]]
+        else:
+            keys = []
+        for nr, nc in sorted(keys):
+            nbox = self._rect_bbox(*self._cell_box(nr, nc))
+            if nbox[2] <= nbox[0] or nbox[3] <= nbox[1]:
+                continue
+            self._callout(cv, W, H, nbox[2] + 14, nbox[1] - 4, None, notes[(nr, nc)], (nbox[2] - 1, nbox[1]))
+
+    def _callout(self, cv, W, H, x, y, title, text, pointer):
+        """A note-style box at (x, y), moved left of `pointer` (x, y) or up when it would leave the canvas."""
+        font, bold, pad = self.ui.small_font, self.header_bold, round(6 * self.scale)
+        width = round(190 * self.scale)
+        lines = self.wrap_lines(text or "", font, width - 2 * pad) if text else []
+        ls = font.metrics("linespace")
+        height = 2 * pad + len(lines) * ls + (bold.metrics("linespace") + 2 if title else 0)
+        if x + width > W and pointer:
+            x = pointer[0] - 14 - width
+        x = max(self.header_w + 2, min(x, W - width - 2))
+        y = max(self.header_h + 2, min(y, H - height - 2))
+        if pointer:
+            cv.create_line(pointer[0], pointer[1], x if x > pointer[0] else x + width, y + 6, fill=NOTE_LINE)
+        cv.create_rectangle(x + 2, y + 2, x + width + 2, y + height + 2, fill="#d8d8d8", outline="")
+        cv.create_rectangle(x, y, x + width, y + height, fill=NOTE_BG, outline=NOTE_LINE)
+        ty = y + pad
+        if title:
+            cv.create_text(x + pad, ty, text=title, anchor="nw", font=bold, fill="#000000")
+            ty += bold.metrics("linespace") + 2
+        if lines:
+            cv.create_text(x + pad, ty, text="\n".join(lines), anchor="nw", font=font, fill="#000000")
+
+    def _border_lines(self, key, spec, x0, y0, x1, y1):
+        """The canvas lines of one border of a cell box: [((x0, y0, x1, y1), (option, value, ...))]."""
         style, color = spec[0], spec[1] if len(spec) > 1 else "#000000"
         width = max(1, round({"medium": 2, "thick": 3}.get(style, 1) * min(self.px, 2)))
-        dash = {"dashed": "-", "dotted": "."}.get(style, "")
+        dash = {"dashed": "-", "dotted": ".", "hair": "."}.get(style, "")
+        if style == "hair":  # Excel's finest line: dots of every other pixel, which look lighter
+            color = fe.blend(color, "#ffffff", 0.35)
         points = {"bt": ((x0 - 1, y0 - 1, x1, y0 - 1), (0, 1)), "bb": ((x0 - 1, y1 - 1, x1, y1 - 1), (0, -1)),
                   "bl": ((x0 - 1, y0 - 1, x0 - 1, y1), (1, 0)), "br": ((x1 - 1, y0 - 1, x1 - 1, y1), (-1, 0))}
         (a, b, c, d), (dx, dy) = points[key]
         if style == "double":
             gap = max(2, round(2 * self.px))
-            cv.create_line(a, b, c, d, fill=color)
-            cv.create_line(a + dx * gap, b + dy * gap, c + dx * gap, d + dy * gap, fill=color)
-        else:
-            cv.create_line(a, b, c, d, fill=color, width=width, dash=dash)
+            return [((a, b, c, d), ("-fill", color)),
+                    ((a + dx * gap, b + dy * gap, c + dx * gap, d + dy * gap), ("-fill", color))]
+        return [((a, b, c, d), ("-fill", color, "-width", width, "-dash", dash))]
 
     def _draw_headers(self, cv, W, H, sel, sel_box=None):
+        """The column letters and row numbers. Each heading gets its own items so _update_headers can
+        recolour just the ones the selection enters or leaves."""
         hw, hh = self.header_w, self.header_h
+        ow, oh = self.outline_w, self.outline_h  # outline symbols take the room before the headings
+        self._headers = None
         if not self.show_headings:
             return
-        r1, c1, r2, c2 = sel
-        cv.create_rectangle(0, 0, W, hh, fill=HEADER_BG, outline="")
-        cv.create_rectangle(0, 0, hw, H, fill=HEADER_BG, outline="")
-        full_cols = r1 == 0 and r2 == MAX_ROWS - 1
-        full_rows = c1 == 0 and c2 == MAX_COLS - 1
-        for c, x0, x1 in self.vis_cols:
-            sel_col = c1 <= c <= c2
-            if sel_col:
-                cv.create_rectangle(x0, 0, x1, hh, fill=HEADER_FULL_BG if full_cols else HEADER_SEL_BG, outline="")
-            cv.create_line(x1 - 1, 0, x1 - 1, hh, fill=HEADER_LINE)
-            cv.create_text((x0 + x1) // 2, hh // 2, text=col_name(c), fill=HEADER_SEL_FG if sel_col else HEADER_FG,
-                           font=self.header_bold if sel_col else self.header_font)
+        cv.create_rectangle(0, oh, W, hh, fill=HEADER_BG, outline="")
+        cv.create_rectangle(ow, 0, hw, H, fill=HEADER_BG, outline="")
+        heads = {"cols": {}, "rows": {}}
+        for c, x0, x1 in self.vis_cols:  # [background, text, look shown, normal text colour]
+            heads["cols"][c] = [cv.create_rectangle(x0, oh, x1, hh, fill=HEADER_BG, outline=""), None, None, HEADER_FG]
+            cv.create_line(x1 - 1, oh, x1 - 1, hh, fill=HEADER_LINE)
+            heads["cols"][c][1] = cv.create_text((x0 + x1) // 2, (oh + hh) // 2, text=col_name(c), fill=HEADER_FG,
+                                                 font=self.header_font)
+        f = self.sh.filter
+        fr1, fr2 = (f["range"][0], f["range"][2]) if f and f["criteria"] else (0, -1)
+        tall = self.line_space(self.header_font) * 0.6
         for r, y0, y1 in self.vis_rows:
-            sel_row = r1 <= r <= r2
-            if sel_row:
-                cv.create_rectangle(0, y0, hw, y1, fill=HEADER_FULL_BG if full_rows else HEADER_SEL_BG, outline="")
-            cv.create_line(0, y1 - 1, hw, y1 - 1, fill=HEADER_LINE)
-            if y1 - y0 >= self.header_font.metrics("linespace") * 0.6:
-                cv.create_text(hw // 2, (y0 + y1) // 2, text=str(r + 1), fill=HEADER_SEL_FG if sel_row else HEADER_FG,
-                               font=self.header_bold if sel_row else self.header_font)
-        cv.create_line(0, hh - 1, W, hh - 1, fill=HEADER_LINE)
-        cv.create_line(hw - 1, 0, hw - 1, H, fill=HEADER_LINE)
+            fg = FILTERED_ROW_FG if fr1 < r <= fr2 else HEADER_FG
+            item = heads["rows"][r] = [cv.create_rectangle(ow, y0, hw, y1, fill=HEADER_BG, outline=""), None, None, fg]
+            cv.create_line(ow, y1 - 1, hw, y1 - 1, fill=HEADER_LINE)
+            if y1 - y0 >= tall:
+                item[1] = cv.create_text((ow + hw) // 2, (y0 + y1) // 2, text=str(r + 1), fill=fg,
+                                         font=self.header_font)
+        cv.create_line(ow, hh - 1, W, hh - 1, fill=HEADER_LINE)
+        cv.create_line(hw - 1, oh, hw - 1, H, fill=HEADER_LINE)
+        heads["col_line"] = cv.create_line(0, 0, 0, 0, fill=ACCENT, width=2, state="hidden")
+        heads["row_line"] = cv.create_line(0, 0, 0, 0, fill=ACCENT, width=2, state="hidden")
+        cv.create_rectangle(ow, oh, hw - 1, hh - 1, fill=HEADER_BG, outline="")
+        t = round((hh - oh) * 0.45)
+        heads["corner"] = cv.create_polygon(hw - 5, hh - 5 - t, hw - 5, hh - 5, hw - 5 - t, hh - 5, outline="",
+                                            fill="#c4c4c4")
+        self._headers = heads
+        self._update_headers(sel, sel_box, W, H)
+
+    def _update_headers(self, sel, sel_box, W, H):
+        """Highlight the headings of the selected rows and columns, with the green line along them. Only
+        headings whose look changes are touched: Tk repaints one box around all the changes, so moving
+        the active cell repaints a small area instead of the whole sheet."""
+        heads, cv = self._headers, self.canvas
+        if not heads:
+            return
+        r1, c1, r2, c2 = sel
+        for items, lo, hi, full in ((heads["cols"], c1, c2, r1 == 0 and r2 == MAX_ROWS - 1),
+                                    (heads["rows"], r1, r2, c1 == 0 and c2 == MAX_COLS - 1)):
+            for i, item in items.items():
+                if lo <= i <= hi:
+                    look = (HEADER_FULL_BG if full else HEADER_SEL_BG, HEADER_SEL_FG, self.header_bold)
+                else:
+                    look = (HEADER_BG, item[3], self.header_font)
+                if look != item[2]:
+                    item[2] = look
+                    cv.itemconfigure(item[0], fill=look[0])
+                    if item[1]:
+                        cv.itemconfigure(item[1], fill=look[1], font=look[2])
+        hw, hh = self.header_w, self.header_h
+        lines = {"col_line": None, "row_line": None}
         if sel_box:
             sx0, sy0, sx1, sy1 = sel_box
             if sx1 > hw and sx0 < W:
-                cv.create_line(max(sx0, hw), hh - 1, min(sx1, W), hh - 1, fill=ACCENT, width=2)
+                lines["col_line"] = (max(sx0, hw), hh - 1, min(sx1, W), hh - 1)
             if sy1 > hh and sy0 < H:
-                cv.create_line(hw - 1, max(sy0, hh), hw - 1, min(sy1, H), fill=ACCENT, width=2)
-        cv.create_rectangle(0, 0, hw - 1, hh - 1, fill=HEADER_BG, outline="")
-        t = round(hh * 0.45)
-        cv.create_polygon(hw - 5, hh - 5 - t, hw - 5, hh - 5, hw - 5 - t, hh - 5, outline="",
-                          fill=ACCENT if full_cols and full_rows else "#c4c4c4")
+                lines["row_line"] = (hw - 1, max(sy0, hh), hw - 1, min(sy1, H))
+        for key, coords in lines.items():
+            if heads.get(key + "_at", False) != coords:
+                heads[key + "_at"] = coords
+                if coords:
+                    cv.coords(heads[key], *coords)
+                cv.itemconfigure(heads[key], state="normal" if coords else "hidden")
+        corner = ACCENT if (r1, c1, r2, c2) == (0, 0, MAX_ROWS - 1, MAX_COLS - 1) else "#c4c4c4"
+        if heads.get("corner_fill") != corner:
+            heads["corner_fill"] = corner
+            cv.itemconfigure(heads["corner"], fill=corner)
+
+    def _draw_outline(self, cv, W, H, row_pos, col_pos):
+        """Excel's outline symbols beside the headings: level buttons 1, 2, ..., a bracket along each group
+        and a +/- button at its summary row or column. Button boxes go to self._outline_buttons."""
+        self._outline_buttons = []
+        ow, oh, hw, hh, step = self.outline_w, self.outline_h, self.header_w, self.header_h, self.outline_step
+        if not (ow or oh):
+            return
+        sh = self.sh
+        cv.create_rectangle(0, 0, W, oh, fill=OUTLINE_BG, outline="")
+        cv.create_rectangle(0, 0, ow, H, fill=OUTLINE_BG, outline="")
+        size = max(7, round(11 * self.scale))
+        font = (self.ui_family, -max(7, round(10 * self.scale)))
+
+        def button(x, y, text, action, side):
+            x0, y0, x1, y1 = x - side / 2, y - side / 2, x + side / 2, y + side / 2
+            cv.create_rectangle(x0, y0, x1, y1, fill="#ffffff", outline=OUTLINE_FG)
+            if text in "+-":
+                arm = side * 0.28
+                cv.create_line(x - arm, y, x + arm + 1, y, fill="#404040")
+                if text == "+":
+                    cv.create_line(x, y - arm, x, y + arm + 1, fill="#404040")
+            else:
+                cv.create_text(x, y, text=text, font=font, fill="#404040")
+            self._outline_buttons.append((x0, y0, x1, y1, action))
+
+        for axis, levels, pos, vis, room in ((0, sh.row_levels, row_pos, self.vis_rows, ow),
+                                             (1, sh.col_levels, col_pos, self.vis_cols, oh)):
+            if not room or not levels:
+                continue
+
+            def pt(across, along, axis=axis):
+                return (across, along) if axis == 0 else (along, across)
+            hidden = sh.hidden_rows if axis == 0 else sh.hidden_cols
+            start, end = (hh, H) if axis == 0 else (hw, W)
+            band = (oh + hh) / 2 if axis == 0 else (ow + hw) / 2
+            for n in range(1, max(levels.values()) + 2):
+                button(*pt((n - 1) * step + step / 2 + 1, band), str(n), ("level", axis, n), size + 2)
+            for level, a, b in fe.outline_groups(levels):
+                across = (level - 1) * step + step / 2 + 1
+                collapsed = a in hidden and b in hidden
+                summary = pos.get(b + 1)
+                if not collapsed and vis:
+                    seen = [(p0, p1) for i, p0, p1 in vis if a <= i <= b]
+                    span = ((seen[0][0], seen[-1][1]) if seen else
+                            (start, end) if a < vis[0][0] and b > vis[-1][0] else None)
+                    if span:
+                        lo = span[0] + 3 if a in pos else start
+                        hi = (summary[0] + summary[1]) / 2 - size / 2 if summary else span[1]
+                        if hi > lo:
+                            cv.create_line(*pt(across, lo), *pt(across, hi), fill=OUTLINE_FG)
+                        if a in pos:
+                            cv.create_line(*pt(across, lo), *pt(across + step * 0.4, lo), fill=OUTLINE_FG)
+                if summary:
+                    button(*pt(across, (summary[0] + summary[1]) / 2), "+" if collapsed else "-",
+                           ("toggle", axis, level, a, b, not collapsed), size)
 
     def update_scrollbars(self):
         rows, cols = self.wb.used_extent(self.sheet)
@@ -1457,29 +2989,75 @@ class SpreadsheetApp:
 
     # ------------------------------------------------------------------ refresh
 
-    def refresh_view(self):
-        self.redraw()
+    def request_refresh(self, ui=True, cells=True):
+        """Refresh once the input waiting now has been handled: scrolling, key repeat and dragging then draw
+        once per batch of events instead of falling behind by drawing for each one. ui: also the formula
+        bar, name box, ribbon and status bar; cells=False: only the selection moved."""
+        if self._refresh_job is None:
+            self._pending = (ui, cells)
+            self._refresh_job = self.root.after_idle(self._run_refresh)
+        else:
+            self._pending = (self._pending[0] or ui, self._pending[1] or cells)
+
+    def _run_refresh(self):
+        self._refresh_job = None
+        if not self.canvas.winfo_exists():  # the window was closed meanwhile
+            return
+        ui, cells = self._pending
+        if ui:
+            self.refresh(cells)
+        else:
+            self.refresh_view(cells)
+
+    def refresh_view(self, cells=True):
+        if self._refresh_job is not None:  # what was waiting is drawn now
+            cells = cells or self._pending[1]
+            if self._pending[0]:
+                self._pending = (True, False)
+            else:
+                self.root.after_cancel(self._refresh_job)
+                self._refresh_job = None
+        if cells:
+            self.redraw()
+        else:
+            self.redraw_selection()
         self.update_scrollbars()
 
-    def refresh(self):
-        self.refresh_view()
+    def refresh(self, cells=True):
+        if self._refresh_job is not None:
+            cells = cells or self._pending[1]
+            self.root.after_cancel(self._refresh_job)
+            self._refresh_job = None
+        self.refresh_view(cells)
         self.update_formula_bar()
         self.update_name_box()
         self.update_toolbar()
         self.update_status()
+        self._sync_pivot_pane()
 
     def refresh_all(self):
         self.build_tabs()
         self.refresh()
         self.update_title()
+        mode = self.mode_label.cget("text")
+        if mode == "Sẵn sàng" or mode.startswith("Bộ lọc:"):
+            self.set_mode("Sẵn sàng")
 
     def _focus_is(self, widget):
         # compare Tcl names: focus_get() raises KeyError while a combobox list is open
         return str(self.root.tk.call("focus")) == str(widget)
 
     def update_formula_bar(self):
+        ghost = False
         if not self.is_editing():
-            self.fx_var.set(self.wb.get_raw(self.sheet, *self.cur))
+            raw = self.wb.get_raw(self.sheet, *self.cur)
+            anchor = None if raw else self.wb.spill_anchor(self.sheet, *self.cur)
+            if anchor is not None and anchor != self.cur:  # a cell a dynamic array spilled into
+                raw, ghost = self.wb.get_raw(self.sheet, *anchor), True
+            if self.sh.protection and (self.sh.formats.get(self.cur) or {}).get("hide_formula"):
+                raw = ""  # Format Cells > Protection > Hidden: the formula is not shown while protected
+            self.fx_var.set(raw)
+        self.fx.configure(foreground="#a0a0a0" if ghost else "")
         editing = self.is_editing()
         self.btn_x.config(fg="#c42b1c" if editing else "#c0c0c0")
         self.btn_ok.config(fg="#107c41" if editing else "#c0c0c0")
@@ -1492,6 +3070,9 @@ class SpreadsheetApp:
             text = f"{r2 - r1 + 1}H x {c2 - c1 + 1}C"
         else:
             text = cell_name(*self.cur)
+            if self.wb.names:  # a block that has a name shows the name, as in Excel
+                text = next((d["name"] for d in self.wb.sorted_names()
+                             if self.wb.name_target(d["name"]) == (self.sheet, (r1, c1, r2, c2))), text)
         self.name_box.delete(0, "end")
         self.name_box.insert(0, text)
 
@@ -1517,31 +3098,80 @@ class SpreadsheetApp:
         self.btn_painter.set_checked(self.painter is not None)
         self.btn_show_formulas.set_checked(self.show_formulas)
         self.btn_filter.set_checked(self.sh.filter is not None)
+        self.btn_protect.set_checked(self.sh.protection is not None)
+        self.print_grid_var.set(bool((self.sh.page_setup or {}).get("gridlines")))
         num = dialogs.canonical_format(fmt.get("num"))
         self.numfmt_box.set(next((label for label, f in NUMBER_FORMATS if dialogs.canonical_format(f) == num),
                                  "Tùy chỉnh"))
 
     def update_status(self):
-        r1, c1, r2, c2 = self.sel_rect()
-        if (r1, c1, r2, c2) == self._cell_box(*self.cur):
+        """Average / Count / Sum of the selection in the status bar. Large selections are added up a piece
+        at a time between events, so moving around never waits for them; an unchanged selection is not
+        added up again."""
+        rects = [self.sel_rect()] + self.areas
+        if len(rects) == 1 and rects[0] == self._cell_box(*self.cur):
+            self._stats_key = None
+            if self._stats_job:
+                self.root.after_cancel(self._stats_job)
+                self._stats_job = None
             self.stats_label.config(text="")
             return
-        cells = self.sh.cells
-        if (r2 - r1 + 1) * (c2 - c1 + 1) > len(cells):
-            keys = [k for k in cells if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
-        else:
-            keys = [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) in cells]
-        count, nums, total = 0, 0, 0.0
-        for r, c in keys:
-            if self.sh.row_hidden(r):
+        rows, cols = self.wb.used_extent(self.sheet)
+        rects = [(r1, c1, min(r2, rows - 1), min(c2, cols - 1)) for r1, c1, r2, c2 in rects]
+        key = (id(self.wb), self.sheet, tuple(rects), self.edit_serial)
+        if key == self._stats_key:
+            return
+        self._stats_key = key
+        if self._stats_job:
+            self.root.after_cancel(self._stats_job)
+        work = self._stats_work(rects)
+        if sum(max(0, r2 - r1 + 1) * max(0, c2 - c1 + 1) for r1, c1, r2, c2 in rects) > 5000:
+            self.stats_label.config(text="")
+        self._stats_job = None
+        self._stats_step(work)
+
+    def _stats_work(self, rects):
+        """Generator adding up the selected cells; yields now and then so the work can pause, and
+        finally yields (count, numbers, total)."""
+        cells, sh, get = self.sh.cells, self.sh, self.wb.get_value
+        sheet, seen = self.sheet, set()
+        count = nums = 0
+        total = 0.0
+        for r1, c1, r2, c2 in rects:
+            if r2 < r1 or c2 < c1:
                 continue
-            v = self.wb.get_value(self.sheet, r, c)
-            if v is None or v == "":
-                continue
-            count += 1
-            if fe.is_number(v):
-                nums += 1
-                total += v
+            if (r2 - r1 + 1) * (c2 - c1 + 1) > len(cells):
+                keys = sorted(k for k in cells if r1 <= k[0] <= r2 and c1 <= k[1] <= c2)
+            else:
+                keys = ((r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) in cells)
+            spilled = [k for k in self.wb.spill_map(sheet) if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
+            for i, (r, c) in enumerate(itertools.chain(keys, spilled)):
+                if i % 4000 == 3999:
+                    yield None
+                if (r, c) in seen or sh.row_hidden(r):
+                    continue
+                if len(rects) > 1:
+                    seen.add((r, c))
+                v = get(sheet, r, c)
+                if v is None or v == "":
+                    continue
+                count += 1
+                if fe.is_number(v):
+                    nums += 1
+                    total += v
+        yield count, nums, total
+
+    def _stats_step(self, work):
+        """Run the adding up for a moment, then let events through and carry on."""
+        end = time.perf_counter() + 0.04
+        result = None
+        while result is None and time.perf_counter() < end:
+            result = next(work)
+        if result is None:
+            self._stats_job = self.root.after(1, lambda: self._stats_step(work))
+            return
+        self._stats_job = None
+        count, nums, total = result
         parts = []
         if nums:
             parts.append(f"Trung bình: {fe.format_general(total / nums)}")
@@ -1553,10 +3183,22 @@ class SpreadsheetApp:
 
     def update_title(self):
         name = os.path.basename(self.path) if self.path else "Sổ làm việc mới"
-        self.root.title(f"{'*' if self.dirty else ''}{name} - {APP_NAME}")
+        title = f"{'*' if self.dirty else ''}{name} - {APP_NAME}"
+        self.root.title(title)
+        self.titlebar.set_title(title)
 
     def set_mode(self, text):
+        if text == "Sẵn sàng":
+            text = self._ready_text()
         self.mode_label.config(text=text)
+
+    def _ready_text(self):
+        """'Ready', or how many records a filter shows (Excel's "5 of 20 records found")."""
+        f = self.sh.filter if self.sheet in self.wb.sheets else None
+        if f and f["criteria"]:
+            total = f["range"][2] - f["range"][0]
+            return f"Bộ lọc: tìm thấy {total - len(f['hidden'])} trên {total} bản ghi"
+        return "Sẵn sàng"
 
     def mark_dirty(self):
         if not self.dirty:
@@ -1567,6 +3209,8 @@ class SpreadsheetApp:
         for widget in self.tab_frame.winfo_children():
             widget.destroy()
         for name, sheet in self.wb.sheets.items():
+            if sheet.hidden:
+                continue
             active = name == self.sheet
             strip = sheet.tab_color or (ACCENT if active else SHEETBAR_BG)
             holder = tk.Frame(self.tab_frame, bg=strip)
@@ -1594,8 +3238,8 @@ class SpreadsheetApp:
             r = m[2] if dr > 0 else m[0] if dr < 0 else r
             c = m[3] if dc > 0 else m[1] if dc < 0 else c
         r, c = r + dr, c + dc
-        while dr and 0 <= r < MAX_ROWS and self.sh.row_hidden(r):
-            r += dr
+        if dr and 0 <= r < MAX_ROWS and self.sh.row_hidden(r):  # step over the hidden rows at once
+            r = next(self.shown_rows(r) if dr > 0 else self.shown_rows_back(r), -1)
         while dc and 0 <= c < MAX_COLS and c in self.sh.hidden_cols:
             c += dc
         if not (0 <= r < MAX_ROWS and 0 <= c < MAX_COLS):
@@ -1603,18 +3247,24 @@ class SpreadsheetApp:
         return r, c
 
     def select_to(self, target, extend=False):
+        self.areas = []
         if extend:
             self.ext = target
         else:
             self.cur = self.ext = self._anchor(target)
+        view = (self.top, self.left)
         self.ensure_visible(*target)
-        self.refresh()
+        self.request_refresh(cells=(self.top, self.left) != view)
 
     def move_active(self, dr, dc):
         self.select_to(self._step(self.cur, dr, dc))
 
     def select_all(self):
         self.commit_edit()
+        if self._objects_selected():
+            self.select_all_objects()
+            return
+        self.areas = []
         self.cur, self.ext = (0, 0), (MAX_ROWS - 1, MAX_COLS - 1)
         self.refresh()
 
@@ -1639,21 +3289,40 @@ class SpreadsheetApp:
 
     def on_key(self, e):
         ks = e.keysym
+        self._lone_ctrl = False
+        if ks == "Escape" and getattr(self, "_pdf_job", None):
+            self._pdf_job["stop"] = True
+            return "break"
+        if self._drawing_key(e):
+            return "break"
+        if self.chart_sel is not None and ks not in MODIFIER_KEYS:
+            if ks in ("Delete", "BackSpace"):
+                self.delete_chart()
+                return "break"
+            self.chart_sel = None  # any other key goes back to the cells
+            self.redraw()
+            if ks == "Escape":
+                return "break"
         shift, ctrl = bool(e.state & SHIFT), bool(e.state & CONTROL)
         arrows = {"Up": (-1, 0), "Down": (1, 0), "Left": (0, -1), "Right": (0, 1)}
         base = self.ext if shift else self.cur
         if ks in arrows:
             dr, dc = arrows[ks]
             target = self._jump(base, dr, dc) if ctrl else self._step(base, dr, dc)
+            if dr and self.sh.row_hidden(target[0]):  # Ctrl+arrow into rows a filter hides: the last shown one
+                target = (next(self.shown_rows_back(target[0]) if dr > 0 else self.shown_rows(target[0]),
+                               base[0]), target[1])
             self.select_to(target, extend=shift)
         elif ks in ("Return", "KP_Enter"):
             self.move_active(-1 if shift else 1, 0)
         elif ks == "Tab":
             self.move_active(0, -1 if shift else 1)
+        elif ks in ("Prior", "Next") and ctrl:
+            self.step_sheet(-1 if ks == "Prior" else 1)
         elif ks in ("Prior", "Next"):
             n = self._visible_rows() * (-1 if ks == "Prior" else 1)
-            self.top = max(0, min(MAX_ROWS - 1, self.top + n))
-            self.select_to(self._clamp(base[0] + n, base[1]), extend=shift)
+            self.top = max(self.frozen()[1], self.rows_from(self.top, n))
+            self.select_to((self.rows_from(base[0], n), base[1]), extend=shift)
         elif ks == "Home":
             self.select_to((0, 0) if ctrl else (base[0], 0), extend=shift)
         elif ks == "End" and ctrl:
@@ -1666,6 +3335,9 @@ class SpreadsheetApp:
         elif ks == "BackSpace":
             self.start_edit(initial="", mode="enter")
         elif ks == "Escape":
+            if self._paste_options_shown():
+                self.paste_info = None
+                self.redraw_selection()
             if self.painter:
                 self.stop_painter()
             elif self.clip:
@@ -1687,6 +3359,39 @@ class SpreadsheetApp:
     # ------------------------------------------------------------------ mouse
 
     def on_press(self, e):
+        self._hide_ribbon_peek()
+        self._lone_ctrl = False
+        if self._paste_button and self._inside(self._paste_button, e.x, e.y):
+            self.paste_options()
+            return "break"
+        if self._list_button and self._inside(self._list_button, e.x, e.y):
+            self.open_validation_list()
+            return "break"
+        if self._drawing_press(e):
+            return "break"
+        hit = self._chart_at(e.x, e.y)
+        prot = self.sh.protection
+        if hit is not None and prot and "objects" not in prot.get("allow", ()):
+            hit = None  # objects on a protected sheet can't be selected
+        if hit is not None and not self._point_mode_ok():
+            self.commit_edit()
+            self.canvas.focus_set()
+            index, box, edges = hit
+            self.chart_sel = index
+            self.drag = {"mode": "chart", "index": index, "box": box, "edges": edges, "start": (e.x, e.y),
+                         "before": self.wb.snapshot(), "sel": self._sel_state()}
+            self.redraw()
+            return "break"
+        if self.chart_sel is not None:
+            self.chart_sel = None
+            self.redraw()
+        for bx0, by0, bx1, by1, action in self._outline_buttons:
+            if bx0 - 2 <= e.x <= bx1 + 2 and by0 - 2 <= e.y <= by1 + 2:
+                self.commit_edit()
+                self.outline_action(action)
+                return "break"
+        if e.x < self.outline_w or e.y < self.outline_h:
+            return "break"
         for bx0, by0, bx1, by1, col in self._filter_buttons:
             if bx0 <= e.x <= bx1 and by0 <= e.y <= by1:
                 self.commit_edit()
@@ -1699,6 +3404,8 @@ class SpreadsheetApp:
         self.commit_edit()
         self.canvas.focus_set()
         border = self._border_hit(e.x, e.y)
+        if border is not None and prot and "format_rows_cols" not in prot.get("allow", ()):
+            border = None
         if border is not None:
             axis, index = border
             size = self.col_w(index) if axis == "col" else self.row_h(index)
@@ -1709,6 +3416,10 @@ class SpreadsheetApp:
             self.drag = {"mode": "fill", "target": None}
             return None
         shift = bool(e.state & SHIFT)
+        if kind == "cell" and e.state & CONTROL and not shift and not self.painter:
+            self.areas.append(self.sel_rect())  # Ctrl+click: keep what is selected and start another block
+        elif not shift:
+            self.areas = []
         if kind == "corner":
             self.cur, self.ext = (0, 0), (MAX_ROWS - 1, MAX_COLS - 1)
             self.drag = None
@@ -1725,23 +3436,32 @@ class SpreadsheetApp:
                 self.ext = (r, c)
             else:
                 self.cur = self.ext = self._anchor((r, c))
+                if not self.painter and not e.state & CONTROL and self.wb.hyperlink_at(self.sheet, *self.cur):
+                    self._link_click = (self.sheet, self.cur, e.time)  # opened on release unless held
             self.drag = {"mode": "select"}
-        self.refresh()
+        self.request_refresh(cells=False)
         return None
 
     def on_drag(self, e):
         if not self.drag:
             return
         self._last_mouse = (e.x, e.y)
+        if self.drag["mode"].startswith("shape"):
+            self._drawing_drag(e.x, e.y, e.state)
+            return
         self._drag_to(e.x, e.y)
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
         outside = e.x < self.header_w or e.y < self.header_h or e.x > W or e.y > H
-        if outside and self._autoscroll_job is None and not self.drag["mode"].startswith("resize"):
-            self._autoscroll_job = self.root.after(50, self._autoscroll)
+        if outside and self._autoscroll_job is None and not self.drag["mode"].startswith(("resize", "chart")):
+            self._autoscroll_at, self._autoscroll_carry = time.perf_counter(), [0.0, 0.0]
+            self._autoscroll_job = self.root.after(AUTOSCROLL_MS, self._autoscroll)
 
     def _drag_to(self, x, y):
         d = self.drag
         mode = d["mode"]
+        if mode == "chart":
+            self._drag_chart(x, y)
+            return
         if mode.startswith("resize"):
             pos = x if mode == "resize_col" else y
             size = max(0, round((d["size"] + pos - d["start"]) / self.px))
@@ -1750,7 +3470,7 @@ class SpreadsheetApp:
             else:
                 self.sh.row_heights[d["index"]] = max(4, size)
                 self.sh.custom_rows.add(d["index"])
-            self.refresh_view()
+            self.request_refresh(ui=False)
             return
         r, c = self.row_at(y), self.col_at(x)
         if mode == "select":
@@ -1763,48 +3483,103 @@ class SpreadsheetApp:
             self._point_set(*d["anchor"], r, c)
         elif mode == "fill":
             d["target"] = self._fill_target(r, c)
-        self.redraw()
+        self.request_refresh(ui=False, cells=mode == "point")  # point: the formula's reference boxes change
         self.update_status()
         self.update_name_box()
+
+    def _autoscroll_steps(self, axis, beyond, elapsed):
+        """Rows (axis 0) or columns (1) to scroll after `elapsed` seconds with the mouse `beyond` pixels past
+        the edge. Rows as in Excel: the further out, the faster - a few rows a second close to the edge,
+        thousands far below it; columns (wide, few) at a steady 20 a second. Fractions carry over."""
+        if axis == 0:
+            per_second = 24 * 2 ** min(beyond / (self.px * 18), 10)
+        else:
+            per_second = 20
+        steps = self._autoscroll_carry[axis] + per_second * elapsed
+        whole = int(steps)
+        self._autoscroll_carry[axis] = steps - whole
+        return whole
 
     def _autoscroll(self):
         self._autoscroll_job = None
         if not self.drag or self.drag["mode"].startswith("resize"):
             return
+        now = time.perf_counter()
+        elapsed, self._autoscroll_at = min(0.25, now - self._autoscroll_at), now
         x, y = self._last_mouse
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
         mode, moved = self.drag["mode"], False
+        _, r1, _, c1 = self.frozen()
         if y > H and self.top < MAX_ROWS - 1:
-            self.top, moved = self.top + 1, True
-        elif y < self.header_h and self.top > 0 and mode != "colsel":
-            self.top, moved = self.top - 1, True
+            n = self._autoscroll_steps(0, y - H, elapsed)
+            if n:
+                self.top, moved = min(MAX_ROWS - 1, self.rows_from(self.top, n)), True
+        elif y < self.header_h and self.top > r1 and mode != "colsel":
+            n = self._autoscroll_steps(0, self.header_h - y, elapsed)
+            if n:
+                self.top, moved = max(r1, self.rows_from(self.top, -n)), True
+        else:
+            self._autoscroll_carry[0] = 0.0
         if x > W and self.left < MAX_COLS - 1:
-            self.left, moved = self.left + 1, True
-        elif x < self.header_w and self.left > 0 and mode != "rowsel":
-            self.left, moved = self.left - 1, True
+            n = self._autoscroll_steps(1, x - W, elapsed)
+            if n:
+                self.left, moved = min(MAX_COLS - 1, self.left + n), True
+        elif x < self.header_w and self.left > c1 and mode != "rowsel":
+            n = self._autoscroll_steps(1, self.header_w - x, elapsed)
+            if n:
+                self.left, moved = max(c1, self.left - n), True
+        else:
+            self._autoscroll_carry[1] = 0.0
         if moved:
             self._drag_to(x, y)
             self.update_scrollbars()
-            self._autoscroll_job = self.root.after(50, self._autoscroll)
+        outside = x < self.header_w or y < self.header_h or x > W or y > H
+        if outside:
+            self._autoscroll_job = self.root.after(AUTOSCROLL_MS, self._autoscroll)
 
     def on_release(self, e):
         d, self.drag = self.drag, None
+        click, self._link_click = self._link_click, None
+        self._hide_link_tip()
         if self._autoscroll_job is not None:
             self.root.after_cancel(self._autoscroll_job)
             self._autoscroll_job = None
         if not d:
+            return
+        if d["mode"].startswith("shape"):
+            self._drawing_release(d, e)
             return
         if d["mode"] == "fill" and d.get("target"):
             self.do_fill(d["target"])
         elif d["mode"].startswith("resize"):
             if d["mode"] == "resize_col":
                 self.autofit_wrapped_rows(d["index"])
-            self._push_snapshot(d["before"], d["sel"])
+            self._push_snapshot(d["before"], d["sel"], "Độ rộng cột" if d["mode"] == "resize_col" else "Chiều cao hàng")
+        elif d["mode"] == "chart":
+            self._push_snapshot(d["before"], d["sel"], "Di chuyển biểu đồ")
+            self.redraw()
+            return
         elif d["mode"] in ("select", "colsel", "rowsel") and self.painter:
             self._apply_painter()
-        self.refresh()
+        if (click and d["mode"] == "select" and click[:2] == (self.sheet, self.cur) and self.ext == self.cur
+                and 0 <= e.time - click[2] < 600):  # a click, not a hold, on a linked cell follows the link
+            link = self.wb.hyperlink_at(self.sheet, *self.cur)
+            if link:
+                self.refresh()
+                self.follow_link(link)
+                return
+        self.request_refresh(cells=False)
 
     def on_double(self, e):
+        if self.selected_shapes(lines=False) and not self.insert_tool:
+            self._prepare_shapes()
+            hit = next((i for i in range(len(self.sh.charts) - 1, -1, -1) if self._object_hit(i, e.x, e.y)), None)
+            if hit is not None and self.sh.charts[hit]["type"] == fe.SHAPE and not shapes.is_line(self.sh.charts[hit]):
+                self.edit_shape_text(hit)
+                return "break"
+        if self._chart_at(e.x, e.y) is not None:
+            self.edit_chart()
+            return "break"
         border = self._border_hit(e.x, e.y)
         if border is not None:
             if border[0] == "col":
@@ -1814,17 +3589,43 @@ class SpreadsheetApp:
             return "break"
         kind, r, c = self.hit(e.x, e.y)
         if kind == "cell" and not self.is_editing() and not self.painter:
+            p = pv.pivot_at(self.wb, self.sheet, r, c)
+            if p is not None:
+                self.pivot_details(p, r, c)
+                return "break"
             self.cur = self.ext = self._anchor((r, c))
             self.start_edit(mode="edit")
         return "break"
 
+    @staticmethod
+    def _inside(box, x, y):
+        return box[0] <= x <= box[2] and box[1] <= y <= box[3]
+
+    def _set_hover_note(self, key):
+        if key != self.hover_note:
+            self.hover_note = key
+            self.redraw()
+
     def on_motion(self, e):
         if self.drag:
             return
+        kind, r, c = self.hit(e.x, e.y)
+        anchor = self._anchor((r, c)) if kind == "cell" else None
+        chart = self._chart_at(e.x, e.y)
+        shape_cursor = self._drawing_motion(e)
+        self._set_hover_note((self.sheet, *anchor) if anchor in self.sh.notes and not chart and not shape_cursor
+                             else None)
         border = self._border_hit(e.x, e.y)
-        if border is not None:
+        if shape_cursor:
+            cursor = shape_cursor
+        elif chart is not None:
+            cursor = {None: "fleur", "l": "sb_h_double_arrow", "r": "sb_h_double_arrow", "t": "sb_v_double_arrow",
+                      "b": "sb_v_double_arrow", "lt": "top_left_corner", "rb": "bottom_right_corner",
+                      "rt": "top_right_corner", "lb": "bottom_left_corner"}[chart[2]]
+        elif border is not None:
             cursor = "sb_h_double_arrow" if border[0] == "col" else "sb_v_double_arrow"
-        elif any(b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3] for b in self._filter_buttons):
+        elif any(b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3] for b in self._filter_buttons) or (
+                self._list_button and self._inside(self._list_button, e.x, e.y)):
             cursor = "hand2"
         elif not self.is_editing() and self._on_fill_handle(e.x, e.y):
             cursor = "crosshair"
@@ -1832,6 +3633,15 @@ class SpreadsheetApp:
             cursor = "pencil"
         else:
             cursor = {"colhead": "sb_down_arrow", "rowhead": "sb_right_arrow", "cell": "plus"}.get(self.hit(e.x, e.y)[0], "")
+        link = self.wb.hyperlink_at(self.sheet, *anchor) if cursor == "plus" and not self.is_editing() else None
+        if link:
+            cursor = "hand2"
+        hover = (self.sheet, anchor) if link else None
+        if hover != self._link_hover:
+            self._link_hover = hover
+            self._hide_link_tip()
+            if link:
+                self._show_link_tip(link, e.x_root, e.y_root)
         if cursor != self._cursor:
             self._cursor = cursor
             self.canvas.config(cursor=cursor)
@@ -1847,17 +3657,17 @@ class SpreadsheetApp:
         if horizontal:
             self.left = max(0, min(MAX_COLS - 1, self.left - notches))
         else:
-            self.top = max(0, min(MAX_ROWS - 1, self.top - 3 * notches))
-        self.refresh_view()
+            self.top = max(self.frozen()[1], self.rows_from(self.top, -3 * notches))
+        self.request_refresh(ui=False)
         return "break"
 
     def on_vscroll(self, *args):
         if args[0] == "moveto":
-            self.top = int(float(args[1]) * self._v_total)
+            self.top = max(0, min(int(float(args[1]) * self._v_total), MAX_ROWS - 1))
+            self.top = next(self.shown_rows(self.top), self.top)
         elif args[0] == "scroll":
-            self.top += int(args[1]) * (self._visible_rows() if args[2] == "pages" else 1)
-        self.top = max(0, min(self.top, MAX_ROWS - 1))
-        self.refresh_view()
+            self.top = self.rows_from(self.top, int(args[1]) * (self._visible_rows() if args[2] == "pages" else 1))
+        self.request_refresh(ui=False)
 
     def on_hscroll(self, *args):
         if args[0] == "moveto":
@@ -1865,11 +3675,33 @@ class SpreadsheetApp:
         elif args[0] == "scroll":
             self.left += int(args[1]) * (max(1, len(self.vis_cols) - 1) if args[2] == "pages" else 1)
         self.left = max(0, min(self.left, MAX_COLS - 1))
-        self.refresh_view()
+        self.request_refresh(ui=False)
 
     def on_context(self, e):
         self.commit_edit()
         self.canvas.focus_set()
+        if self.insert_tool:
+            self.set_insert_tool(None)
+            return
+        self._prepare_shapes()
+        top = next((i for i in range(len(self.sh.charts) - 1, -1, -1) if self._object_hit(i, e.x, e.y)), None)
+        if top is not None and self.sh.charts[top]["type"] == fe.SHAPE:
+            if top not in self.selected_objects():
+                self.chart_sel = top
+            self.redraw()
+            self.shape_context_menu(e)
+            return
+        hit = self._chart_at(e.x, e.y)
+        if hit is not None:
+            self.chart_sel = hit[0]
+            self.redraw()
+            menu = self.picture_menu if self.sh.charts[hit[0]]["type"] == fe.PICTURE else self.chart_menu
+            try:
+                menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                menu.grab_release()
+            return
+        self.chart_sel = None
         kind, r, c = self.hit(e.x, e.y)
         r1, c1, r2, c2 = self.sel_rect()
         menu = self.cell_menu
@@ -1894,8 +3726,22 @@ class SpreadsheetApp:
     def is_editing(self):
         return self.editor is not None or self.bar_editing
 
+    def _pivot_guard(self, r1, c1, r2, c2):
+        """True (after telling the user) when the cells overlap a pivot report, which is not edited by hand."""
+        for p in self.sh.pivots:
+            a1, b1, a2, b2 = p["rect"] or (0, 0, -1, -1)
+            if a1 <= r2 and r1 <= a2 and b1 <= c2 and c1 <= b2:
+                messagebox.showinfo(APP_NAME, "Không thể sửa ô của báo cáo PivotTable. Hãy sửa dữ liệu nguồn rồi "
+                                    "bấm Làm mới, hoặc dùng ngăn Các trường PivotTable.", parent=self.root)
+                return True
+        return False
+
     def start_edit(self, initial=None, mode="edit"):
         if self.is_editing():
+            return
+        if self._pivot_guard(*self._cell_box(*self._anchor(self.cur))):
+            return
+        if self._locked(cells=[self._anchor(self.cur)]):
             return
         if self.painter:
             self.stop_painter()
@@ -1918,9 +3764,11 @@ class SpreadsheetApp:
         e.bind("<Control-Return>", lambda ev: self._key_action(lambda: self.commit_edit(fill=True)))
         e.bind("<Escape>", lambda ev: self._key_action(self.cancel_edit))
         e.bind("<Control-semicolon>", lambda ev: self._key_action(lambda: self.insert_now(False)))
+        e.bind("<Alt-Return>", lambda ev: self._key_action(lambda: e.insert("insert", "\n")))
         for key, d in (("Up", (-1, 0)), ("Down", (1, 0)), ("Left", (0, -1)), ("Right", (0, 1))):
             e.bind(f"<{key}>", lambda ev, d=d: self._editor_arrow(d))
         e.bind("<Key>", self._reset_point, add="+")
+        self._formula_assist(e)
         self.set_mode("Nhập" if mode == "enter" else "Sửa")
         self.update_formula_bar()
         self.redraw()
@@ -1932,7 +3780,8 @@ class SpreadsheetApp:
         sheet, r, c = self.edit_cell
         x0, y0, x1, y1 = self._rect_bbox(*self._cell_box(r, c))
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if sheet != self.sheet or y0 < self.header_h - 1 or y0 >= H or x1 <= self.header_w or x0 >= W:
+        if (sheet != self.sheet or y0 < self.header_h - 1 or y0 >= H or x1 <= self.header_w or x0 >= W
+                or x1 <= x0 or y1 <= y0):  # off screen, or scrolled behind frozen panes
             self.editor.place_forget()
             return
         needed = self.text_width(self._edit_font, self.edit_var.get()) + 4 * self.pad
@@ -1943,11 +3792,17 @@ class SpreadsheetApp:
     def _on_edit_text(self, *_):
         if self.editor is not None:
             self.fx_var.set(self.edit_var.get())
-            self.redraw()
+            self._show_edit_refs(self.edit_var.get())
 
     def _on_fx_text(self, *_):
         if self.bar_editing:
-            self.redraw()
+            self._show_edit_refs(self.fx_var.get())
+
+    def _show_edit_refs(self, text):
+        """While a formula is typed its references are outlined in colour on the sheet: redraw when they
+        change (not for every key, which made typing slow)."""
+        if fe.formula_references(text) != self._drawn_refs:
+            self.request_refresh(ui=False)
 
     def _on_fx_focus(self, e):
         if self.editor is not None:  # move an in-cell edit into the formula bar
@@ -1962,6 +3817,69 @@ class SpreadsheetApp:
             self.edit_cell, self.edit_mode = (self.sheet, *self.cur), "edit"
         self.set_mode("Sửa")
         self.update_formula_bar()
+
+    @undo_name("Bảo vệ trang tính")
+    def toggle_protection(self):
+        """Review > Protect Sheet / Unprotect Sheet."""
+        self.commit_edit()
+        sh = self.sh
+        if sh.protection:
+            if sh.protection.get("hash"):
+                pw = simpledialog.askstring("Bỏ bảo vệ Trang tính", "Mật khẩu:", show="*", parent=self.root)
+                if pw is None:
+                    return
+                if fe.password_hash(pw) != sh.protection["hash"]:
+                    messagebox.showerror(APP_NAME, "Mật khẩu không đúng.", parent=self.root)
+                    return
+            self._structural(lambda: setattr(sh, "protection", None))
+            self.set_mode("Đã bỏ bảo vệ trang tính")
+            return
+        result = dialogs.ProtectSheetDialog(self.root).show()
+        if result is not None:
+            password, allow = result
+            self._structural(lambda: setattr(sh, "protection", {"hash": fe.password_hash(password), "allow": allow}))
+            self.set_mode("Trang tính đang được bảo vệ")
+
+    @undo_name("Khóa ô")
+    def toggle_lock_cells(self):
+        """Format > Lock Cell: lock or unlock the selected cells (what protection then keeps from changes)."""
+        self.commit_edit()
+        if self.sh.protection:
+            messagebox.showinfo(APP_NAME, PROTECTED_MSG, parent=self.root)
+            return
+        targets = self._format_targets()
+        unlock = any(fe.cell_locked(self.sh.formats.get(k)) for k in targets)
+        cs = ChangeSet(self.wb)
+        for r, c in targets:
+            fmt = dict(self.sh.formats.get((r, c)) or {})
+            if unlock:
+                fmt["unlocked"] = True
+            else:
+                fmt.pop("unlocked", None)
+            cs.set(self.sheet, r, c, fmt=fmt)
+        self.commit(cs)
+        self.set_mode("Đã bỏ khóa ô" if unlock else "Đã khóa ô")
+
+    def _formula_assist(self, entry):
+        """Function (and defined name) list while typing, argument tip inside a call, F4 for $ references."""
+        functions = fe.function_names()
+
+        def names():
+            return sorted(functions + [d["name"] for d in self.wb.names.values()], key=str.upper)
+
+        def info(name):
+            item = FUNCTION_INFO.get(name)  # function names are upper case; defined names keep their case
+            if item:
+                return item[1:]
+            d = self.wb.names.get(name.upper())
+            if d:
+                return d["name"], f"Tên: {d['ref'][1:]}" + (f" — {d['comment']}" if d.get("comment") else ""), False
+            return None
+
+        def changed():
+            self.point = None
+            self.set_mode("Nhập" if self.edit_mode == "enter" else "Sửa")
+        return FormulaAssist(entry, self.ui.font, self.ui.small_font, names, info, changed)
 
     def _editor_commit(self, e, move):
         if e.state & SHIFT:
@@ -1981,26 +3899,62 @@ class SpreadsheetApp:
             self.point = None
             self.set_mode("Nhập" if self.edit_mode == "enter" else "Sửa")
 
+    @content_named
     def commit_edit(self, move=None, fill=False):
         """Store the text being edited; Ctrl+Enter (fill=True) writes it into every selected cell."""
+        if self.text_edit:
+            self._finish_text_edit()
         if not self.is_editing():
             return
         text = self.edit_var.get() if self.editor is not None else self.fx_var.get()
         sheet, r, c = self.edit_cell
         self._end_edit()
         if sheet in self.wb.sheets:
-            raw = fe.normalize_formula(text)
+            raw = fe.normalize_formula(text, self.wb.names)
+            if not self._entry_allowed(sheet, r, c, raw, text):
+                self.refresh()
+                return
             cs = ChangeSet(self.wb)
-            if fill and sheet == self.sheet:
-                for rr, cc in self._format_targets():
-                    cs.set(sheet, rr, cc, raw=fe.shift_formula(raw, rr - r, cc - c))
-            else:
-                cs.set(sheet, r, c, raw=raw)
+            targets = self._format_targets() if fill and sheet == self.sheet else [(r, c)]
+            for rr, cc in targets:
+                cs.set(sheet, rr, cc, raw=fe.shift_formula(raw, rr - r, cc - c))
+                if "\n" in raw and not fe.is_formula(raw):  # Alt+Enter line breaks turn on Wrap Text, as in Excel
+                    cs.set(sheet, rr, cc, fmt=dict(self.wb.get_format(sheet, rr, cc) or {}, wrap=True))
             self.commit(cs)
         if move:
             self.move_active(*move)
         else:
             self.refresh()
+
+    def _entry_allowed(self, sheet, r, c, raw, text):
+        """Check an entry against the cell's data validation, asking the user like Excel does.
+        "Retry" (or "No" on a warning) reopens the editor with the text typed."""
+        rule = self.wb.validate(sheet, r, c, raw)
+        if rule is None:
+            return True
+        title = rule.get("error_title") or APP_NAME
+        msg = rule.get("error") or ("Giá trị này không khớp với các giới hạn xác thực dữ liệu đã đặt cho ô này."
+                                    if rule.get("type") != "list" else "Hãy chọn một giá trị trong danh sách.")
+        style = rule.get("style", "stop")
+        if style == "warning":
+            answer = messagebox.askyesnocancel(title, msg + "\n\nTiếp tục?", icon="warning", parent=self.root)
+        elif style == "info":
+            answer = messagebox.askokcancel(title, msg, icon="info", parent=self.root) or None
+        else:
+            answer = False if messagebox.askretrycancel(title, msg, icon="error", parent=self.root) else None
+        if answer:
+            return True
+        if answer is False:
+            self.root.after_idle(lambda: self._reopen_edit(sheet, r, c, text))
+        return False
+
+    def _reopen_edit(self, sheet, r, c, text):
+        if sheet not in self.wb.sheets or self.is_editing():
+            return
+        if sheet != self.sheet:
+            self.switch_sheet(sheet)
+        self.cur = self.ext = (r, c)
+        self.start_edit(initial=text, mode="edit")
 
     def cancel_edit(self):
         if not self.is_editing():
@@ -2060,29 +4014,99 @@ class SpreadsheetApp:
         changes = cs.changes()
         if not changes:
             return False
+        for (sheet, r, c), raw0, raw1, fmt0, fmt1 in changes:  # protected sheets: locked cells keep their content
+            prot = self.wb.sheets[sheet].protection
+            if prot and ((raw0 != raw1 and (fe.cell_locked(fmt0) or fe.cell_locked(fmt1)))
+                         or (fmt0 != fmt1 and "format_cells" not in prot.get("allow", ()))):
+                messagebox.showinfo(APP_NAME, PROTECTED_MSG, parent=self.root)
+                self.refresh()
+                return False
         self._apply_changes(changes, forward=True)
         self._push_undo(("cells", changes, self._sel_state()))
         return True
 
     def _apply_changes(self, changes, forward):
         rows = {}
-        for (sheet, r, c), raw0, raw1, fmt0, fmt1 in changes:
-            self.wb.set_raw(sheet, r, c, raw1 if forward else raw0)
-            self.wb.set_format(sheet, r, c, fmt1 if forward else fmt0)
+        if forward:
+            self.wb.write_cells((sheet, r, c, raw1, fmt1) for (sheet, r, c), raw0, raw1, fmt0, fmt1 in changes)
+        else:
+            self.wb.write_cells((sheet, r, c, raw0, fmt0) for (sheet, r, c), raw0, raw1, fmt0, fmt1 in changes)
+        for (sheet, r, c), *_ in changes:
             rows.setdefault(sheet, set()).add(r)
         for sheet, changed in rows.items():
             self.autofit_rows(changed, sheet)
 
-    def _push_undo(self, action):
-        self.undo_stack.append(action)
+    def _push_undo(self, action, name=None):
+        step = UndoStep(action)
+        step.name = name or self._undo_name or self._step_name(action)
+        self.undo_stack.append(step)
         del self.undo_stack[:-200]
         self.redo_stack.clear()
+        self.edit_serial += 1
         self.mark_dirty()
+        self._update_undo_buttons()
 
-    def _push_snapshot(self, before, sel):
+    def _push_snapshot(self, before, sel, name=None):
         after = self.wb.snapshot()
         if after != before:
-            self._push_undo(("snap", before, after, sel))
+            self._share_snapshots(before, after)
+            self._push_undo(("snap", before, after, sel), name)
+            self._trim_undo()
+
+    @staticmethod
+    def _step_name(action):
+        """A name for an undo step no command named: what was typed, cleared or formatted."""
+        if action[0] != "cells":
+            return "Thay đổi"
+        changes = action[1]
+        edited = [change for change in changes if change[1] != change[2]]
+        if not edited:
+            return format_name({k for _, _, _, f0, f1 in changes[:200] for k in set(f0 or {}) | set(f1 or {})
+                                if (f0 or {}).get(k) != (f1 or {}).get(k)})
+        if len(edited) == 1:
+            (_, r, c), _, raw, _, _ = edited[0]
+            if not raw:
+                return f"Xóa {cell_name(r, c)}"
+            text = " ".join(raw.split())
+            return f'Nhập "{text if len(text) <= 24 else text[:23] + "…"}" vào {cell_name(r, c)}'
+        if not any(change[2] for change in edited):
+            return "Xóa nội dung"
+        return f"Sửa {len(edited)} ô"
+
+    def _share_snapshots(self, before, after):
+        """Let snapshot parts with the same content be one object: before/after of this change, and this
+        change's before with the previous change's after (big sheets would otherwise be copied each time)."""
+        prev = next((a for a in reversed(self.undo_stack) if a[0] == "snap"), None)
+        previous = dict(prev[2][0]) if prev else {}
+        old = dict(before[0])
+        for name, state in after[0]:
+            b, p = old.get(name), previous.get(name)
+            if b is None:
+                continue
+            for key in fe.Sheet._FLAT:
+                if p is not None and b[key] is not p[key] and b[key] == p[key]:
+                    b[key] = p[key]
+                if state[key] is not b[key] and state[key] == b[key]:
+                    state[key] = b[key]
+
+    UNDO_BUDGET = 6_000_000  # cells and formats kept in undo copies of whole sheets
+
+    def _trim_undo(self):
+        """Forget the oldest whole-sheet undo copies when they hold more than UNDO_BUDGET cells."""
+        seen, size = set(), 0
+        for i in range(len(self.undo_stack) - 1, -1, -1):
+            action = self.undo_stack[i]
+            if action[0] != "snap":
+                continue
+            for _, state in action[1][0] + action[2][0]:
+                for key in ("cells", "formats"):
+                    obj = state[key]
+                    if id(obj) not in seen:
+                        seen.add(id(obj))
+                        size += len(obj)
+            if size > self.UNDO_BUDGET and i < len(self.undo_stack) - 1:
+                del self.undo_stack[:i]
+                return
 
     def _structural(self, func):
         """Run a change to sheets, rows, columns, merges or rules with whole-workbook undo."""
@@ -2094,28 +4118,61 @@ class SpreadsheetApp:
             messagebox.showerror(APP_NAME, str(err), parent=self.root)
             self.wb.restore(before)
             return False
+        if self._protection_broken(before):
+            self.wb.restore(before)
+            self.refresh_all()
+            return False
         self.wb.invalidate()
         self._push_snapshot(before, sel)
         self.refresh_all()
         return True
 
-    def undo(self):
-        self._undo_redo(self.undo_stack, self.redo_stack, forward=False)
+    def _protection_broken(self, before):
+        """After a change: True (having told the user) when it altered a protected sheet in a way its
+        protection does not allow; sheets protected or unprotected by the change itself are not checked."""
+        old = dict(before[0])
+        for name, sh in self.wb.sheets.items():
+            state = old.get(name)
+            if sh.protection and state and state.get("protection"):
+                if fe.protection_problem(state, sh.copy_state(), sh.protection.get("allow", ())):
+                    messagebox.showinfo(APP_NAME, PROTECTED_MSG, parent=self.root)
+                    return True
+        return False
 
-    def redo(self):
-        self._undo_redo(self.redo_stack, self.undo_stack, forward=True)
+    def _locked(self, sheet=None, cells=None, need=None):
+        """True (after telling the user) when the sheet is protected and the cells are locked, or `need`
+        (a protection option) is not allowed."""
+        sh = self.wb.sheets[sheet or self.sheet]
+        prot = sh.protection
+        if not prot:
+            return False
+        if (need and need not in prot.get("allow", ())) or any(fe.cell_locked(sh.formats.get(k)) for k in cells or ()):
+            messagebox.showinfo(APP_NAME, PROTECTED_MSG, parent=self.root)
+            return True
+        return False
 
-    def _undo_redo(self, source, target, forward):
+    def undo(self, steps=1):
+        """Undo the last `steps` changes (the Undo button's list undoes several at once)."""
+        self._undo_redo(self.undo_stack, self.redo_stack, forward=False, steps=steps)
+
+    def redo(self, steps=1):
+        self._undo_redo(self.redo_stack, self.undo_stack, forward=True, steps=steps)
+
+    def _undo_redo(self, source, target, forward, steps=1):
         self.commit_edit()
         if not source:
             self.root.bell()
             return
-        action = source.pop()
-        if action[0] == "cells":
-            self._apply_changes(action[1], forward)
-        else:
-            self.wb.restore(action[2] if forward else action[1])
-        target.append(action)
+        self.edit_serial += 1
+        self.areas = []
+        for _ in range(min(steps, len(source))):
+            action = source.pop()
+            if action[0] == "cells":
+                self._apply_changes(action[1], forward)
+            else:
+                self.wb.restore(action[2] if forward else action[1])
+            target.append(action)
+        self._update_undo_buttons()
         sheet, cur, ext = action[-1]
         if sheet in self.wb.sheets:
             self._show_sheet(sheet)
@@ -2176,6 +4233,7 @@ class SpreadsheetApp:
         rows = {r for (r, c), fmt in self.sh.formats.items() if c == col and fmt.get("wrap")}
         self.autofit_rows(rows)
 
+    @undo_name("Tự động khớp chiều cao hàng")
     def autofit_rows_manual(self, rows):
         before = self.wb.snapshot()
         self.sh.custom_rows.difference_update(rows)
@@ -2190,6 +4248,7 @@ class SpreadsheetApp:
         r1, _, r2, _ = self._copy_rect()
         self.autofit_rows_manual(list(range(r1, r2 + 1)))
 
+    @undo_name("Chiều cao hàng")
     def ask_row_height(self):
         self.commit_edit()
         r1, _, r2, _ = self.sel_rect()
@@ -2221,12 +4280,17 @@ class SpreadsheetApp:
 
     def _format_targets(self):
         """Cells a formatting command applies to (huge selections clipped to the used/visible area)."""
-        r1, c1, r2, c2 = self.sel_rect()
-        if self._is_huge(r1, c1, r2, c2):
-            rows, cols = self.wb.used_extent(self.sheet)
-            r2 = min(r2, max(rows, self.top + self._visible_rows()) - 1)
-            c2 = min(c2, max(cols, self.left + len(self.vis_cols)) - 1)
-        return [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1)]
+        out, seen = [], set()
+        for r1, c1, r2, c2 in [self.sel_rect()] + self.areas:
+            if self._is_huge(r1, c1, r2, c2):
+                rows, cols = self.wb.used_extent(self.sheet)
+                r2 = min(r2, max(rows, self.top + self._visible_rows()) - 1)
+                c2 = min(c2, max(cols, self.left + len(self.vis_cols)) - 1)
+            for key in ((r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1)):
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+        return out
 
     @staticmethod
     def _tsv_field(text):
@@ -2236,24 +4300,76 @@ class SpreadsheetApp:
 
     def copy(self, cut=False):
         self.commit_edit()
+        if self._objects_selected():
+            self.copy_objects(cut)
+            return
+        if self.areas:
+            messagebox.showinfo(APP_NAME, "Không thể sao chép hoặc cắt nhiều vùng chọn rời nhau cùng lúc.",
+                                parent=self.root)
+            return
         r1, c1, r2, c2 = self._copy_rect()
         if r2 < r1 or c2 < c1:
             return
-        sh = self.sh
-        block = [[(sh.cells.get((r, c)), sh.formats.get((r, c))) for c in range(c1, c2 + 1)] for r in range(r1, r2 + 1)]
-        values = [[fe.value_to_raw(self.wb.get_value(self.sheet, r, c)) for c in range(c1, c2 + 1)]
-                  for r in range(r1, r2 + 1)]
-        text = "\n".join("\t".join(self._tsv_field(self.wb.display_text(self.sheet, r, c)) for c in range(c1, c2 + 1))
-                         for r in range(r1, r2 + 1))
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
+        sh, cols = self.sh, range(c1, c2 + 1)
+        block = [[(sh.cells.get((r, c)), sh.formats.get((r, c))) for c in cols] for r in range(r1, r2 + 1)]
+        values, lines = [], []
+        spilled = self.wb.spill_map(self.sheet)
+        for r in range(r1, r2 + 1):  # each value once, for both the paste-values copy and the text
+            shown = [self.wb.cell_display(self.sheet, r, c) if (r, c) in sh.cells or (r, c) in spilled else (None, None)
+                     for c in cols]
+            values.append([fe.value_to_raw(v) for v, _ in shown])
+            lines.append("\t".join(self._tsv_field(fe.format_value(*vf)) for vf in shown))
+        text = "\n".join(lines)
+        try:  # on Windows, also as HTML/RTF tables and a picture, like Excel (AutoCAD needs those)
+            rich = (r2 - r1 + 1) * (c2 - c1 + 1) <= BIG_AREA and richclip.copy_to_clipboard(
+                self.root.winfo_id(), text, self._clip_table(r1, c1, r2, c2))
+        except Exception:  # noqa: BLE001 - the rich formats are a bonus; plain text must always work
+            rich = False
+        if not rich:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        merges = [(m[0] - r1, m[1] - c1, m[2] - r1, m[3] - c1) for m in sh.merges
+                  if r1 <= m[0] and m[2] <= r2 and c1 <= m[1] and m[3] <= c2]
         self.clip = {"sheet": self.sheet, "rect": (r1, c1, r2, c2), "cells": block, "values": values,
-                     "cut": cut, "text": text}
+                     "cut": cut, "text": text, "merges": merges,
+                     "widths": [sh.col_widths.get(c, fe.DEFAULT_COL_WIDTH) for c in cols]}
+        self.paste_info = None
         self.set_mode("Chọn ô đích rồi nhấn Ctrl+V (Esc để hủy)")
         self.redraw()
 
     def cut(self):
         self.copy(cut=True)
+
+    def _clip_table(self, r1, c1, r2, c2):
+        """The copied block as richclip describes a table: visible rows and columns only, with each
+        cell's text as displayed, its alignment and its format (conditional formatting included)."""
+        sh = self.sh
+        rows = [r for r in range(r1, r2 + 1) if not sh.row_hidden(r)]
+        cols = [c for c in range(c1, c2 + 1) if c not in sh.hidden_cols]
+        cells = []
+        for r in rows:
+            row = []
+            for c in cols:
+                value = self.wb.get_value(self.sheet, r, c)
+                fmt = dict(sh.formats.get((r, c)) or {})
+                style = self.wb.cond_format(self.sheet, r, c) or {}
+                fmt.update({k: style[k] for k in ("bg", "fg", "bold", "italic") if k in style})
+                default = ("right" if fe.is_number(value) else
+                           "center" if isinstance(value, (bool, fe.CellError)) else "left")
+                align = {"centerContinuous": "center"}.get(fmt.get("align"), fmt.get("align"))
+                row.append({"text": self.wb.display_text(self.sheet, r, c), "align": align or default,
+                            "fmt": fmt, "value": value if fe.is_number(value) and not isinstance(value, bool) else None})
+            cells.append(row)
+        row_at, col_at = {r: i for i, r in enumerate(rows)}, {c: j for j, c in enumerate(cols)}
+        merges = []
+        for m in sh.merges:
+            if r1 <= m[0] and m[2] <= r2 and c1 <= m[1] and m[3] <= c2:
+                mr = [row_at[r] for r in range(m[0], m[2] + 1) if r in row_at]
+                mc = [col_at[c] for c in range(m[1], m[3] + 1) if c in col_at]
+                if mr and mc and (len(mr) > 1 or len(mc) > 1):
+                    merges.append((mr[0], mc[0], mr[-1], mc[-1]))
+        return {"cols": [sh.col_widths.get(c, fe.DEFAULT_COL_WIDTH) for c in cols],
+                "rows": [sh.row_heights.get(r, fe.DEFAULT_ROW_HEIGHT) for r in rows], "cells": cells, "merges": merges}
 
     def _paste_targets(self, h, w):
         """(row, col, i, j) for pasting an h x w block; a selection that is a multiple of
@@ -2274,60 +4390,261 @@ class SpreadsheetApp:
         self.ext = self._clamp(r1 + reps_h * h - 1, c1 + reps_w * w - 1)
         return targets
 
-    def paste(self, mode="all", transpose=False, skip_blanks=False):
-        """Paste the clipboard: mode is "all", "formulas", "values" or "formats"."""
+    @undo_name("Dán")
+    def paste(self, mode="all", transpose=False, skip_blanks=False, widths=False):
+        """Paste the clipboard. mode: "all", "formulas", "values", "values_num" (values and their number
+        formats), "formats", "no_borders" (all but borders) or "widths" (column widths alone); widths: the
+        columns also take the copied ones' widths. Cells copied in Excel (or another spreadsheet, a web page)
+        come with their formats, merged cells, notes and links when it put them on the clipboard."""
         self.commit_edit()
+        if mode == "all" and self.objects_on_clipboard():
+            self.paste_objects()
+            return
+        if self._pivot_guard(*self.sel_rect()):
+            return
         try:
             text = self.root.clipboard_get()
         except tk.TclError:
             text = ""
+        if not text and mode == "all" and self.paste_picture():  # a screenshot or copied picture
+            return
         text = text.replace("\r\n", "\n").rstrip("\n")
+        start = (self.cur, self.ext)
+        block = self._paste_block(text)
+        if block is None or not (block.h and block.w):
+            return
+        styled = block.source != "text"  # plain text leaves the cells' formats as they are
+        if not styled and mode == "formats":
+            return
+        moving = isinstance(block, _CopiedBlock) and block.moving and mode == "all" and not transpose
+        if transpose:
+            block = block.transposed()
+        sh, names, last = self.sh, set(self.wb.names), self.undo_stack[-1] if self.undo_stack else None
         cs = ChangeSet(self.wb)
         clip = self.clip
-        if clip and text == clip["text"].rstrip("\n"):
-            block, values = clip["cells"], clip["values"]
-            sr, sc = clip["rect"][0], clip["rect"][1]
-            if transpose:
-                block = [list(row) for row in zip(*block)]
-                values = [list(row) for row in zip(*values)]
-            moving = clip["cut"] and mode == "all" and not transpose
-            if moving and clip["sheet"] in self.wb.sheets:
-                for i, row in enumerate(block):
-                    for j in range(len(row)):
-                        cs.set(clip["sheet"], sr + i, sc + j, raw=None, fmt=None)
-            for r, c, i, j in self._paste_targets(len(block), len(block[0])):
-                raw, fmt = block[i][j]
-                if skip_blanks and raw is None:
-                    continue
-                src_r, src_c = (sr + j, sc + i) if transpose else (sr + i, sc + j)
-                if mode in ("all", "formulas"):
-                    cs.set(self.sheet, r, c, raw=raw if moving or not raw else fe.shift_formula(raw, r - src_r, c - src_c))
-                elif mode == "values":
-                    cs.set(self.sheet, r, c, raw=values[i][j])
-                if mode in ("all", "formats"):
-                    cs.set(self.sheet, r, c, fmt=fmt)
-            if moving:
-                self.clip = None
-                self.set_mode("Sẵn sàng")
-        elif text and mode != "formats":
-            rows = list(csv.reader(io.StringIO(text), delimiter="\t")) or [[""]]
-            width = max(len(row) for row in rows)
-            rows = [row + [""] * (width - len(row)) for row in rows]
-            if transpose:
-                rows = [list(row) for row in zip(*rows)]
-            for r, c, i, j in self._paste_targets(len(rows), len(rows[0])):
-                if not (skip_blanks and rows[i][j] == ""):
-                    cs.set(self.sheet, r, c, raw=rows[i][j])
+        if moving and clip["sheet"] in self.wb.sheets:
+            sr, sc = clip["rect"][:2]
+            for i in range(block.h):
+                for j in range(block.w):
+                    cs.set(clip["sheet"], sr + i, sc + j, raw=None, fmt=None)
+        targets = self._paste_targets(block.h, block.w)
+        with_raw = mode in ("all", "formulas", "no_borders")
+        with_fmt = styled and mode in ("all", "formats", "no_borders")
+        for r, c, i, j in targets:
+            if skip_blanks and block.empty(i, j):
+                continue
+            if with_raw:
+                cs.set(self.sheet, r, c, raw=block.raw(i, j, r, c, names))
+            elif mode in ("values", "values_num"):
+                cs.set(self.sheet, r, c, raw=block.values.get((i, j)))
+            fmt = block.formats.get((i, j))
+            if with_fmt:
+                if mode == "no_borders" and fmt:
+                    fmt = {k: v for k, v in fmt.items() if k not in fe.BORDER_KEYS}
+                cs.set(self.sheet, r, c, fmt=fmt)
+            elif mode == "values_num" and styled:  # the cell keeps its format, with the copied number format
+                new = dict(sh.formats.get((r, c)) or {})
+                if fmt and fmt.get("num"):
+                    new["num"] = fmt["num"]
+                else:
+                    new.pop("num", None)
+                cs.set(self.sheet, r, c, fmt=new)
+        tiles = [(r, c) for r, c, i, j in targets if (i, j) == (0, 0)]
+        a1, b1, a2, b2 = self.sel_rect()
+        merges = None
+        if with_fmt and (block.merges or any(m[0] <= a2 and m[2] >= a1 and m[1] <= b2 and m[3] >= b1
+                                             for m in sh.merges)):
+            merges = [m for m in sh.merges if not (m[0] <= a2 and m[2] >= a1 and m[1] <= b2 and m[3] >= b1)]
+            merges += [(r0 + i1, c0 + j1, r0 + i2, c0 + j2) for r0, c0 in tiles for i1, j1, i2, j2 in block.merges
+                       if r0 + i2 < MAX_ROWS and c0 + j2 < MAX_COLS]
+        col_widths, row_heights = self._pasted_sizes(block, tiles, mode) if styled and not transpose else ({}, {})
+        if (widths or mode == "widths") and not transpose:
+            for r0, c0 in tiles:
+                for j in range(min(block.w, MAX_COLS - c0)):
+                    col_widths[c0 + j] = block.col_widths.get(j) or block.default_width or fe.DEFAULT_COL_WIDTH
+        extras = mode == "all" and (block.notes or block.links)
+        if merges is None and not col_widths and not row_heights and not extras:
+            self.commit(cs)
         else:
-            return
-        self.commit(cs)
+            def apply():
+                self._apply_changes(cs.changes(), forward=True)
+                if merges is not None:
+                    sh.set_merges(merges)
+                for c, width in col_widths.items():
+                    sh.col_widths[c] = max(fe.MIN_COL_WIDTH, round(width))
+                for r, height in row_heights.items():
+                    sh.row_heights[r] = max(4, round(height))
+                    sh.custom_rows.add(r)
+                if extras:
+                    for r0, c0 in tiles:
+                        sh.notes.update(((r0 + i, c0 + j), note) for (i, j), note in block.notes.items())
+                        sh.links.update(((r0 + i, c0 + j), dict(link)) for (i, j), link in block.links.items())
+            self._structural(apply)
+        if moving:
+            self.clip = None
+            self.set_mode("Sẵn sàng")
+        step = self.undo_stack[-1] if self.undo_stack else None
+        self.paste_info = None
+        if step is not None and step is not last and not moving and styled:
+            kwargs = {k: v for k, v in (("mode", mode), ("transpose", transpose), ("skip_blanks", skip_blanks),
+                                        ("widths", widths)) if v not in ("all", False)}
+            self.paste_info = {"sheet": self.sheet, "rect": self.sel_rect(), "start": start, "step": step,
+                               "kwargs": kwargs}
         self.ensure_visible(*self.cur)
         self.refresh()
+
+    def _pasted_sizes(self, block, tiles, mode):
+        """({col: width}, {row: height}) cells from another program bring along to the sheet: the copied
+        sizes, for columns and rows still at the default size here with nothing else in them (pasting into
+        an empty sheet then looks as it did there; Excel itself leaves sizes alone)."""
+        if block.source in ("PyExcel", "text") or mode not in ("all", "formats") or not tiles:
+            return {}, {}
+        sh = self.sh
+        a1, b1, a2, b2 = self.sel_rect()
+        if len(sh.cells) > 200000:  # (looking through every cell for the busy rows and columns would take long)
+            return {}, {}
+        busy_cols, busy_rows = set(), set()
+        for r, c in sh.cells:
+            if b1 <= c <= b2 and not a1 <= r <= a2:
+                busy_cols.add(c)
+            if a1 <= r <= a2 and not b1 <= c <= b2:
+                busy_rows.add(r)
+        widths, heights = {}, {}
+        for r0, c0 in tiles:
+            for j in range(min(block.w, MAX_COLS - c0)):
+                width = block.col_widths.get(j) or block.default_width
+                if width and c0 + j not in sh.col_widths and c0 + j not in busy_cols:
+                    widths[c0 + j] = width
+            for i, height in block.row_heights.items():
+                if r0 + i < MAX_ROWS and r0 + i not in sh.custom_rows and r0 + i not in busy_rows:
+                    heights[r0 + i] = height
+        return widths, heights
+
+    def _paste_block(self, text):
+        """What a paste puts in: PyExcel's own copied cells, cells copied in another program with their
+        formats, or the clipboard's text as tab-separated values."""
+        clip = self.clip
+        if clip and text == clip["text"].rstrip("\n"):
+            return _CopiedBlock(clip)
+        block = self._clipboard_cells()
+        if block is not None:
+            return block
+        if not text:
+            return None
+        rows = list(csv.reader(io.StringIO(text), delimiter="\t")) or [[""]]
+        block = clipcells.Block(len(rows), max(len(row) for row in rows))
+        block.source = "text"
+        block.values = {(i, j): value for i, row in enumerate(rows) for j, value in enumerate(row) if value != ""}
+        return block
+
+    def _clipboard_cells(self):
+        """The cells another program copied with their formats - Excel's XML Spreadsheet, else an HTML table
+        (Windows; an HTML table elsewhere) - or None when the clipboard has only text."""
+        try:
+            data = richclip.read_cells(self.root.winfo_id())
+        except Exception:  # noqa: BLE001 - the formats are a bonus: text always pastes
+            data = {}
+        if not data and sys.platform != "win32":
+            page = self._selection_html()
+            data = {"html": page} if page else {}
+        block = None
+        try:
+            if data.get("xml"):
+                block = clipcells.from_spreadsheet_xml(data["xml"])
+            if block is None and data.get("html"):
+                block = clipcells.from_html(data["html"])
+        except Exception:  # noqa: BLE001 - a clipboard we can't read pastes as text
+            block = None
+        if block is not None and data.get("link"):
+            block.origin = clipcells.link_origin(data["link"])
+        if block is not None and block.h * block.w > 4 * BIG_AREA * 50:
+            block.fit_content()  # (a copied whole column: only its used part)
+        return block
+
+    def _selection_html(self):
+        """The clipboard's text/html (X11), decoded as its owner wrote it."""
+        try:
+            page = self.root.clipboard_get(type="text/html")
+        except tk.TclError:
+            return None
+        try:
+            data = page.encode("latin-1")  # Tk hands over the bytes as Latin-1
+        except UnicodeEncodeError:
+            return page
+        if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            return data.decode("utf-16", "replace")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return page
 
     def paste_special(self):
         result = dialogs.PasteSpecialDialog(self.root).show()
         if result:
             self.paste(**result)
+
+    # Paste Options: the button by what was just pasted (or Ctrl alone) to paste it again another way
+
+    def _paste_options_shown(self):
+        info = self.paste_info
+        return bool(info and info["sheet"] == self.sheet and self.undo_stack and info["step"] is self.undo_stack[-1]
+                    and not self.is_editing())
+
+    def paste_options(self, x=None, y=None):
+        """The Paste Options menu at (x, y) on the screen (by its button when None)."""
+        if not self._paste_options_shown():
+            return
+        if x is None:
+            if not self._paste_button:
+                return
+            x = self.canvas.winfo_rootx() + self._paste_button[0]
+            y = self.canvas.winfo_rooty() + self._paste_button[3]
+        current = self.paste_info["kwargs"]
+        menu = tk.Menu(self.root, tearoff=0)
+        choice = tk.IntVar(menu, value=-1)
+        menu.choice = choice
+        for k, (heading, label, kwargs) in enumerate(PASTE_OPTIONS):
+            if heading:
+                if k:
+                    menu.add_separator()
+                menu.add_command(label=heading, state="disabled")
+            if kwargs == current:
+                choice.set(k)
+            menu.add_radiobutton(label="   " + label, variable=choice, value=k,
+                                 command=lambda kw=kwargs: self._repaste(kw))
+        menu.tk_popup(x, y)
+        menu.grab_release()
+
+    def _repaste(self, kwargs):
+        """Paste again, another way (a choice of the Paste Options)."""
+        if not self._paste_options_shown() or kwargs == self.paste_info["kwargs"]:
+            return
+        start = self.paste_info["start"]
+        self.undo()
+        self.cur, self.ext = start
+        self.paste(**kwargs)
+
+    def _draw_paste_button(self, cv, W, H):
+        self._paste_button = None
+        if not self._paste_options_shown():
+            return
+        box = self._rect_bbox(*self.paste_info["rect"])
+        w, h = round(52 * self.px), round(20 * self.px)
+        x, y = box[2] + 2, box[3] + 2
+        if not (self.header_w <= x and x + w <= W and self.header_h <= y and y + h <= H):
+            return
+        self._paste_button = (x, y, x + w, y + h)
+        cv.create_rectangle(x, y, x + w, y + h, fill="#ffffff", outline="#a6a6a6")
+        k = self.px
+        cx, cy = x + 9 * k, y + h / 2  # a clipboard
+        cv.create_rectangle(cx - 5 * k, cy - 6 * k, cx + 5 * k, cy + 7 * k, fill="#f3d27a", outline="#8a6d1d")
+        cv.create_rectangle(cx - 2.5 * k, cy - 7.5 * k, cx + 2.5 * k, cy - 4.5 * k, fill="#6e6e6e", outline="")
+        cv.create_rectangle(cx - 2 * k, cy - 2 * k, cx + 6 * k, cy + 7.5 * k, fill="#ffffff", outline="#6e6e6e")
+        cv.create_text(x + 17 * k, cy, text="(Ctrl)", anchor="w", font=("Segoe UI", -max(7, round(10 * k))),
+                       fill="#444444")
+        ax = x + w - 5 * k
+        cv.create_polygon(ax - 2.5 * k, cy - 1 * k, ax + 2.5 * k, cy - 1 * k, ax, cy + 2 * k, fill="#444444",
+                          outline="")
 
     # ------------------------------------------------------------------ format painter
 
@@ -2347,12 +4664,17 @@ class SpreadsheetApp:
         self.set_mode("Sẵn sàng")
         self.update_toolbar()
 
+    @undo_name("Sao định dạng")
     def _apply_painter(self):
         block = self.painter["block"]
         h, w = len(block), len(block[0])
         r1, c1, r2, c2 = self.sel_rect()
         if (r1, c1, r2, c2) == self._cell_box(*self.cur):
             r2, c2 = min(MAX_ROWS - 1, r1 + h - 1), min(MAX_COLS - 1, c1 + w - 1)
+        elif self._is_huge(r1, c1, r2, c2):
+            rows, cols = self.wb.used_extent(self.sheet)
+            r2 = min(r2, max(rows, self.top + self._visible_rows()) - 1)
+            c2 = min(c2, max(cols, self.left + len(self.vis_cols)) - 1)
         cs = ChangeSet(self.wb)
         for r in range(r1, r2 + 1):
             for c in range(c1, c2 + 1):
@@ -2364,25 +4686,50 @@ class SpreadsheetApp:
 
     # ------------------------------------------------------------------ cell formatting
 
+    @undo_name(lambda self, update: format_name(update))
     def apply_format(self, update):
-        """Merge `update` into the format of every selected cell (None/False removes a key)."""
+        """Merge `update` into the format of every selected cell (None/False removes a key). Cells that had
+        the same format get one shared new format; very large selections are written in one go. With
+        shapes selected their text (and fill) is formatted instead."""
         self.commit_edit()
+        if self.selected_shapes():
+            self.format_shapes_from_cells(update)
+            return
         formats = self.sh.formats
-        cs = ChangeSet(self.wb)
-        for r, c in self._format_targets():
-            fmt = dict(formats.get((r, c)) or {})
-            for key, value in update.items():
-                if value in (None, False, ""):
-                    fmt.pop(key, None)
-                else:
-                    fmt[key] = value
-            cs.set(self.sheet, r, c, fmt=fmt)
-        self.commit(cs)
+        made = {}
+
+        def merged(old):
+            entry = made.get(id(old))
+            if entry is None:
+                fmt = dict(old or {})
+                for key, value in update.items():
+                    if value in (None, False, ""):
+                        fmt.pop(key, None)
+                    else:
+                        fmt[key] = value
+                entry = made[id(old)] = (old, fmt or None)  # (old kept alive: its id stays its own)
+            return entry[1]
+        targets = self._format_targets()
+        if len(targets) <= 50000:
+            cs = ChangeSet(self.wb)
+            for r, c in targets:
+                cs.set(self.sheet, r, c, fmt=merged(formats.get((r, c))))
+            self.commit(cs)
+        else:
+            def change():
+                with fe.bulk():
+                    new = {key: merged(formats.get(key)) for key in targets}
+                    kept = {k: v for k, v in formats.items() if k not in new}
+                    self.sh.formats = {**kept, **{k: v for k, v in new.items() if v}}
+                if any(k in update for k in ("size", "wrap", "rotate", "font")):
+                    self.autofit_rows({r for r, _ in targets})
+            self._structural(change)
         self.refresh()
         self.canvas.focus_set()
 
     def _active_fmt(self):
-        return self.sh.formats.get(self.cur) or {}
+        fmt = self._shape_fmt()
+        return fmt if fmt is not None else self.sh.formats.get(self.cur) or {}
 
     def toggle_style(self, key):
         self.apply_format({key: not self._active_fmt().get(key)})
@@ -2464,9 +4811,13 @@ class SpreadsheetApp:
         value, numfmt = self.wb.cell_display(self.sheet, *self.cur)
         self.apply_format({"num": fe.adjust_decimals(numfmt, value, delta)})
 
+    @undo_name("Viền")
     def apply_border(self, kind):
         self.commit_edit()
         self.last_border = kind
+        if self.btn_border.icon != f"border_{kind}":  # like Excel, the button repeats the last border used
+            self.btn_border.icon = f"border_{kind}"
+            self.btn_border.draw()
         targets = self._format_targets()
         if not targets:
             return
@@ -2505,6 +4856,7 @@ class SpreadsheetApp:
         self.commit(cs)
         self.refresh()
 
+    @undo_name("Viền")
     def _apply_border_spec(self, borders):
         """Borders from the Format Cells dialog: outline edges and inside lines of the selection."""
         targets = self._format_targets()
@@ -2550,6 +4902,7 @@ class SpreadsheetApp:
             self.unmerge()
         self.refresh()
 
+    @undo_name("Kiểu ô")
     def apply_cell_style(self, name):
         style = STYLE_LOOKUP[name]
         self.commit_edit()
@@ -2599,6 +4952,7 @@ class SpreadsheetApp:
         items = [(style[0], preview(style), style) for style in TABLE_STYLES]
         gallery_popup(button, self.ui, [("Kiểu bảng", items)], self.format_as_table, tile_w=self.ui.px(62))
 
+    @undo_name("Định dạng như Bảng")
     def format_as_table(self, style):
         self.commit_edit()
         rect = self.sel_rect()
@@ -2627,6 +4981,7 @@ class SpreadsheetApp:
         self._structural(apply)
 
     # merging
+    @undo_name("Hợp nhất ô")
     def merge(self, center=False, across=False):
         self.commit_edit()
         r1, c1, r2, c2 = self.sel_rect()
@@ -2657,6 +5012,7 @@ class SpreadsheetApp:
         self.cur, self.ext = (r1, c1), (r2, c2)
         self.refresh()
 
+    @undo_name("Bỏ hợp nhất ô")
     def unmerge(self):
         r1, c1, r2, c2 = self.sel_rect()
         self._structural(lambda: self.sh.set_merges(
@@ -2714,16 +5070,19 @@ class SpreadsheetApp:
                 return
         self.cf_add(rule)
 
+    @undo_name("Định dạng có điều kiện")
     def cf_add(self, rule):
         rule = dict(rule, range=self.sel_rect())
         self._structural(lambda: self.wb.set_cond_formats(self.sheet, self.sh.cond_formats + [rule]))
 
+    @undo_name("Xóa quy tắc")
     def cf_clear_selection(self):
         r1, c1, r2, c2 = self.sel_rect()
         keep = [rule for rule in self.sh.cond_formats
                 if not (rule["range"][0] <= r2 and rule["range"][2] >= r1 and rule["range"][1] <= c2 and rule["range"][3] >= c1)]
         self._structural(lambda: self.wb.set_cond_formats(self.sheet, keep))
 
+    @undo_name("Xóa quy tắc")
     def cf_clear_sheet(self):
         self._structural(lambda: self.wb.set_cond_formats(self.sheet, []))
 
@@ -2743,6 +5102,7 @@ class SpreadsheetApp:
                     "scale": "Thang màu"}.get(kind, kind)
         return f"{text}    —  áp dụng cho {where}"
 
+    @undo_name("Quản lý quy tắc")
     def cf_manage(self):
         rules = dialogs.ManageRulesDialog(self.root, self.sh.cond_formats, self.describe_rule).show()
         if rules is not None:
@@ -2750,16 +5110,20 @@ class SpreadsheetApp:
 
     # ------------------------------------------------------------------ cell commands
 
+    @undo_name("Xóa nội dung")
     def clear_contents(self):
         self.commit_edit()
-        r1, c1, r2, c2 = self.sel_rect()
+        rects = [self.sel_rect()] + self.areas
+        if any(self._pivot_guard(*rect) for rect in rects):
+            return
         cs = ChangeSet(self.wb)
-        for r, c in list(self.sh.cells):
-            if r1 <= r <= r2 and c1 <= c <= c2:
+        for r1, c1, r2, c2 in rects:
+            for r, c in [(r, c) for r, c in self.sh.cells if r1 <= r <= r2 and c1 <= c <= c2]:
                 cs.set(self.sheet, r, c, raw=None)
         self.commit(cs)
         self.refresh()
 
+    @undo_name(lambda self, contents=False: "Xóa tất cả" if contents else "Xóa định dạng")
     def clear_formats(self, contents=False):
         self.commit_edit()
         r1, c1, r2, c2 = self.sel_rect()
@@ -2772,6 +5136,8 @@ class SpreadsheetApp:
                     if contents:
                         self.wb.set_raw(self.sheet, *key, None)
             sh.set_merges([m for m in sh.merges if not (m[0] <= r2 and m[2] >= r1 and m[1] <= c2 and m[3] >= c1)])
+            if contents:  # Clear All takes the links too
+                sh.links = {k: v for k, v in sh.links.items() if not (r1 <= k[0] <= r2 and c1 <= k[1] <= c2)}
             self.autofit_rows({r for r in sh.row_heights if r1 <= r <= r2})
         self._structural(clear)
 
@@ -2779,6 +5145,9 @@ class SpreadsheetApp:
         self.clear_formats(contents=True)
 
     def fill_down(self):
+        if self._objects_selected():  # Ctrl+D with shapes selected: duplicate them, as Excel does
+            self.duplicate_objects()
+            return
         self._fill_from_edge(vertical=True)
 
     def fill_right(self):
@@ -2790,6 +5159,7 @@ class SpreadsheetApp:
     def fill_left(self):
         self._fill_from_edge(vertical=False, reverse=True)
 
+    @undo_name("Điền")
     def _fill_from_edge(self, vertical, reverse=False):
         """Ctrl+D / Ctrl+R (and up/left): copy the first row (column) of the selection over the rest."""
         self.commit_edit()
@@ -2818,6 +5188,7 @@ class SpreadsheetApp:
         self.commit(cs)
         self.refresh()
 
+    @undo_name("Chuỗi")
     def fill_series_dialog(self):
         self.commit_edit()
         r1, c1, r2, c2 = self._copy_rect()
@@ -2864,6 +5235,7 @@ class SpreadsheetApp:
             return r1, c1, r2, c
         return r1, c, r2, c2
 
+    @undo_name("Tự động điền")
     def do_fill(self, target):
         r1, c1, r2, c2 = self.sel_rect()
         t1, tc1, t2, tc2 = target
@@ -2889,6 +5261,7 @@ class SpreadsheetApp:
         self.cur, self.ext = (t1, tc1), (t2, tc2)
         self.refresh()
 
+    @undo_name("Tự động tính tổng")
     def autosum(self, func="SUM"):
         self.commit_edit()
         r1, c1, r2, c2 = self.sel_rect()
@@ -2957,37 +5330,251 @@ class SpreadsheetApp:
         self.wb.invalidate()
         self.refresh()
 
+    # outline: Data > Group / Ungroup / Subtotal
+    def _outline_target(self, verb):
+        """(axis, first, last) to group: whole rows or columns selected decide, otherwise ask like Excel."""
+        r1, c1, r2, c2 = self.sel_rect()
+        if r1 == 0 and r2 == MAX_ROWS - 1 and not (c1 == 0 and c2 == MAX_COLS - 1):
+            return 1, c1, c2
+        if c1 == 0 and c2 == MAX_COLS - 1:
+            return (0, r1, r2) if r2 - r1 < 100000 else None
+        axis = dialogs.ChoiceDialog(self.root, verb, [("Hàng", "rows"), ("Cột", "cols")], "rows").show()
+        if axis is None:
+            return None
+        return (0, r1, r2) if axis == "rows" else (1, c1, c2)
+
+    @undo_name(lambda self, delta=1: "Nhóm" if delta > 0 else "Bỏ nhóm")
+    def group_selection(self, delta=1):
+        """Data > Group (Alt+Shift+Right) / Ungroup (Alt+Shift+Left)."""
+        self.commit_edit()
+        target = self._outline_target("Nhóm" if delta > 0 else "Bỏ nhóm")
+        if target is None:
+            return
+        done = {}
+
+        def change():
+            done["changed"] = self.wb.group(self.sheet, *target, delta)
+        self._structural(change)
+        if not done.get("changed"):
+            self.root.bell()
+
+    @undo_name("Xóa dàn bài")
+    def clear_outline(self):
+        self.commit_edit()
+        self._structural(lambda: (self.wb.clear_outline(self.sheet, 0), self.wb.clear_outline(self.sheet, 1)))
+
+    @undo_name("Dàn bài")
+    def outline_action(self, action):
+        """A click on an outline symbol: ("level", axis, n) or ("toggle", axis, level, first, last, collapse)."""
+        axis = action[1]
+        if action[0] == "level":
+            self._structural(lambda: self.wb.show_level(self.sheet, axis, action[2]))
+        else:
+            _, _, level, a, b, collapse = action
+            self._structural(lambda: self.wb.set_collapsed(self.sheet, axis, level, a, b, collapse))
+        hidden = self.sh.row_hidden(self.cur[0]) or self.cur[1] in self.sh.hidden_cols
+        if hidden:  # the active cell went into a collapsed group: stand on the group's summary instead
+            levels = self.sh.row_levels if axis == 0 else self.sh.col_levels
+            index = self.cur[axis]
+            end = max((b for _, a, b in fe.outline_groups(levels) if a <= index <= b), default=index)
+            self.cur = self.ext = (end + 1, self.cur[1]) if axis == 0 else (self.cur[0], end + 1)
+            self.refresh()
+
+    def outline_detail(self, show):
+        """Data > Show Detail / Hide Detail: expand or collapse the innermost group at the active cell."""
+        self.commit_edit()
+        r1, _, r2, _ = self.sel_rect()
+        axes = (1,) if r1 == 0 and r2 == MAX_ROWS - 1 else (0, 1)
+        for axis in axes:
+            index = self.cur[axis]
+            sh = self.sh
+            levels, hidden = (sh.row_levels, sh.hidden_rows) if axis == 0 else (sh.col_levels, sh.hidden_cols)
+            groups = [(lv, a, b) for lv, a, b in fe.outline_groups(levels)
+                      if a <= index <= b + 1 and (a in hidden and b in hidden) == show]
+            if groups:
+                lv, a, b = max(groups)
+                self.outline_action(("toggle", axis, lv, a, b, not show))
+                return
+        self.root.bell()
+
+    @undo_name("Tổng phụ")
+    def subtotal_dialog(self):
+        """Data > Subtotal: totals after each group of equal values, with an outline to fold the table."""
+        self.commit_edit()
+        rect = self.sel_rect()
+        if rect == self._cell_box(*self.cur):
+            rect = self.current_region(*self.cur)
+        if rect[2] <= rect[0]:
+            messagebox.showinfo(APP_NAME, "Hãy chọn một ô trong bảng dữ liệu có hàng tiêu đề.", parent=self.root)
+            return
+        if self._pivot_guard(*rect):
+            return
+        columns = [(c, self.wb.display_text(self.sheet, rect[0], c)) for c in range(rect[1], rect[3] + 1)]
+        result = dialogs.SubtotalDialog(self.root, columns).show()
+        if not result:
+            return
+        out = {}
+
+        def change():
+            if result.get("remove"):
+                out["rect"] = self.wb.remove_subtotals(self.sheet, rect)
+            else:
+                out["rect"] = self.wb.add_subtotals(self.sheet, rect, result["by"], result["func"],
+                                                    result["columns"], result["replace"])
+        if self._structural(change):
+            r1, c1, r2, c2 = out["rect"]
+            self.cur, self.ext = (r1, c1), (r2, c2)
+            self.refresh()
+
+    @undo_name("Nhập từ Văn bản/CSV")
+    def import_text(self):
+        """Data > From Text/CSV: read a text file with the encoding and delimiter the user picks, into a new sheet."""
+        self.commit_edit()
+        path = filedialog.askopenfilename(parent=self.root, title="Nhập từ Văn bản/CSV", filetypes=[
+            ("Văn bản / CSV", "*.csv *.txt *.tsv *.prn"), ("Tất cả các tệp", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as err:
+            messagebox.showerror(APP_NAME, f"Không mở được tệp:\n{path}\n\n{err}", parent=self.root)
+            return
+        name = os.path.splitext(os.path.basename(path))[0]
+        options = dialogs.TextImportDialog(self.root, data, os.path.basename(path)).show()
+        if options is None:
+            return
+        self._busy(f"Đang nhập {os.path.basename(path)}...")
+        rows = fe.read_text_table(data, **options)[0]
+        created = []
+
+        def add():
+            title, i = name[:31] or "Nhập", 2
+            while self.wb.resolve_sheet(title) or self.wb.check_sheet_name(title):
+                title = f"{name[:26]} ({i})"
+                i += 1
+                if i > 999:
+                    title = None
+                    break
+            sheet = self.wb.add_sheet(title)
+            self.wb.sheets[sheet].cells = fe.table_cells(rows)
+            created.append(sheet)
+        if self._structural(add):
+            self.switch_sheet(created[0])
+            self.autofit_columns(0, min(fe.MAX_COLS - 1, max((len(r) for r in rows[:200]), default=1) - 1))
+        self._not_busy()
+        self.set_mode(f"Đã nhập {len(rows):,} hàng")
+
+    @undo_name("Văn bản thành Cột")
+    def text_to_columns(self):
+        """Data > Text to Columns: split the text of one column into the columns to its right."""
+        self.commit_edit()
+        r1, c1, r2, c2 = self.sel_rect()
+        if c1 != c2:
+            messagebox.showinfo(APP_NAME, "Hãy chọn các ô trong một cột để tách.", parent=self.root)
+            return
+        if self._is_huge(r1, c1, r2, c2):
+            r2 = min(r2, self.wb.used_extent(self.sheet)[0] - 1)
+        rows = [r for r in range(r1, r2 + 1) if (r, c1) in self.sh.cells and not fe.is_formula(self.sh.cells[(r, c1)])]
+        if not rows:
+            self.root.bell()
+            return
+        texts = {r: self.wb.display_text(self.sheet, r, c1) for r in rows}
+        opts = dialogs.TextToColumnsDialog(self.root, [texts[r] for r in rows]).show()
+        if not opts:
+            return
+        parts = {r: [p.strip() for p in fe.split_text(texts[r], opts["delimiters"], opts["merge"], opts["breaks"])]
+                 for r in rows}
+        width = max(len(p) for p in parts.values())
+        if c1 + width > MAX_COLS:
+            self.root.bell()
+            return
+        if any((r, c) in self.sh.cells for r in rows for c in range(c1 + 1, c1 + width)) and not messagebox.askyesno(
+                APP_NAME, "Ở các cột bên phải đã có dữ liệu. Bạn có muốn thay thế không?", parent=self.root):
+            return
+        if self._pivot_guard(r1, c1, r2, c1 + width - 1):
+            return
+        cs = ChangeSet(self.wb)
+        for r, values in parts.items():
+            for k in range(width):
+                value = values[k] if k < len(values) else ""
+                if opts["as_text"] and value and fe.parse_literal(value)[0] != value:
+                    value = "'" + value  # kept as typed: phone numbers keep their leading 0
+                cs.set(self.sheet, r, c1 + k, raw=value or None)
+        self.commit(cs)
+        self.cur, self.ext = (r1, c1), (r2, c1 + width - 1)
+        self.refresh()
+
+    def go_to_special(self):
+        """Select the cells of one kind (blanks, constants, formulas...) in the selection or the whole sheet."""
+        self.commit_edit()
+        found = dialogs.GoToSpecialDialog(self.root).show()
+        if not found:
+            return
+        kind, types = found
+        rect = self.sel_rect()
+        single = rect == self._cell_box(*self.cur) and not self.areas
+        if kind == "region":
+            r1, c1, r2, c2 = self.current_region(*self.cur)
+            self.areas, self.cur, self.ext = [], (r1, c1), (r2, c2)
+            self.refresh()
+            return
+        scope = (0, 0, MAX_ROWS - 1, MAX_COLS - 1) if single or kind == "last" else rect
+        cells = self.wb.special_cells(self.sheet, scope, kind, types)
+        if not cells:
+            messagebox.showinfo(APP_NAME, "Không tìm thấy ô nào.", parent=self.root)
+            return
+        rects = fe.cells_to_rects(cells)[:20000]
+        first = rects[0]
+        self.cur, self.ext, self.areas = (first[0], first[1]), (first[2], first[3]), rects[1:]
+        self.ensure_visible(*self.cur)
+        self.refresh()
+        self.set_mode(f"Đã chọn {len(cells)} ô ({len(rects)} vùng)")
+
     # sorting and filtering
     def current_region(self, r, c):
-        """Bounding box of the block of filled cells around (r, c), like Excel's Ctrl+*."""
+        """Bounding box of the block of filled cells around (r, c), like Excel's Ctrl+*.
+
+        Rows are grown first, a row at a time (cheap: one row is a few lookups), then the columns are
+        checked once along the whole height; repeated until nothing grows, so tall tables stay fast."""
         cells = self.sh.cells
         r1 = r2 = r
         c1 = c2 = c
-        grew = True
-        while grew:
-            grew = False
+        while True:
             cols = range(max(0, c1 - 1), min(MAX_COLS, c2 + 2))
-            if r1 > 0 and any((r1 - 1, k) in cells for k in cols):
-                r1, grew = r1 - 1, True
-            if r2 < MAX_ROWS - 1 and any((r2 + 1, k) in cells for k in cols):
-                r2, grew = r2 + 1, True
+            while r1 > 0 and any((r1 - 1, k) in cells for k in cols):
+                r1 -= 1
+            while r2 < MAX_ROWS - 1 and any((r2 + 1, k) in cells for k in cols):
+                r2 += 1
             rows = range(max(0, r1 - 1), min(MAX_ROWS, r2 + 2))
-            if c1 > 0 and any((k, c1 - 1) in cells for k in rows):
+            grew = False
+            while c1 > 0 and any((k, c1 - 1) in cells for k in rows):
                 c1, grew = c1 - 1, True
-            if c2 < MAX_COLS - 1 and any((k, c2 + 1) in cells for k in rows):
+            while c2 < MAX_COLS - 1 and any((k, c2 + 1) in cells for k in rows):
                 c2, grew = c2 + 1, True
-        return r1, c1, r2, c2
+            if not grew:
+                return r1, c1, r2, c2
 
     def _has_header(self, r1, c1, r2, c2):
+        """Guess, like Excel, whether the first row of a block holds column titles: all text, and
+        formatted unlike the next row, or above numbers (numbers typed as text count), or the
+        first row of a filter."""
         if r2 <= r1:
             return False
         first = [self.wb.get_value(self.sheet, r1, c) for c in range(c1, c2 + 1)]
         if not all(isinstance(v, str) and v for v in first):
             return False
-        if (self.sh.formats.get((r1, c1)) or {}).get("bold"):
+        f = self.sh.filter
+        if f and f["range"][0] == r1 and f["range"][1] <= c1 and c2 <= f["range"][3]:
+            return True
+
+        def look(r, c):
+            fmt = self.sh.formats.get((r, c)) or {}
+            return bool(fmt.get("bold")), fmt.get("bg"), bool(fmt.get("bb"))
+        if any(look(r1, c) != look(r1 + 1, c) for c in range(c1, c2 + 1)):
             return True
         second = [self.wb.get_value(self.sheet, r1 + 1, c) for c in range(c1, c2 + 1)]
-        return any(v is not None and not isinstance(v, str) for v in second)
+        return any(v not in (None, "") and fe.natural_key(v)[0] != 1 for v in second)
 
     def _sort_target(self):
         r1, c1, r2, c2 = self.sel_rect()
@@ -3018,28 +5605,56 @@ class SpreadsheetApp:
         if result:
             self._sort_rows((r1, c1, r2, c2), result["keys"], result["header"])
 
-    def _sort_rows(self, rect, keys, header):
+    @undo_name("Sắp xếp")
+    def _sort_rows(self, rect, keys, header, first=None):
+        """Sort the rows of rect by keys [(col, descending)], or with first = (col, "bg" | "fg", colour)
+        put the rows whose cell in col shows that colour on top (Excel's Sort by Color)."""
         r1, c1, r2, c2 = rect
         start = r1 + 1 if header else r1
         if r2 <= start or c2 < c1:
             return
-        sh = self.sh
-        items = [(r, [self.wb.get_value(self.sheet, r, k) for k, _ in keys],
-                  [(sh.cells.get((r, c)), sh.formats.get((r, c))) for c in range(c1, c2 + 1)])
+        sh, get = self.sh, self.wb.get_value
+        big = (r2 - start + 1) * (c2 - c1 + 1) > 20000
+        cells, formats = sh.cells, sh.formats
+        items = [(r, [get(self.sheet, r, k) for k, _ in keys],
+                  None if big else [(cells.get((r, c)), formats.get((r, c))) for c in range(c1, c2 + 1)])
                  for r in range(start, r2 + 1)]
         for i in reversed(range(len(keys))):  # stable passes, most significant key last
             filled = [it for it in items if it[1][i] is not None and it[1][i] != ""]
             blanks = [it for it in items if it[1][i] is None or it[1][i] == ""]
-            filled.sort(key=lambda it: fe.sort_key(it[1][i]), reverse=keys[i][1])
+            filled.sort(key=lambda it: fe.natural_key(it[1][i]), reverse=keys[i][1])  # 2 before 10
             items = filled + blanks
-        cs = ChangeSet(self.wb)
-        for new_r, (old_r, _, cells) in zip(range(start, r2 + 1), items):
-            for j, (raw, fmt) in enumerate(cells):
-                cs.set(self.sheet, new_r, c1 + j, raw=fe.shift_formula(raw, new_r - old_r, 0) if raw else None, fmt=fmt)
-        self.commit(cs)
-        if sh.filter:
-            self.wb.apply_filter(self.sheet)
-        self.refresh()
+        if first is not None:
+            col, what, color = first
+            hits = {it[0] for it in items if self.wb.cell_color(self.sheet, it[0], col, what) == color}
+            items = [it for it in items if it[0] in hits] + [it for it in items if it[0] not in hits]
+        if not big:
+            cs = ChangeSet(self.wb)
+            for new_r, (old_r, _, cells) in zip(range(start, r2 + 1), items):
+                for j, (raw, fmt) in enumerate(cells):
+                    cs.set(self.sheet, new_r, c1 + j, raw=fe.shift_formula(raw, new_r - old_r, 0) if raw else None,
+                           fmt=fmt)
+            self.commit(cs)
+            if sh.filter:
+                self.wb.apply_filter(self.sheet)
+            self.refresh()
+            return
+
+        def move():  # big tables: renumber the rows in one pass (undo keeps a copy of the sheet, not each cell)
+            new_row = {old: new for new, (old, _, _) in zip(range(start, r2 + 1), items)}
+            with fe.bulk():
+                for name in ("cells", "formats"):
+                    d = getattr(sh, name)
+                    setattr(sh, name, {((new_row[r], c) if start <= r <= r2 and c1 <= c <= c2 else (r, c)): v
+                                       for (r, c), v in d.items()})
+                cells, old_row = sh.cells, {n: o for o, n in new_row.items()}
+                formulas = [(k, v) for k, v in cells.items() if v[:1] == "=" and start <= k[0] <= r2 and c1 <= k[1] <= c2]
+                for (r, c), raw in formulas:  # a formula's relative references move with its row
+                    cells[(r, c)] = fe.shift_formula(raw, r - old_row[r], 0)
+            self.wb._ast.clear()
+            if sh.filter:
+                self.wb.apply_filter(self.sheet)
+        self._structural(move)
 
     def _filter_rect(self):
         r1, c1, r2, c2 = self.sel_rect()
@@ -3047,6 +5662,7 @@ class SpreadsheetApp:
             return self.current_region(*self.cur) if self.cur in self.sh.cells else None
         return self._copy_rect()
 
+    @undo_name("Lọc")
     def toggle_filter(self):
         self.commit_edit()
         if self.sh.filter:
@@ -3058,6 +5674,7 @@ class SpreadsheetApp:
             return
         self._structural(lambda: setattr(self.sh, "filter", {"range": rect, "criteria": {}, "hidden": set()}))
 
+    @undo_name("Xóa bộ lọc")
     def clear_filter(self):
         if self.sh.filter and self.sh.filter["criteria"]:
             def clear():
@@ -3065,6 +5682,7 @@ class SpreadsheetApp:
                 self.wb.apply_filter(self.sheet)
             self._structural(clear)
 
+    @undo_name("Áp dụng lại bộ lọc")
     def reapply_filter(self):
         if self.sh.filter:
             self._extend_filter_range()
@@ -3083,25 +5701,60 @@ class SpreadsheetApp:
             return
         self._extend_filter_range()
         title = self.wb.display_text(self.sheet, f["range"][0], col) or f"Cột {col_name(col)}"
-        dialogs.FilterPopup(self.root, self.ui, title, self.wb.filter_values(self.sheet, col), f["criteria"].get(col),
-                            x, y, on_sort=lambda desc: self._sort_rows(f["range"], [(col, desc)], True),
-                            on_clear=lambda: self._set_filter_criteria(col, None),
-                            on_apply=lambda allowed: self._set_filter_criteria(col, allowed))
+        crit = f["criteria"].get(col)
+        if isinstance(crit, dict):  # tick the values a rule lets through
+            r1, _, r2, _ = f["range"]
+            stats = {}
+            selected = {self.wb.display_text(self.sheet, r, col) for r in range(r1 + 1, r2 + 1)
+                        if self.wb.filter_match(self.sheet, r, col, crit, stats)}
+        else:
+            selected = crit
+        kind = self.wb.filter_kind(self.sheet, col)
+        colors = {what: self.wb.filter_colors(self.sheet, col, what) for what in ("bg", "fg")}
+        dialogs.FilterPopup(
+            self.root, self.ui, title, self.wb.filter_values(self.sheet, col), selected, x, y, kind=kind,
+            colors=colors, active=crit, icons=self.menu_icons,
+            on_sort=lambda desc: self._sort_rows(f["range"], [(col, desc)], True),
+            on_sort_color=lambda what, color: self._sort_rows(f["range"], [], True, first=(col, what, color)),
+            on_clear=lambda: self._set_filter_criteria(col, None),
+            on_apply=lambda allowed: self._set_filter_criteria(col, allowed),
+            on_criterion=lambda new: self._set_filter_criteria(col, new),
+            on_dialog=lambda name, preset: self._filter_dialog(col, title, name, preset, kind))
 
+    def _filter_dialog(self, col, title, name, preset, kind):
+        """The Top 10 ("top") or Custom AutoFilter ("custom") dialog for a filter column."""
+        if name == "top":
+            result = dialogs.Top10Dialog(self.root, preset).show()
+        else:
+            result = dialogs.CustomFilterDialog(self.root, title, self.wb.filter_values(self.sheet, col), preset,
+                                                kind).show()
+        if result:
+            self._set_filter_criteria(col, result)
+
+    @undo_name("Lọc")
     def _set_filter_criteria(self, col, allowed):
         def change():
             criteria = self.sh.filter["criteria"]
             if allowed is None:
                 criteria.pop(col, None)
-            else:
-                criteria[col] = set(allowed)
+            else:  # a set of texts from the checklist, or a rule (see formula_engine.FILTER_OPS)
+                criteria[col] = dict(allowed) if isinstance(allowed, dict) else set(allowed)
             self.wb.apply_filter(self.sheet)
         self._structural(change)
 
     def filter_by_value(self):
+        self._filter_by_cell(lambda r, c: {self.wb.display_text(self.sheet, r, c)})
+
+    def filter_by_color(self, what="bg"):
+        self._filter_by_cell(lambda r, c: {"type": "color", "what": what,
+                                           "color": self.wb.cell_color(self.sheet, r, c, what)})
+
+    @undo_name("Lọc")
+    def _filter_by_cell(self, criterion):
+        """Filter the active cell's column by criterion(row, col), turning the filter on if needed."""
         self.commit_edit()
         r, c = self.cur
-        text = self.wb.display_text(self.sheet, r, c)
+        crit = criterion(r, c)
 
         def change():
             if not self.sh.filter:
@@ -3109,10 +5762,11 @@ class SpreadsheetApp:
                 if rect[0] == rect[2]:
                     raise ValueError("Cần một vùng dữ liệu có tiêu đề để lọc.")
                 self.sh.filter = {"range": rect, "criteria": {}, "hidden": set()}
-            self.sh.filter["criteria"][c] = {text}
+            self.sh.filter["criteria"][c] = crit
             self.wb.apply_filter(self.sheet)
         self._structural(change)
 
+    @undo_name("Loại bỏ Trùng lặp")
     def remove_duplicates(self):
         self.commit_edit()
         target = self._sort_target()
@@ -3151,28 +5805,612 @@ class SpreadsheetApp:
 
     # ------------------------------------------------------------------ rows, columns, cells, sheets
 
+    # ------------------------------------------------------------------ charts
+
+    @undo_name("Chèn biểu đồ")
+    def insert_chart(self, kind):
+        """Chart of the selected cells (or the data around the active cell), placed right of the data."""
+        self.commit_edit()
+        rect = self.sel_rect()
+        if rect == self._cell_box(*self.cur):
+            rect = self.current_region(*self.cur) if self.cur in self.sh.cells else None
+        elif self._is_huge(*rect):
+            rows, cols = self.wb.used_extent(self.sheet)
+            rect = (rect[0], rect[1], min(rect[2], rows - 1), min(rect[3], cols - 1))
+        if rect is None or rect[2] < rect[0] or rect[3] < rect[1] or not self.wb.chart_data(
+                self.sheet, {"range": rect})[1]:
+            messagebox.showinfo(APP_NAME, "Hãy chọn vùng dữ liệu (có thể kèm hàng/cột tiêu đề) để vẽ biểu đồ.",
+                                parent=self.root)
+            return
+        chart = {"type": kind, "range": rect, "title": "", "anchor": (rect[0], min(rect[3] + 2, MAX_COLS - 1), 0, 0),
+                 "size": fe.CHART_SIZE}
+        if self._structural(lambda: self.sh.charts.append(chart)):
+            self.chart_sel = len(self.sh.charts) - 1
+            r, c = chart["anchor"][:2]
+            self.ensure_visible(r, c)
+            self.refresh_view()
+
+    @undo_name("Sửa biểu đồ")
+    def _update_chart(self, **changes):
+        index = self.chart_sel
+
+        def change():
+            self.sh.charts[index] = dict(self.sh.charts[index], **changes)
+        self._structural(change)
+        self.chart_sel = index
+        self.redraw()
+
+    def edit_chart(self):
+        if self.chart_sel is not None and self.sh.charts[self.chart_sel]["type"] != fe.PICTURE:
+            result = dialogs.ChartDialog(self.root, self.sh.charts[self.chart_sel]).show()
+            if result:
+                self._update_chart(**result)
+
+    def set_chart_type(self, kind):
+        if self.chart_sel is not None and self.sh.charts[self.chart_sel]["type"] != fe.PICTURE:
+            self._update_chart(type=kind)
+
+    @undo_name("Xóa biểu đồ")
+    def delete_chart(self):
+        if self.chart_sel is not None:
+            index, self.chart_sel = self.chart_sel, None
+            self._structural(lambda: self.sh.charts.pop(index))
+
+    def insert_shape(self, kind):
+        """Insert > Shapes: draw `kind` with the next drag on the sheet (Excel's look); the Diagram tab, which
+        formats shapes, opens after."""
+        self.commit_edit()
+        self.set_insert_tool(kind, after=lambda: self.ribbon.select("Sơ đồ"))
+
+    # ------------------------------------------------------------------ pictures
+
+    def _ask_picture(self):
+        path = filedialog.askopenfilename(parent=self.root, title="Chèn ảnh", filetypes=[
+            ("Ảnh", "*.png *.gif *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"), ("Tất cả các tệp", "*.*")])
+        if not path:
+            return None
+        try:
+            return images.load_picture(path) + (os.path.splitext(os.path.basename(path))[0],)
+        except (OSError, ValueError) as err:
+            messagebox.showerror(APP_NAME, f"Không chèn được ảnh:\n{path}\n\n{err}", parent=self.root)
+            return None
+
+    @staticmethod
+    def _fit_picture(size, limit=(640, 480)):
+        w, h = size
+        k = min(1.0, limit[0] / max(1, w), limit[1] / max(1, h))
+        return max(8, round(w * k)), max(8, round(h * k))
+
+    @undo_name("Chèn ảnh")
+    def insert_picture(self):
+        """Insert > Pictures: a picture floating over the cells at the active cell."""
+        self.commit_edit()
+        found = self._ask_picture()
+        if not found:
+            return
+        self._add_picture(*found)
+
+    def _add_picture(self, data, fmt, size, name):
+        r, c = self.cur
+        picture = {"type": fe.PICTURE, "image": data, "format": fmt, "id": fe.new_picture_id(), "name": name,
+                   "anchor": (r, c, 0, 0), "size": self._fit_picture(size), "native": list(size)}
+        if self._structural(lambda: self.sh.charts.append(picture)):
+            self.chart_sel = len(self.sh.charts) - 1
+            self.redraw()
+            return True
+        return False
+
+    @undo_name("Dán ảnh")
+    def paste_picture(self):
+        """Ctrl+V with a picture on the clipboard (and no text): it floats over the cells at the active
+        cell, as Excel pastes a screenshot."""
+        try:
+            data = richclip.read_image(self.root.winfo_id())
+        except OSError:
+            data = None
+        info = images.image_info(data) if data else None
+        if not info:
+            return False
+        n = sum(1 for o in self.sh.charts if o["type"] == fe.PICTURE) + 1
+        return self._add_picture(base64.b64encode(data).decode("ascii"), info[0], info[1:], f"Ảnh {n}")
+
+    def change_picture(self):
+        if self.chart_sel is None:
+            return
+        found = self._ask_picture()
+        if found:
+            data, fmt, size, name = found
+            old = self.sh.charts[self.chart_sel]
+            width = old["size"][0]
+            self._update_chart(image=data, format=fmt, id=fe.new_picture_id(), name=name, native=list(size),
+                               size=(width, max(8, round(width * size[1] / max(1, size[0])))))
+
+    def reset_picture_size(self):
+        if self.chart_sel is None:
+            return
+        picture = self.sh.charts[self.chart_sel]
+        native = picture.get("native") or images.image_info(base64.b64decode(picture["image"]))[1:]
+        self._update_chart(size=tuple(native))
+
+    # ------------------------------------------------------------------ hyperlinks
+
+    @undo_name("Liên kết")
+    def insert_hyperlink(self):
+        """Insert > Link (Ctrl+K): link the active cell to a web page, a file, a place or an e-mail address."""
+        self.commit_edit()
+        r, c = self.cur = self.ext = self._anchor(self.cur)
+        if self._pivot_guard(r, c, r, c):
+            return
+        sheet, link = self.sheet, self.sh.links.get((r, c))
+        text = self.wb.display_text(sheet, r, c)
+        result = dialogs.HyperlinkDialog(self.root, text, link, list(self.wb.sheets),
+                                         [d["name"] for d in self.wb.sorted_names()], cell_name(r, c),
+                                         os.path.dirname(self.path) if self.path else None).show()
+        if not result:
+            return
+        if result.get("remove"):
+            self.remove_hyperlinks()
+            return
+
+        def change():
+            self.wb.sheets[sheet].links[(r, c)] = {"target": result["target"], "tip": result["tip"]}
+            if result["text"] != text or not self.wb.get_raw(sheet, r, c):
+                shown = result["text"]
+                self.wb.set_raw(sheet, r, c, "'" + shown if shown.startswith(("=", "'")) else shown)
+            fmt = dict(self.wb.get_format(sheet, r, c) or {}, fg=HYPERLINK_FG, underline=True)
+            self.wb.set_format(sheet, r, c, fmt)
+        self._structural(change)
+
+    @undo_name("Loại bỏ liên kết")
+    def remove_hyperlinks(self):
+        """Remove Hyperlinks: the links in the selection and their blue underlined look."""
+        self.commit_edit()
+        r1, c1, r2, c2 = self.sel_rect()
+        keys = [k for k in self.sh.links if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
+        if not keys:
+            self.root.bell()
+            return
+        sheet = self.sheet
+
+        def change():
+            for key in keys:
+                del self.wb.sheets[sheet].links[key]
+                fmt = dict(self.wb.get_format(sheet, *key) or {})
+                if fmt.get("fg") == HYPERLINK_FG:
+                    fmt.pop("fg")
+                    fmt.pop("underline", None)
+                self.wb.set_format(sheet, *key, fmt or None)
+        self._structural(change)
+
+    def open_hyperlink(self):
+        link = self.wb.hyperlink_at(self.sheet, *self._anchor(self.cur))
+        if link:
+            self.follow_link(link)
+        else:
+            self.root.bell()
+
+    def follow_link(self, link):
+        """Open a link: '#Sheet!A1' or '#Name' goes there; web and mail addresses open in their programs;
+        anything else is a file (relative to the workbook's folder)."""
+        target = link["target"].strip()
+        if target.startswith("#"):
+            place = target[1:]
+            if place.upper() in self.wb.names:
+                if not self.go_to_name(place):
+                    self.root.bell()
+                return
+            sheet_part, _, addr = place.rpartition("!")
+            sheet = self.wb.resolve_sheet(sheet_part.strip("'").replace("''", "'")) if sheet_part else self.sheet
+            rect = fe.parse_range(addr.replace("$", "").strip())
+            if sheet is None or rect is None:
+                messagebox.showerror(APP_NAME, f"Không tìm thấy vị trí {place}.", parent=self.root)
+                return
+            self.commit_edit()
+            self.switch_sheet(sheet)
+            self.cur, self.ext = rect[:2], rect[2:]
+            self.ensure_visible(*self.cur)
+            self.refresh()
+            return
+        if re.match(r"[a-z][a-z0-9+.-]+:", target, re.I) and not re.match(r"[a-z]:[\\/]", target, re.I):
+            webbrowser.open(target)  # http:, https:, mailto:, ...
+            return
+        folder = os.path.dirname(self.path) if self.path else os.getcwd()
+        path = target if os.path.isabs(target) else os.path.join(folder, target)
+        try:
+            self._open_document(path)
+        except OSError as err:
+            messagebox.showerror(APP_NAME, f"Không mở được:\n{path}\n\n{err}", parent=self.root)
+
+    def _show_link_tip(self, link, x, y):
+        """The ScreenTip of a linked cell under the pointer (after a short pause), like Excel's."""
+        self._hide_link_tip()
+        text = (link.get("tip") or link["target"]) + "\nNhấp một lần để mở. Nhấp và giữ để chọn ô này."
+
+        def show():
+            self._link_tip_job = None
+            tip = self._link_tip = tk.Toplevel(self.root)
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            tk.Label(tip, text=text, bg="#ffffff", fg="#333333", bd=1, relief="solid", padx=7, pady=4, justify="left",
+                     font=self.ui.small_font).pack()
+            tip.geometry(f"+{x + 14}+{y + 18}")
+        self._link_tip_job = self.root.after(600, show)
+
+    def _hide_link_tip(self):
+        if self._link_tip_job:
+            self.root.after_cancel(self._link_tip_job)
+            self._link_tip_job = None
+        if self._link_tip is not None:
+            self._link_tip.destroy()
+            self._link_tip = None
+
+    # ------------------------------------------------------------------ PivotTables
+
+    @undo_name("Chèn PivotTable")
+    def insert_pivot(self):
+        """Insert > PivotTable: a pivot of the selected block (or the data around the active cell)."""
+        self.commit_edit()
+        rect = self.sel_rect()
+        if rect == self._cell_box(*self.cur):
+            rect = self.current_region(*self.cur) if self.cur in self.sh.cells else (0, 0, 0, 0)
+        elif self._is_huge(*rect):
+            rows, cols = self.wb.used_extent(self.sheet)
+            rect = (rect[0], rect[1], max(rect[0], min(rect[2], rows - 1)), max(rect[1], min(rect[3], cols - 1)))
+        result = dialogs.PivotDialog(self.root, self.wb, self.sheet, rect).show()
+        if not result:
+            return
+        names = {p["name"] for sh in self.wb.sheets.values() for p in sh.pivots}
+        name = next(f"PivotTable{n}" for n in itertools.count(1) if f"PivotTable{n}" not in names)
+        src_sheet, src_rect = result["source"]
+        p = pv.new_pivot(name, src_sheet, src_rect, (2, 0))
+        try:
+            pv.Source(self.wb, p)
+        except pv.PivotError as err:
+            messagebox.showerror(APP_NAME, str(err), parent=self.root)
+            return
+        dest = result["dest"]
+        if dest:
+            p["anchor"] = dest[1:]
+            if pv.overlaps(self.wb, dest[0], p, pv.compute(self.wb, p)) and not messagebox.askyesno(
+                    APP_NAME, "Nơi đặt PivotTable đã có dữ liệu. Ghi đè lên dữ liệu đó?", parent=self.root):
+                return
+        placed = []
+
+        def create():
+            sheet = dest[0] if dest else self.wb.add_sheet(index=list(self.wb.sheets).index(self.sheet))
+            self.wb.sheets[sheet].pivots.append(p)
+            pv.place(self.wb, sheet, p, pv.compute(self.wb, p))
+            placed.append(sheet)
+        if self._structural(create):
+            self.show_pivot_fields = True
+            if placed[0] != self.sheet:
+                self.switch_sheet(placed[0])
+            self.select_to(p["anchor"])
+
+    def _fit_report_columns(self, sheet, rect):
+        """Size a pivot report's columns to its contents (Excel autofits them on every update)."""
+        sh = self.wb.sheets[sheet]
+        for c, width in self._content_widths(sheet, rect[1], rect[3], rows=(rect[0], rect[2])).items():
+            sh.col_widths[c] = max(width, fe.DEFAULT_COL_WIDTH * 3 // 4)
+
+    def _current_pivot(self):
+        return pv.pivot_at(self.wb, self.sheet, *self.cur)
+
+    @undo_name("Thay đổi PivotTable")
+    def update_pivot(self, p, **changes):
+        """Apply changes to pivot p on this sheet, recompute and rewrite its report (one undo step)."""
+        sheet = self.sheet
+        trial = dict(p, **changes)
+        try:
+            report = pv.compute(self.wb, trial)
+            pv.report_rect(trial, report)
+        except pv.PivotError as err:
+            messagebox.showerror(APP_NAME, str(err), parent=self.root)
+            self._pane_key = None
+            self.refresh()
+            return False
+        if pv.overlaps(self.wb, sheet, trial, report) and not messagebox.askyesno(
+                APP_NAME, "Báo cáo PivotTable mới sẽ ghi đè lên ô đang có dữ liệu. Tiếp tục?", parent=self.root):
+            self._pane_key = None
+            self.refresh()
+            return False
+
+        def change():
+            p.update({key: trial[key] for key in changes})
+            pv.place(self.wb, sheet, p, report)
+            self._fit_report_columns(sheet, p["rect"])
+        return self._structural(change)
+
+    def refresh_pivot(self, p):
+        self.update_pivot(p)
+
+    @undo_name("Làm mới tất cả")
+    def refresh_all_pivots(self):
+        """Data > Refresh All: recompute every pivot from its source as it is now."""
+        self.commit_edit()
+        pivots = [(name, p) for name, sh in self.wb.sheets.items() for p in sh.pivots]
+        if not pivots:
+            messagebox.showinfo(APP_NAME, "Sổ làm việc chưa có PivotTable nào.", parent=self.root)
+            return
+        errors = []
+
+        def change():
+            for sheet, p in pivots:
+                try:
+                    pv.refresh(self.wb, sheet, p)
+                    self._fit_report_columns(sheet, p["rect"])
+                except pv.PivotError as err:
+                    errors.append(f"{p['name']}: {err}")
+        self._structural(change)
+        self._pane_key = None
+        self.refresh()
+        if errors:
+            messagebox.showwarning(APP_NAME, "\n".join(errors), parent=self.root)
+
+    @undo_name("Xóa PivotTable")
+    def delete_pivot(self, p):
+        if not messagebox.askyesno(APP_NAME, f"Xóa {p['name']} và báo cáo của nó?", parent=self.root):
+            return
+
+        def change():
+            a1, b1, a2, b2 = p["rect"] or (0, 0, -1, -1)
+            for key in [k for k in set(self.sh.cells) | set(self.sh.formats) if a1 <= k[0] <= a2 and b1 <= k[1] <= b2]:
+                self.sh.cells.pop(key, None)
+                self.sh.formats.pop(key, None)
+            self.sh.pivots.remove(p)
+        self._structural(change)
+
+    @undo_name("Hiện chi tiết")
+    def pivot_details(self, p, r, c):
+        """Double-click on a value: the source records behind it, on a new sheet (Excel's Show Details)."""
+        try:
+            source = pv.Source(self.wb, p)
+            report = pv.compute(self.wb, dict(p), source)
+        except pv.PivotError as err:
+            messagebox.showerror(APP_NAME, str(err), parent=self.root)
+            return
+        key = report.sources.get((r - p["anchor"][0], c - p["anchor"][1]))
+        if key is None:
+            return
+        names, records = pv.drill_down(self.wb, p, *key, source=source)
+        made = []
+
+        def create():
+            sheet = self.wb.add_sheet(index=list(self.wb.sheets).index(self.sheet))
+            sh = self.wb.sheets[sheet]
+            for j, name in enumerate(names):
+                sh.cells[(0, j)] = fe.value_to_raw(name) or name
+                sh.formats[(0, j)] = {"bold": True, "bg": "#ddebf7", "bb": ["thin", "#9bc2e6"]}
+            for i, rec in enumerate(records, 1):
+                for j, (value, _) in enumerate(rec):
+                    raw = fe.number_text(value) if fe.is_number(value) else fe.value_to_raw(value)
+                    if raw:
+                        sh.cells[(i, j)] = raw
+                    fmt = source.formats.get(names[j]) if fe.is_number(value) else None
+                    if fmt:
+                        sh.formats[(i, j)] = {"num": fmt}
+            sh.freeze = (0, 1, 0, 0)
+            for col, width in self._content_widths(sheet, 0, len(names) - 1).items():
+                sh.col_widths[col] = max(width, fe.DEFAULT_COL_WIDTH)
+            made.append(sheet)
+        if self._structural(create):
+            self.switch_sheet(made[0])
+            self.select_to((0, 0))
+
+    def toggle_pivot_fields(self):
+        self.show_pivot_fields = not self.show_pivot_fields
+        self._pane_key = None
+        self.refresh()
+
+    def _sync_pivot_pane(self):
+        """Show the PivotTable Fields pane while the active cell is in a pivot report, as Excel does."""
+        self.btn_pivot_fields.set_checked(self.show_pivot_fields)
+        p = self._current_pivot() if self.show_pivot_fields else None
+        if p is None:
+            if self.pivot_pane.winfo_ismapped() or self._pane_key is not None:
+                self.pivot_pane.grid_remove()
+                self._pane_key = None
+            return
+        key = (self.sheet, id(p), repr([p[area] for area in pv.AREAS]))
+        if key != self._pane_key:
+            try:
+                source = pv.Source(self.wb, p)
+                fields, kinds = source.names, source.kinds
+            except pv.PivotError:
+                fields, kinds = [], {}
+            self.pivot_pane.show(p, fields, kinds)
+            self._pane_key = key
+        if not self.pivot_pane.winfo_ismapped():
+            self.pivot_pane.grid(row=0, column=2, sticky="ns")
+
+    def _pivot_pane_change(self, areas):
+        p = self._current_pivot()
+        if p is not None:
+            self.update_pivot(p, **areas)
+
+    def _pivot_pane_action(self, action, *args):
+        p = self._current_pivot()
+        if action == "close":
+            self.toggle_pivot_fields()
+            return
+        if p is None:
+            return
+        if action == "refresh":
+            self.refresh_pivot(p)
+        elif action == "delete":
+            self.delete_pivot(p)
+        elif action == "options":
+            result = dialogs.PivotOptionsDialog(self.root, p).show()
+            if result:
+                self.update_pivot(p, **result)
+        elif action == "value":
+            values = [dict(v) for v in p["values"]]
+            result = dialogs.ValueFieldDialog(self.root, values[args[0]], pv.FUNCS, pv.SHOW_AS).show()
+            if result:
+                values[args[0]].update(result)
+                self.update_pivot(p, values=values)
+        elif action == "field":
+            area, index = args
+            field = p[area][index]
+            try:
+                source = pv.Source(self.wb, p)
+            except pv.PivotError as err:
+                messagebox.showerror(APP_NAME, str(err), parent=self.root)
+                return
+            result = dialogs.PivotFieldDialog(
+                self.root, field, pv.field_items(source, p, field), p["items"].get(field),
+                p["sort"].get(field) == "desc", p["group"].get(field), pv.GROUPS,
+                source.kinds.get(field) == "date").show()
+            if not result:
+                return
+            sort, group, items = dict(p["sort"]), dict(p["group"]), dict(p["items"])
+            sort.pop(field, None)
+            if result["desc"]:
+                sort[field] = "desc"
+            items.pop(field, None)
+            if result["group"] != group.get(field):
+                group.pop(field, None)  # new grouping, new items: all of them shown again
+                if result["group"]:
+                    group[field] = result["group"]
+            elif result["items"] is not None:
+                items[field] = result["items"]
+            self.update_pivot(p, sort=sort, group=group, items=items)
+
+    # ------------------------------------------------------------------ data validation and notes
+
+    def _validation_target(self):
+        r1, c1, r2, c2 = self.sel_rect()
+        if self._is_huge(r1, c1, r2, c2) and not (r1 == 0 and r2 == MAX_ROWS - 1):
+            rows, cols = self.wb.used_extent(self.sheet)
+            r2, c2 = max(r1, min(r2, rows - 1)), max(c1, min(c2, cols - 1))
+        return r1, c1, r2, c2
+
+    def _replace_validation(self, rect, rule):
+        """Rules after `rect` loses whatever validation it had and, unless rule is None, gets `rule`."""
+        rules = [dict(old, range=part) for old in self.sh.validations for part in fe.rect_minus(old["range"], rect)]
+        if rule is not None:
+            rules.append(dict(rule, range=rect))
+        return rules
+
+    @undo_name("Xác thực dữ liệu")
+    def data_validation_dialog(self):
+        self.commit_edit()
+        rect = self._validation_target()
+        result = dialogs.ValidationDialog(self.root, self.wb.validation_at(self.sheet, *self.cur)).show()
+        if result is None:
+            return
+        rule = None if result.get("clear") or result.get("type") == "any" else result
+        rules = self._replace_validation(rect, rule)
+        if rules != self.sh.validations:
+            self._structural(lambda: setattr(self.sh, "validations", rules))
+
+    @undo_name("Xóa xác thực")
+    def clear_validation(self):
+        self.commit_edit()
+        rules = self._replace_validation(self._validation_target(), None)
+        if rules != self.sh.validations:
+            self._structural(lambda: setattr(self.sh, "validations", rules))
+
+    def open_validation_list(self):
+        self.commit_edit()
+        r, c = self.cur
+        rule = self.wb.validation_at(self.sheet, r, c)
+        if not rule or rule.get("type") != "list":
+            return
+        items = self.wb.validation_options(self.sheet, r, c, rule)
+        if not items:
+            self.root.bell()
+            return
+        self.ensure_visible(r, c)
+        self.refresh_view()
+        x0, _, x1, y1 = self._rect_bbox(*self._cell_box(r, c))
+        cv = self.canvas
+        width = max(x1 - x0 + (self._list_button[2] - self._list_button[0] if self._list_button else 0),
+                    max(self.ui.font.measure(t) for t in items) + 24)
+
+        def pick(text):
+            cs = ChangeSet(self.wb)
+            cs.set(self.sheet, r, c, raw="'" + text if text.startswith("=") else text)
+            self.commit(cs)
+            self.refresh()
+            self.canvas.focus_set()
+
+        dialogs.ListPopup(self.root, self.ui, items, self.wb.display_text(self.sheet, r, c),
+                          cv.winfo_rootx() + int(x0), cv.winfo_rooty() + int(y1) + 1, width, pick)
+
+    @undo_name("Ghi chú")
+    def edit_note(self):
+        self.commit_edit()
+        r, c = self.cur = self._anchor(self.cur)
+        old = self.sh.notes.get((r, c), "")
+        text = dialogs.NoteDialog(self.root, cell_name(r, c), old).show()
+        if text is None or text == old:
+            return
+
+        def change():
+            if text:
+                self.sh.notes[(r, c)] = text
+            else:
+                self.sh.notes.pop((r, c), None)
+        self._structural(change)
+
+    @undo_name("Xóa ghi chú")
+    def delete_notes(self):
+        self.commit_edit()
+        r1, c1, r2, c2 = self.sel_rect()
+        doomed = [k for k in self.sh.notes if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
+        if not doomed:
+            self.root.bell()
+            return
+
+        def change():
+            for k in doomed:
+                del self.sh.notes[k]
+        self._structural(change)
+
+    def goto_note(self, step):
+        """Select the next (step 1) or previous (step -1) cell with a note, wrapping around."""
+        self.commit_edit()
+        keys = sorted(self.sh.notes)
+        if not keys:
+            self.root.bell()
+            return
+        after = [k for k in keys if (k > self.cur if step > 0 else k < self.cur)]
+        target = (after[0] if step > 0 else after[-1]) if after else (keys[0] if step > 0 else keys[-1])
+        self.select_to(target)
+
+    def toggle_show_notes(self):
+        self.show_notes = not self.show_notes
+        self.btn_show_notes.set_checked(self.show_notes)
+        self.redraw()
+
+    @undo_name("Chèn hàng")
     def insert_rows(self):
         r1, _, r2, _ = self.sel_rect()
         count = 1 if r2 - r1 + 1 >= MAX_ROWS else r2 - r1 + 1
         self.clip = None
         self._structural(lambda: self.wb.insert_rows(self.sheet, r1, count))
 
+    @undo_name("Xóa hàng")
     def delete_rows(self):
         r1, _, r2, _ = self.sel_rect()
         self.clip = None
         self._structural(lambda: self.wb.delete_rows(self.sheet, r1, r2 - r1 + 1))
 
+    @undo_name("Chèn cột")
     def insert_cols(self):
         _, c1, _, c2 = self.sel_rect()
         count = 1 if c2 - c1 + 1 >= MAX_COLS else c2 - c1 + 1
         self.clip = None
         self._structural(lambda: self.wb.insert_cols(self.sheet, c1, count))
 
+    @undo_name("Xóa cột")
     def delete_cols(self):
         _, c1, _, c2 = self.sel_rect()
         self.clip = None
         self._structural(lambda: self.wb.delete_cols(self.sheet, c1, c2 - c1 + 1))
 
+    @undo_name(lambda self, insert, shift: "Chèn ô" if insert else "Xóa ô")
     def _shift_cells(self, insert, shift):
         r1, c1, r2, c2 = self.sel_rect()
         if shift == "rows":
@@ -3217,35 +6455,56 @@ class SpreadsheetApp:
         else:
             self._shift_cells(False, "up")
 
+    @undo_name("Ẩn hàng")
     def hide_rows(self):
         r1, _, r2, _ = self.sel_rect()
         self._structural(lambda: self.sh.hidden_rows.update(range(r1, r2 + 1)))
 
+    @undo_name("Ẩn cột")
     def hide_cols(self):
         _, c1, _, c2 = self.sel_rect()
         self._structural(lambda: self.sh.hidden_cols.update(range(c1, c2 + 1)))
 
+    @undo_name("Bỏ ẩn hàng")
     def unhide_rows(self):
         r1, _, r2, _ = self.sel_rect()
         self._structural(lambda: self.sh.hidden_rows.difference_update(range(r1, r2 + 1)))
 
+    @undo_name("Bỏ ẩn cột")
     def unhide_cols(self):
         _, c1, _, c2 = self.sel_rect()
         self._structural(lambda: self.sh.hidden_cols.difference_update(range(c1, c2 + 1)))
 
+    def _content_widths(self, sheet, c1, c2, rows=None):
+        """{column: pixels at 96 DPI} its widest text needs (only rows r1..r2 when rows = (r1, r2))."""
+        sh = self.wb.sheets[sheet]
+        cells, formats = sh.cells, sh.formats
+        by_col = {}
+        for key in cells:
+            if c1 <= key[1] <= c2 and (rows is None or rows[0] <= key[0] <= rows[1]):
+                by_col.setdefault(key[1], []).append(key)
+        widest = {}
+        for c, keys in by_col.items():
+            if len(keys) > 400:  # long columns: measure the longest texts and every cell in a larger font
+                keys = set(heapq.nlargest(150, keys, key=lambda k: len(cells[k]))) | {
+                    k for k in keys if k in formats and ((formats[k].get("size") or 11) > 11 or formats[k].get("indent"))}
+            for r, c in keys:
+                if sh.merge_at(r, c):
+                    continue
+                fmt = formats.get((r, c))
+                text = self.wb.display_text(sheet, r, c)
+                indent = ((fmt or {}).get("indent") or 0) * round(9 * self.px)
+                widest[c] = max(widest.get(c, 0), self.text_width(self.font_for(fmt), text) + indent)
+        return {c: max(fe.MIN_COL_WIDTH, round((w + 3 * self.pad) / self.px)) for c, w in widest.items()}
+
+    @undo_name("Tự động khớp độ rộng cột")
     def autofit_columns(self, c1, c2):
         sh = self.sh
         before = self.wb.snapshot()
-        widest = {}
-        for r, c in sh.cells:
-            if c1 <= c <= c2 and not sh.merge_at(r, c):
-                fmt = sh.formats.get((r, c))
-                text = self.wb.display_text(self.sheet, r, c)
-                indent = ((fmt or {}).get("indent") or 0) * round(9 * self.px)
-                widest[c] = max(widest.get(c, 0), self.text_width(self.font_for(fmt), text) + indent)
+        widest = self._content_widths(self.sheet, c1, c2)
         for c in range(c1, c2 + 1):
             if c in widest:
-                sh.col_widths[c] = max(fe.MIN_COL_WIDTH, round((widest[c] + 3 * self.pad) / self.px))
+                sh.col_widths[c] = widest[c]
             else:
                 sh.col_widths.pop(c, None)
         self._push_snapshot(before, self._sel_state())
@@ -3257,6 +6516,7 @@ class SpreadsheetApp:
         c2 = min(c2, max(c1, self.wb.used_extent(self.sheet)[1] - 1))
         self.autofit_columns(c1, c2)
 
+    @undo_name("Độ rộng cột")
     def ask_column_width(self):
         self.commit_edit()
         _, c1, _, c2 = self.sel_rect()
@@ -3280,6 +6540,8 @@ class SpreadsheetApp:
         if self.sheet in self.wb.sheets:
             self.views[self.sheet] = (self.top, self.left, self.cur, self.ext)
         self.sheet = name
+        self.chart_sel = None
+        self.areas = []
         self.top, self.left, self.cur, self.ext = self.views.get(name, (0, 0, (0, 0), (0, 0)))
 
     def switch_sheet(self, name):
@@ -3289,21 +6551,25 @@ class SpreadsheetApp:
         self._show_sheet(name)
         self.refresh_all()
 
+    @undo_name("Chèn trang tính")
     def add_sheet(self):
         index = list(self.wb.sheets).index(self.sheet) + 1
         created = []
         if self._structural(lambda: created.append(self.wb.add_sheet(index=index))):
             self.switch_sheet(created[0])
 
+    @undo_name("Sao chép trang tính")
     def copy_sheet(self):
         index = list(self.wb.sheets).index(self.sheet) + 1
         created = []
         if self._structural(lambda: created.append(self.wb.copy_sheet(self.sheet, index))):
             self.switch_sheet(created[0])
 
+    @undo_name("Màu tab")
     def set_tab_color(self, color):
         self._structural(lambda: setattr(self.sh, "tab_color", color))
 
+    @undo_name("Đổi tên trang tính")
     def rename_sheet(self, name):
         self.commit_edit()
         new = simpledialog.askstring("Đổi tên trang tính", "Tên mới:", initialvalue=name, parent=self.root)
@@ -3321,6 +6587,7 @@ class SpreadsheetApp:
                 self.clip["sheet"] = new
         self._structural(rename)
 
+    @undo_name("Xóa trang tính")
     def delete_sheet(self, name):
         self.commit_edit()
         if len(self.wb.sheets) == 1:
@@ -3340,24 +6607,60 @@ class SpreadsheetApp:
                 self.top, self.left, self.cur, self.ext = self.views.get(fallback, (0, 0, (0, 0), (0, 0)))
         self._structural(delete)
 
+    @undo_name("Di chuyển trang tính")
     def move_sheet(self, name, index):
         self._structural(lambda: self.wb.move_sheet(name, index))
+
+    @undo_name("Ẩn trang tính")
+    def hide_sheet(self, name=None):
+        """Hide a sheet (its tab); the next visible sheet becomes active."""
+        name = name or self.sheet
+        visible = self.wb.visible_sheets()
+        if len(visible) <= 1:
+            messagebox.showinfo(APP_NAME, "Sổ làm việc phải có ít nhất một trang tính hiển thị.", parent=self.root)
+            return
+        i = visible.index(name)
+        fallback = visible[i + 1] if i + 1 < len(visible) else visible[i - 1]
+        if self._structural(lambda: self.wb.hide_sheet(name)) and self.sheet == name:
+            self.switch_sheet(fallback)
+
+    @undo_name("Bỏ ẩn trang tính")
+    def unhide_sheet(self):
+        hidden = [n for n, sh in self.wb.sheets.items() if sh.hidden]
+        if not hidden:
+            self.root.bell()
+            return
+        name = dialogs.ChoiceDialog(self.root, "Bỏ ẩn trang tính", [(n, n) for n in hidden], hidden[0]).show()
+        if name and self._structural(lambda: self.wb.hide_sheet(name, False)):
+            self.switch_sheet(name)
+
+    def step_sheet(self, step):
+        """Ctrl+PgDn / Ctrl+PgUp: the next / previous visible sheet."""
+        visible = self.wb.visible_sheets()
+        i = visible.index(self.sheet) if self.sheet in visible else 0
+        if 0 <= i + step < len(visible):
+            self.switch_sheet(visible[i + step])
 
     def _tab_menu(self, e, name):
         self.switch_sheet(name)
         index = list(self.wb.sheets).index(name)
         last = len(self.wb.sheets) - 1
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Chèn trang tính", command=self.add_sheet)
-        menu.add_command(label="Xóa", command=lambda: self.delete_sheet(name))
-        menu.add_command(label="Đổi tên...", command=lambda: self.rename_sheet(name))
-        menu.add_command(label="Sao chép trang tính", command=self.copy_sheet)
-        menu.add_cascade(label="Màu tab", menu=self._palette_menu(menu, self.set_tab_color, "Không màu"))
+        menu.add_command(label="Chèn trang tính", command=self.add_sheet, **self._menu_image("Chèn trang tính"))
+        menu.add_command(label="Xóa", command=lambda: self.delete_sheet(name), **self._menu_image("", "sheet_delete"))
+        menu.add_command(label="Đổi tên...", command=lambda: self.rename_sheet(name), **self._menu_image("Đổi tên"))
+        menu.add_command(label="Sao chép trang tính", command=self.copy_sheet, **self._menu_image("Sao chép trang tính"))
+        menu.add_cascade(label="Màu tab", menu=self._palette_menu(menu, self.set_tab_color, "Không màu"),
+                         **self._menu_image("Màu tab"))
+        menu.add_command(label="Ẩn", command=lambda: self.hide_sheet(name), **self._menu_image("", "sheet_hide"),
+                         state="normal" if len(self.wb.visible_sheets()) > 1 else "disabled")
+        menu.add_command(label="Bỏ ẩn...", command=self.unhide_sheet, **self._menu_image("", "sheet_unhide"),
+                         state="normal" if len(self.wb.visible_sheets()) < len(self.wb.sheets) else "disabled")
         menu.add_separator()
         menu.add_command(label="Di chuyển sang trái", command=lambda: self.move_sheet(name, index - 1),
-                         state="normal" if index > 0 else "disabled")
+                         state="normal" if index > 0 else "disabled", **self._menu_image("Di chuyển sang trái"))
         menu.add_command(label="Di chuyển sang phải", command=lambda: self.move_sheet(name, index + 1),
-                         state="normal" if index < last else "disabled")
+                         state="normal" if index < last else "disabled", **self._menu_image("Di chuyển sang phải"))
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -3397,6 +6700,31 @@ class SpreadsheetApp:
         self.top, self.left = r1, c1
         self.refresh()
 
+    @undo_name("Cố định ngăn")
+    def freeze_panes(self, kind):
+        """Freeze the rows above and columns left of the active cell ("cell"), the top visible row
+        ("row") or the first visible column ("col"); None unfreezes."""
+        self.commit_edit()
+        self._clamp_view()
+        r, c = self.cur
+        if kind == "cell":
+            freeze = (self.top, max(r, self.top), self.left, max(c, self.left))
+        elif kind == "row":
+            freeze = (self.top, self.top + 1, 0, 0)
+        elif kind == "col":
+            freeze = (0, 0, self.left, self.left + 1)
+        else:
+            freeze = None
+        if freeze and freeze[1] == freeze[0] and freeze[3] == freeze[2]:
+            messagebox.showinfo(APP_NAME, "Hãy chọn ô nằm dưới các hàng và bên phải các cột muốn cố định.",
+                                parent=self.root)
+            return
+        if freeze == self.sh.freeze:
+            return
+        if self._structural(lambda: setattr(self.sh, "freeze", freeze)) and freeze:
+            self.top, self.left = max(self.top, freeze[1]), max(self.left, freeze[3])
+            self.refresh_view()
+
     def toggle_grid(self):
         self.show_grid = self.grid_var.get()
         self.refresh_view()
@@ -3408,7 +6736,7 @@ class SpreadsheetApp:
 
     def toggle_formula_bar(self):
         if self.fxbar_var.get():
-            self.formula_bar.pack(side="top", fill="x", after=self.ribbon)
+            self.formula_bar.pack(side="top", fill="x", before=self.grid_frame)
         else:
             self.formula_bar.pack_forget()
 
@@ -3423,8 +6751,20 @@ class SpreadsheetApp:
         self.canvas.focus_set()
         self.update_name_box()
 
+    @undo_name("Đặt tên")
     def _on_name_box(self, e):
         text = self.name_box.get().strip()
+        if text.upper() in self.wb.names:
+            if not self.go_to_name(text):
+                self.root.bell()
+            return "break"
+        if "!" not in text and fe.parse_address(text) is None and self.wb.check_name(text) is None:
+            rect = self.sel_rect()  # a new name for the selection, as typing a name in Excel's Name Box does
+            if self._structural(lambda: self.wb.define_name(text, "=" + fe.absolute_ref(self.sheet, rect))):
+                self.set_mode(f"Đã đặt tên {text} cho {range_name(*rect)}")
+            self.canvas.focus_set()
+            self.update_name_box()
+            return "break"
         sheet = self.sheet
         if "!" in text:
             sheet_part, text = text.rsplit("!", 1)
@@ -3505,6 +6845,7 @@ class SpreadsheetApp:
         replacement = self.repl_var.get()
         return re.sub(re.escape(self.find_var.get()), lambda m: replacement, raw, flags=flags)
 
+    @undo_name("Thay thế")
     def replace_one(self):
         if not self.find_var.get():
             return
@@ -3517,6 +6858,7 @@ class SpreadsheetApp:
             self.refresh()
         self.find_next()
 
+    @undo_name("Thay thế")
     def replace_all(self):
         if not self.find_var.get():
             return
@@ -3549,6 +6891,400 @@ class SpreadsheetApp:
                             f"{MAX_ROWS:,} hàng × {MAX_COLS} cột mỗi trang tính, {len(fe.function_names())} hàm,\n"
                             "mở/lưu .xlsx, .pyxl, .csv.", parent=self.root)
 
+    # ------------------------------------------------------------------ defined names
+
+    def go_to_name(self, name):
+        """Select the block a name refers to; False when it is not a block of cells."""
+        target = self.wb.name_target(name)
+        if target is None:
+            return False
+        sheet, (r1, c1, r2, c2) = target
+        self.commit_edit()
+        self.switch_sheet(sheet)
+        self.cur, self.ext = (r1, c1), (r2, c2)
+        self.ensure_visible(r1, c1)
+        self.canvas.focus_set()
+        self.refresh()
+        return True
+
+    @undo_name("Tên vùng")
+    def _edit_name(self, parent, name=None):
+        """New / Edit Name dialog; returns the name kept (for the Name Manager to select)."""
+        if name:
+            d = self.wb.names[name.upper()]
+            values = dict(name=d["name"], ref=d["ref"], comment=d.get("comment", ""), old=d["name"])
+        else:
+            r1, c1, r2, c2 = self.sel_rect()
+            label = self.wb.display_text(self.sheet, r1, c1) if (r1, c1) != (r2, c2) else ""
+            guess = fe.name_from_label(label) if label else ""
+            values = dict(name=guess if guess and self.wb.check_name(guess) is None else "",
+                          ref="=" + fe.absolute_ref(self.sheet, (r1, c1, r2, c2)))
+        result = dialogs.DefineNameDialog(parent, self.wb, **values).show()
+        if not result:
+            return name
+        new, ref, comment = result
+        self._structural(lambda: self.wb.define_name(new, ref, comment, old=values.get("old")))
+        return new
+
+    def define_name_dialog(self):
+        self.commit_edit()
+        self._edit_name(self.root)
+
+    @undo_name("Trình Quản lý Tên")
+    def name_manager(self):
+        """Formulas > Name Manager (Ctrl+F3)."""
+        self.commit_edit()
+
+        def delete(name):
+            self._structural(lambda: self.wb.delete_name(name))
+        dialogs.NameManagerDialog(self.root, self.wb, lambda parent: self._edit_name(parent),
+                                  lambda parent, name: self._edit_name(parent, name), delete, self.go_to_name).show()
+
+    @undo_name("Tạo tên từ vùng chọn")
+    def create_names_from_selection(self):
+        """Formulas > Create from Selection (Ctrl+Shift+F3): names from the labels along the block's edges."""
+        self.commit_edit()
+        r1, c1, r2, c2 = self.sel_rect()
+        if (r1, c1) == (r2, c2) or r2 - r1 > 10000 or c2 - c1 > 1000:
+            messagebox.showinfo(APP_NAME, "Hãy chọn vùng gồm tiêu đề và dữ liệu (ví dụ cả bảng có hàng tiêu đề).",
+                                parent=self.root)
+            return
+        text = lambda r, c: self.wb.display_text(self.sheet, r, c)  # noqa: E731
+        numeric = lambda r, c: fe.is_number(self.wb.get_value(self.sheet, r, c))  # noqa: E731
+        top = r2 > r1 and all(text(r1, c) and not numeric(r1, c) for c in range(c1 + 1, c2 + 1) or [c1])
+        left = c2 > c1 and all(text(r, c1) and not numeric(r, c1) for r in range(r1 + 1, r2 + 1))
+        picked = dialogs.CreateNamesDialog(self.root, top or not left, left).show()
+        if not picked:
+            return
+        rows = (r1 + ("top" in picked), r2 - ("bottom" in picked))
+        cols = (c1 + ("left" in picked), c2 - ("right" in picked))
+        items = []
+        for edge in ("top", "bottom"):
+            if edge in picked:
+                label_row = r1 if edge == "top" else r2
+                items += [(text(label_row, c), (rows[0], c, rows[1], c)) for c in range(cols[0], cols[1] + 1)]
+        for edge in ("left", "right"):
+            if edge in picked:
+                label_col = c1 if edge == "left" else c2
+                items += [(text(r, label_col), (r, cols[0], r, cols[1])) for r in range(rows[0], rows[1] + 1)]
+        items = [(fe.name_from_label(label), rect) for label, rect in items
+                 if label and rect[0] <= rect[2] and rect[1] <= rect[3]]
+        items = [(name, rect) for name, rect in items if name]
+        if not items:
+            self.root.bell()
+            return
+
+        def change():
+            for name, rect in items:
+                old = name if name.upper() in self.wb.names else None
+                if self.wb.check_name(name, ignore=old) is None:
+                    self.wb.define_name(name, "=" + fe.absolute_ref(self.sheet, rect), old=old)
+        if self._structural(change):
+            self.set_mode(f"Đã tạo {len(items)} tên: " + ", ".join(n for n, _ in items[:6]) + ("..." if len(items) > 6 else ""))
+
+    def _names_menu(self, menu):
+        """Use in Formula: the names, inserted where a formula is being typed (or starting one)."""
+        menu.delete(0, "end")
+        if not self.wb.names:
+            menu.add_command(label="(Chưa có tên nào)", state="disabled")
+        for d in self.wb.sorted_names():
+            menu.add_command(label=d["name"], command=lambda n=d["name"]: self.insert_name(n))
+        menu.add_separator()
+        menu.add_command(label="Trình Quản lý Tên...", command=self.name_manager, accelerator="Ctrl+F3")
+
+    def insert_name(self, name):
+        if not self.is_editing():
+            self.start_edit(initial="=")
+        w = self._edit_widget()
+        w.insert("insert", name)
+        w.focus_set()
+
+    # ------------------------------------------------------------------ printing
+
+    @property
+    def font_library(self):
+        """The TrueType fonts used to lay out and write printed pages (indexed on first use)."""
+        if self._font_library is None:
+            self.root.config(cursor="watch")  # scanning the fonts folder can take a moment the first time
+            self.root.update_idletasks()
+            try:
+                self._font_library = ttf.FontLibrary()
+                self._font_library.index()
+            finally:
+                self.root.config(cursor="")
+        return self._font_library
+
+    def file_label(self):
+        return os.path.basename(self.path) if self.path else ""
+
+    def print_jobs(self, scope):
+        """[(sheet, setup)] to print: the active sheet, every sheet, or the selection of the active sheet."""
+        if scope == "book":
+            return [(name, printing.setup_of(sh)) for name, sh in self.wb.sheets.items() if not sh.hidden]
+        setup = printing.setup_of(self.sh)
+        if scope == "selection":
+            setup = dict(setup, area=self.sel_rect())
+        return [(self.sheet, setup)]
+
+    def page_layout(self):
+        """printing.Layout of the active sheet, kept until the next change (for the page-break lines)."""
+        key = (id(self.wb), self.sheet, self.edit_serial)
+        if self._layout_cache[0] != key:
+            self._layout_cache = (key, printing.Layout(self.wb, self.sheet, printing.setup_of(self.sh)))
+        return self._layout_cache[1]
+
+    @undo_name("Thiết lập trang")
+    def update_page_setup(self, changes, sheet=None):
+        """Change printing options of a sheet (with undo); only values that differ from the defaults are kept."""
+        sh = self.wb.sheets[sheet or self.sheet]
+        setup = {**printing.setup_of(sh), **changes}
+        kept = {k: v for k, v in setup.items() if v != printing.DEFAULT_SETUP.get(k)} or None
+        if kept != sh.page_setup:
+            self._structural(lambda: setattr(sh, "page_setup", kept))
+
+    def page_setup_dialog(self, tab="page", sheet=None, parent=None):
+        self.commit_edit()
+        sheet = sheet or self.sheet
+        result = dialogs.PageSetupDialog(parent or self.root, printing.setup_of(self.wb.sheets[sheet]), tab).show()
+        if result:
+            self.update_page_setup(result, sheet)
+
+    def print_preview(self, scope="sheet"):
+        """File > Print (Ctrl+P): the preview with print and PDF buttons."""
+        self.commit_edit()
+        self.breaks_shown.add(self.sheet)
+        PrintPreview(self, scope)
+        self.redraw()
+
+    def _write_pdf(self, scope, path):
+        selection = (self.sheet, self.sel_rect()) if scope == "selection" else None
+        sheets = self.wb.visible_sheets() if scope == "book" else [self.sheet]
+        return printing.export_pdf(self.wb, sheets, path, self.font_library, self.file_label(), selection)
+
+    # ------------------------------------------------------------------ PDF into sheets
+
+    def import_pdf(self, path=None):
+        """Tiện ích > Nhập PDF: the chosen pages of a PDF as new sheets (read in the background; Esc stops)."""
+        self.commit_edit()
+        if getattr(self, "_pdf_job", None):
+            return
+        path = path or filedialog.askopenfilename(parent=self.root, title="Nhập PDF",
+                                                  filetypes=[("PDF", "*.pdf"), ("Tất cả các tệp", "*.*")])
+        if not path:
+            return
+        try:
+            doc = pdfread.Document(path)
+            pages = doc.pages()
+        except (pdfread.PDFError, OSError, ValueError, MemoryError) as err:
+            messagebox.showerror(APP_NAME, f"Không mở được PDF:\n{path}\n\n{err}", parent=self.root)
+            return
+        if not pages:
+            messagebox.showinfo(APP_NAME, "PDF không có trang nào.", parent=self.root)
+            return
+        name = os.path.splitext(os.path.basename(path))[0]
+        options = dialogs.PdfImportDialog(self.root, os.path.basename(path), len(pages),
+                                          pdf_import.page_kinds(doc, pages)).show()
+        if not options:
+            return
+        options.families = {pdf_import._squash(f): f for f in tkfont.families(self.root)}
+        if not options.one_sheet and len(options.pages) > 60 and not messagebox.askyesno(
+                APP_NAME, f"Sẽ tạo {len(options.pages)} trang tính. Tiếp tục?", parent=self.root):
+            return
+        job = self._pdf_job = {"done": 0, "total": len(options.pages), "stop": False, "result": None, "error": None}
+
+        def progress(done, total):
+            job["done"] = done
+            return not job["stop"]
+
+        def work():
+            try:
+                job["result"] = pdf_import.convert(doc, options.pages, options, self._sheet_base(name), progress)
+            except Exception as err:  # noqa: BLE001 - a broken PDF must not leave the program waiting
+                job["error"] = err
+        threading.Thread(target=work, name="PyExcel PDF", daemon=True).start()
+        self._watch_pdf_job(job)
+
+    def _sheet_base(self, name):
+        name = re.sub(r"[\[\]:*?/\\']", " ", name).strip() or "PDF"
+        return name[:20].strip()
+
+    def _watch_pdf_job(self, job):
+        if job["result"] is None and job["error"] is None:
+            self.set_mode(f"Đang nhập PDF: trang {job['done']}/{job['total']} — Esc để dừng")
+            self.root.after(120, self._watch_pdf_job, job)
+            return
+        self._pdf_job = None
+        self.set_mode("Sẵn sàng")
+        if job["error"] is not None:
+            messagebox.showerror(APP_NAME, f"Không đọc được PDF:\n{job['error']}", parent=self.root)
+            return
+        self._apply_pdf(job["result"], job["stop"])
+
+    @undo_name("Nhập PDF")
+    def _apply_pdf(self, result, stopped=False):
+        created = []
+        shared = {}
+
+        def unique(name):
+            name = name[:31]
+            n = 2
+            base = name
+            while self.wb.check_sheet_name(name) is not None:
+                name = f"{base[:26]} ({n})"
+                n += 1
+            return name
+
+        def change():
+            index = len(self.wb.sheets)
+            for sd in result.sheets:
+                name = unique(sd.name)
+                self.wb.add_sheet(name, index=index)
+                index += 1
+                created.append(name)
+                items = []
+                for key in set(sd.cells) | set(sd.formats):
+                    fmt = sd.formats.get(key)
+                    if fmt:
+                        sig = repr(sorted(fmt.items()))
+                        fmt = shared.setdefault(sig, fmt)  # cells with one look share one format
+                    items.append((name, key[0], key[1], sd.cells.get(key), fmt or None))
+                self.wb.write_cells(items)
+                sh = self.wb.sheets[name]
+                sh.col_widths.update(sd.col_widths)
+                sh.row_heights.update(sd.row_heights)
+                sh.custom_rows.update(sd.row_heights)
+                sh.set_merges(sd.merges)
+                sh.charts.extend(sd.objects)
+                if sd.landscape:
+                    sh.page_setup = {"orientation": "landscape"}
+        if not result.sheets or not self._structural(change):
+            return
+        self.switch_sheet(created[0])
+        def n(v):
+            return f"{v:,}".replace(",", ".")
+        lines = [f"Đã nhập {result.pages} trang vào {len(created)} trang tính: {n(result.cells)} ô chữ, "
+                 f"{n(result.lines)} đường kẻ, {n(result.shapes)} hình vẽ, {n(result.pictures)} ảnh."]
+        if stopped:
+            lines.append("Đã dừng giữa chừng theo yêu cầu.")
+        if result.scanned:
+            pages = ", ".join(map(str, result.scanned[:12])) + ("..." if len(result.scanned) > 12 else "")
+            lines.append(f"Trang {pages} chỉ có ảnh (bản quét): không có chữ để lấy - cần nhận dạng chữ (OCR), "
+                         "PyExcel chưa có.")
+        if result.skipped_pictures:
+            lines.append(f"{result.skipped_pictures} ảnh ở dạng PyExcel chưa đọc được (JPEG 2000, ảnh fax...) "
+                         "nên bị bỏ qua.")
+        if result.trimmed:
+            lines.append("Một số trang có quá nhiều nét vẽ (bản vẽ CAD...): chỉ lấy một phần hình vẽ.")
+        messagebox.showinfo(APP_NAME, "\n\n".join(lines), parent=self.root)
+
+    def export_pdf(self, scope="sheet", parent=None):
+        """File > Export PDF: write the pages to a PDF file and offer to open it."""
+        self.commit_edit()
+        parent = parent or self.root
+        base = os.path.splitext(self.file_label())[0] or "Bang tinh"
+        path = filedialog.asksaveasfilename(parent=parent, title="Xuất PDF", initialfile=base,
+                                            defaultextension=".pdf", filetypes=[("Tệp PDF", "*.pdf")])
+        if not path:
+            return False
+        try:
+            pages = self._write_pdf(scope, path)
+        except Exception as err:  # e.g. the PDF is open in a viewer that locks it
+            messagebox.showerror(APP_NAME, f"Không xuất được PDF:\n{path}\n\n{err}", parent=parent)
+            return False
+        self.set_mode(f"Đã xuất {pages} trang ra {os.path.basename(path)}")
+        if messagebox.askyesno(APP_NAME, f"Đã xuất {pages} trang ra:\n{path}\n\nMở tệp PDF ngay?", parent=parent):
+            self._open_document(path)
+        return True
+
+    @staticmethod
+    def _open_document(path, verb=None):
+        """Open (or with verb "print", print) a file with the program the system uses for it."""
+        if sys.platform == "win32":
+            os.startfile(path, verb) if verb else os.startfile(path)
+        elif verb == "print" and shutil.which("lp"):
+            subprocess.Popen(["lp", path])
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+
+    def print_now(self, scope="sheet", parent=None):
+        """Print: the pages go to a PDF in the temp folder, which the system's PDF program sends to the
+        default printer; when it cannot print directly the PDF is opened to print from there."""
+        self.commit_edit()
+        parent = parent or self.root
+        base = os.path.splitext(self.file_label())[0] or "Bang tinh"
+        path = os.path.join(tempfile.gettempdir(), f"PyExcel - {base} - {dt.datetime.now():%Y%m%d-%H%M%S}.pdf")
+        try:
+            pages = self._write_pdf(scope, path)
+        except Exception as err:
+            messagebox.showerror(APP_NAME, f"Không tạo được trang in:\n{err}", parent=parent)
+            return False
+        try:
+            self._open_document(path, "print")
+            self.set_mode(f"Đã gửi {pages} trang tới máy in")
+        except OSError:
+            try:
+                self._open_document(path)
+            except OSError as err:
+                messagebox.showerror(APP_NAME, f"Không mở được trình xem PDF để in:\n{err}", parent=parent)
+                return False
+            messagebox.showinfo(APP_NAME, "Máy chưa có chương trình in PDF trực tiếp nên PyExcel đã mở tệp PDF;\n"
+                                          "hãy bấm In (Ctrl+P) trong cửa sổ vừa mở.", parent=parent)
+        return True
+
+    def set_print_area(self):
+        self.update_page_setup({"area": self.sel_rect()})
+
+    def clear_print_area(self):
+        self.update_page_setup({"area": None})
+
+    def insert_page_break(self):
+        """Excel's Insert Page Break: above the active row and left of the active column (not at row/column 1)."""
+        r, c = self.cur
+        setup = printing.setup_of(self.sh)
+        changes = {}
+        if r > 0:
+            changes["breaks"] = sorted(set(setup["breaks"]) | {r})
+        if c > 0:
+            changes["col_breaks"] = sorted(set(setup["col_breaks"]) | {c})
+        self.breaks_shown.add(self.sheet)
+        self.update_page_setup(changes)
+
+    def remove_page_break(self):
+        r, c = self.cur
+        setup = printing.setup_of(self.sh)
+        self.update_page_setup({"breaks": [b for b in setup["breaks"] if b != r],
+                                "col_breaks": [b for b in setup["col_breaks"] if b != c]})
+
+    def reset_page_breaks(self):
+        self.update_page_setup({"breaks": [], "col_breaks": []})
+
+    def toggle_print_gridlines(self):
+        self.update_page_setup({"gridlines": self.print_grid_var.get()})
+
+    def _draw_page_breaks(self, cv, col_pos, row_pos, right, bottom):
+        """Dashed lines where pages end, as Excel shows them once the sheet has been previewed or set up;
+        manual breaks are drawn darker."""
+        layout = self.page_layout()
+        if not layout.pages:
+            return
+        rows, cols = layout.breaks()
+        rows.add(max(r for page, _ in layout.pages for r in page) + 1)
+        cols.add(max(c for _, page in layout.pages for c in page) + 1)
+        manual_rows, manual_cols = set(layout.setup["breaks"]), set(layout.setup["col_breaks"])
+        hw, hh = self.header_w, self.header_h
+        for r in rows:
+            y = row_pos[r][0] if r in row_pos else row_pos[r - 1][1] if r - 1 in row_pos else None
+            if y is not None:
+                manual = r in manual_rows
+                cv.create_line(hw, y - 1, right, y - 1, fill=BREAK_LINE[manual], dash=(6, 3) if manual else (3, 3),
+                               width=2 if manual else 1)
+        for c in cols:
+            x = col_pos[c][0] if c in col_pos else col_pos[c - 1][1] if c - 1 in col_pos else None
+            if x is not None:
+                manual = c in manual_cols
+                cv.create_line(x - 1, hh, x - 1, bottom, fill=BREAK_LINE[manual], dash=(6, 3) if manual else (3, 3),
+                               width=2 if manual else 1)
+
     # ------------------------------------------------------------------ files
 
     def confirm_discard(self):
@@ -3572,25 +7308,55 @@ class SpreadsheetApp:
         if path:
             self.open_path(path)
 
+    def _busy(self, text):
+        """Show what is going on (and a busy pointer) before a long job that holds up the window."""
+        self.set_mode(text)
+        self.root.config(cursor="watch")
+        self.canvas.config(cursor="watch")
+        self.root.update_idletasks()
+
+    def _not_busy(self):
+        self.root.config(cursor="")
+        self._cursor = None  # the next pointer move sets the canvas cursor again
+        self.canvas.config(cursor="")
+
     def open_path(self, path):
+        self._busy(f"Đang mở {os.path.basename(path)}...")
         try:
             wb = fe.load_workbook(path)
         except Exception as err:  # any I/O or format problem is reported, not fatal
+            self._not_busy()
+            self.set_mode("Sẵn sàng")
             messagebox.showerror(APP_NAME, f"Không mở được tệp:\n{path}\n\n{err}", parent=self.root)
             return
         self._load(wb, path)
+        self._not_busy()
+        info = wb.import_info
+        if info:  # tell how a text file was read (Data > From Text/CSV chooses otherwise)
+            self.set_mode(f"Đã đọc {os.path.basename(path)}: {fe.ENCODING_NAMES.get(info['encoding'], info['encoding'])}"
+                          f", {fe.DELIMITER_NAMES.get(info['delimiter'], info['delimiter'])}")
+        if info and info.get("truncated"):
+            messagebox.showwarning(APP_NAME, f"Tệp có nhiều hơn {MAX_ROWS:,} hàng hoặc {MAX_COLS:,} cột; phần vượt "
+                                   "quá giới hạn của một trang tính không được mở (Excel cũng giới hạn như vậy).",
+                                   parent=self.root)
 
     def _load(self, wb, path):
         self._end_edit()
         self.wb = wb
-        self.sheet = wb.active or next(iter(wb.sheets))
+        self.sheet = wb.active if wb.active in wb.visible_sheets() else wb.visible_sheets()[0]
         self.views.clear()
         self.top = self.left = 0
         self.cur = self.ext = (0, 0)
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self._update_undo_buttons()
         self.clip = self.painter = None
+        self.areas = []
+        self.breaks_shown.clear()
         self.path = path
+        if path:
+            self.settings.add_recent(path)
+        self.recovery.discard()
         self.dirty = False
         self.refresh_all()
 
@@ -3613,38 +7379,130 @@ class SpreadsheetApp:
                 APP_NAME, "CSV chỉ lưu giá trị của trang tính đang mở (không có công thức, định dạng "
                           "và các trang tính khác). Tiếp tục?", parent=self.root):
             return False
+        self._busy(f"Đang lưu {os.path.basename(path)}...")
         try:
             fe.save_workbook(self.wb, path, active=self.sheet)
         except Exception as err:  # e.g. the file is open in Excel
+            self._not_busy()
+            self.set_mode("Sẵn sàng")
             messagebox.showerror(APP_NAME, f"Không lưu được tệp:\n{path}\n\n{err}", parent=self.root)
             return False
+        self._not_busy()
         self.path = path
         self.dirty = False
+        self.settings.add_recent(path)
+        self.recovery.discard()
+        self.recovery.beat(path=path)
         self.update_title()
         self.set_mode(f"Đã lưu {os.path.basename(path)}")
         return True
 
     def quit(self):
+        if self._quitting:  # Alt+F4 may come both from Tk and from Windows
+            return
+        self._quitting = True
         if self.confirm_discard():
+            self.recovery.close()  # nothing left to recover: changes were saved or dropped on purpose
             self.root.destroy()
+        else:
+            self._quitting = False
+
+    # ------------------------------------------------------------------ recent files and AutoRecover
+
+    def _fill_recent_menu(self):
+        menu = self.recent_menu
+        menu.delete(0, "end")
+        items = self.settings.recent()
+        if not items:
+            menu.add_command(label="(Chưa có tệp nào)", state="disabled")
+            return
+        for i, path in enumerate(items, 1):
+            menu.add_command(label=f"{i}  {os.path.basename(path)}", underline=0,
+                             accelerator=os.path.dirname(path), command=lambda p=path: self.open_recent(p))
+        menu.add_separator()
+        menu.add_command(label="Xóa danh sách gần đây", command=self.settings.clear_recent)
+
+    def open_recent(self, path):
+        if not os.path.exists(path):
+            messagebox.showerror(APP_NAME, f"Không tìm thấy tệp:\n{path}", parent=self.root)
+            return
+        if self.confirm_discard():
+            self.open_path(path)
+
+    def autosave_options(self):
+        minutes = simpledialog.askinteger(
+            "Lưu tự động", "Lưu bản khôi phục sau mỗi bao nhiêu phút?\n(0 = tắt; bản khôi phục giúp lấy lại dữ liệu\n"
+                          "khi máy tắt đột ngột hoặc chương trình bị lỗi)",
+            initialvalue=self.settings.autosave_minutes, minvalue=0, maxvalue=120, parent=self.root)
+        if minutes is not None:
+            self.settings.autosave_minutes = minutes
+
+    def _autosave_tick(self):
+        """Every minute: a heartbeat; with unsaved changes, an AutoRecover copy every few minutes."""
+        try:
+            minutes = self.settings.autosave_minutes
+            self.recovery.beat(path=self.path)
+            last = self.recovery.saved_at
+            busy = self._autosave_thread is not None and self._autosave_thread.is_alive()
+            if (self.dirty and minutes and not busy and not self.is_editing() and not self.drag
+                    and (last is None or time.time() - last >= minutes * 60)):
+                # copy the workbook now (fast), write it out on another thread
+                self._autosave_thread = self.recovery.save_in_background(self.wb.snapshot(), self.sheet)
+                self.root.after(500, self._autosave_done)
+        finally:
+            self.root.after(60_000, self._autosave_tick)
+
+    def _autosave_done(self):
+        if self._autosave_thread is not None and self._autosave_thread.is_alive():
+            self.root.after(500, self._autosave_done)
+            return
+        self._autosave_thread = None
+        if self.recovery.saved_at and self.mode_label.cget("text") == "Sẵn sàng":
+            self.set_mode(f"Đã lưu bản khôi phục lúc {dt.datetime.now():%H:%M}")
+
+    def _offer_recovery(self):
+        """After a crash: offer the AutoRecover copies the previous sessions left behind."""
+        entries = self.recovery.orphans()
+        if not entries:
+            return
+        options = [(f"{dt.datetime.fromtimestamp(e['saved']):%d/%m/%Y %H:%M}  —  "
+                    f"{os.path.basename(e['path']) if e['path'] else 'Sổ làm việc chưa lưu'}", str(i))
+                   for i, e in enumerate(entries)]
+        options.append(("Không khôi phục (xóa các bản này)", "none"))
+        choice = dialogs.ChoiceDialog(
+            self.root, "Khôi phục tài liệu", options, "0",
+            prompt="Lần trước PyExcel đã đóng đột ngột khi còn thay đổi chưa lưu.\n"
+                   "Chọn bản khôi phục muốn mở (Hủy: để lại, hỏi lại lần sau):").show()
+        if choice is None:
+            return
+        if choice != "none":
+            entry = entries[int(choice)]
+            if not self.confirm_discard():
+                return
+            try:
+                wb = fe.load_workbook(entry["file"])
+            except Exception as err:  # a damaged copy is reported, not fatal
+                messagebox.showerror(APP_NAME, f"Không mở được bản khôi phục:\n{err}", parent=self.root)
+                return
+            self._load(wb, entry["path"])
+            self.dirty = True  # recovered work still needs saving
+            self.update_title()
+            self.set_mode("Đã khôi phục — hãy lưu lại (Ctrl+S)")
+        for entry in entries:
+            self.recovery.forget(entry)
 
 
 def main():
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
-        except (AttributeError, OSError):
-            pass
+    per_monitor = screens.follow_monitor_dpi(session.Settings().per_monitor_dpi)
     root = tk.Tk()
     scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
     width = min(round(1360 * scale), int(root.winfo_screenwidth() * 0.94))
     height = min(round(800 * scale), int(root.winfo_screenheight() * 0.88))
     root.geometry(f"{width}x{height}")
     root.minsize(round(720 * scale), round(480 * scale))
-    if sys.platform == "win32":
-        root.state("zoomed")  # Excel opens maximised
-    SpreadsheetApp(root, sys.argv[1] if len(sys.argv) > 1 else None)
+    app = SpreadsheetApp(root, sys.argv[1] if len(sys.argv) > 1 else None)
+    app.per_monitor_dpi = per_monitor
+    app.titlebar.start(width, height, maximized=sys.platform == "win32")  # Excel opens maximised
     root.mainloop()
 
 
